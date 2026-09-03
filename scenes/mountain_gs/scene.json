@@ -1,0 +1,7 @@
+{
+  "name": "mountain_gs",
+  "match": "mountain.sh: cyclic ground -R, cyclic clouds -r, sand@300K, same camera/sun",
+  "gaussians": {"path": "mountain_gs.ply", "count": 66049},
+  "camera": {"pos": [10245.37, 615.02, 422.34], "tgt": [-2977.39, 6829.40, 842.40], "fov": 30},
+  "sun": {"azimuth_deg": 225, "elevation_deg": 30}
+}

@@ -1,0 +1,29 @@
+# Third-party clones and install prefixes
+htrdr-atmosphere-spk/
+htrdr/
+star-engine/
+star-build/
+local/
+
+# Python / build
+__pycache__/
+*.pyc
+*.pyo
+*.log
+
+# Editor
+.cursor/
+.vscode/
+
+# Secrets
+.env
+.env.*
+credentials.json
+*.pem
+
+# Large generated / cached data
+*.bin
+*.htcp
+*.cache
+*.tgz
+*.tar.gz
