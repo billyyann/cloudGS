@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#define ATM_KERNEL_REV 10
+#define ATM_KERNEL_REV 22
 #include <3dgptir/pipelineParameters.h>
 #include <3dgptir/kernels/cuda/sampler.cuh>
 // clang-format on
@@ -25,7 +25,7 @@ __constant__ PipelineParameters params;
 #include <3dgptir/kernels/cuda/environment.cuh>
 #include <3dgptir/kernels/cuda/pathTracer.cuh>
 #include <3dgptir/kernels/cuda/atmospherePathTracer.cuh>
-/* NVRTC: ATM_KERNEL_REV 10 NEE analog τ XY-periodic; camera Woodcock finite AABB. */
+/* NVRTC: ATM_KERNEL_REV 22 no mesh+vol IAS; vol 1-AABB Woodcock; mesh NEE tmin 2m. */
 
 // Ablation early-return stages (only with ENABLE_RAYGEN_SETUP_PROFILING).
 // Official release: do not define ENABLE_RAYGEN_SETUP_PROFILING.
@@ -107,6 +107,7 @@ __constant__ PipelineParameters params;
         if (ATM_KERNEL_REV < 0) {
             return;
         }
+        /* rev19: mesh Triangle GAS + vol Custom GAS + mesh/vol IAS */
         traceAtmospherePath(idx, sampler);
         return;
     }
@@ -277,4 +278,48 @@ extern "C" __global__ void __anyhit__ah() {
             optixIgnoreIntersection();
         }
     }
+}
+
+/* Mesh Triangle GAS closest-hit. Payload: t, kind=1, primId. */
+extern "C" __global__ void __closesthit__mesh() {
+    optixSetPayload_0(__float_as_uint(optixGetRayTmax()));
+    optixSetPayload_1(1u);
+    optixSetPayload_2(optixGetPrimitiveIndex());
+}
+
+/* Volume Custom GAS: one grid AABB; sequential Woodcock with a single Ts. */
+extern "C" __global__ void __intersection__vol() {
+    const float3 o3 = optixGetObjectRayOrigin();
+    const float3 d3 = optixGetObjectRayDirection();
+    const float org[3] = {o3.x, o3.y, o3.z};
+    const float dir[3] = {d3.x, d3.y, d3.z};
+    const float tmin = optixGetRayTmin();
+    const float tmax = optixGetRayTmax();
+    const unsigned seedLo = optixGetPayload_5();
+    const unsigned seedHi = optixGetPayload_6();
+    unsigned long long seed =
+        (static_cast<unsigned long long>(seedHi) << 32ull) | static_cast<unsigned long long>(seedLo);
+    Sampler rng;
+    rng.init(seed ? seed : 1ull, 1ull);
+    const int walk_ks = params.atmosphere.spectral_mode != ATM_SPECTRAL_LW;
+    const float omega_arg = params.atmosphere.mie_omega > 0.f ? params.atmosphere.mie_omega : -1.f;
+    AtmHit hit;
+    atm_woodcock_voxels_into(
+        &params.atmosphere.voxels, org, dir, tmax, rng, omega_arg, walk_ks, &hit);
+    if (hit.event == ATM_EVENT_NONE || hit.t < tmin || hit.t > tmax) {
+        return;
+    }
+    optixReportIntersection(
+        hit.t,
+        0u,
+        static_cast<unsigned>(hit.event),
+        __float_as_uint(hit.temperature));
+}
+
+extern "C" __global__ void __closesthit__vol() {
+    optixSetPayload_0(__float_as_uint(optixGetRayTmax()));
+    optixSetPayload_1(2u);
+    optixSetPayload_2(optixGetPrimitiveIndex());
+    optixSetPayload_3(optixGetAttribute_0());
+    optixSetPayload_4(optixGetAttribute_1());
 }

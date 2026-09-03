@@ -51,7 +51,8 @@ enum CreatePipelineFlags {
     PipelineFlag_HasAH      = 1 << 2,
     PipelineFlag_HasMS      = 1 << 3,
     PipelineFlag_HasRG      = 1 << 4,
-    PipelineFlag_SpherePrim = 1 << 5
+    PipelineFlag_SpherePrim = 1 << 5,
+    PipelineFlag_AtmAccel   = 1 << 6  // mesh CH + volume IS; GAS or single-level IAS
 };
 
 class OptixTracer {
@@ -68,6 +69,31 @@ protected:
         CUdeviceptr gasBufferTmp;            // GPU显存指针，构建GAS时所需的临时工作空间缓冲区
         size_t gasBufferTmpSz;               // gasBufferTmp临时缓冲区的大小（字节数）
         OptixAabb gasAABB;                   // GAS的世界空间轴对齐包围盒（AABB），用于视锥体剔除
+
+        OptixTraversableHandle meshGasHandle;
+        CUdeviceptr meshGasBuffer;
+        size_t meshGasBufferSz;
+        int meshGasNtri;
+        int meshGasNvert;
+        CUdeviceptr meshGasVertsPtr;
+        CUdeviceptr meshGasIdxPtr;
+
+        OptixTraversableHandle volGasHandle;
+        CUdeviceptr volGasBuffer;
+        size_t volGasBufferSz;
+        CUdeviceptr volAabbBuffer;
+        size_t volAabbBufferSz;
+        CUdeviceptr volBrickIdBuffer;
+        size_t volBrickIdBufferSz;
+        int volPrimCount;
+        CUdeviceptr volKmaxPtr;
+
+        OptixTraversableHandle meshVolIasHandle;
+        CUdeviceptr meshVolIasBuffer;
+        size_t meshVolIasBufferSz;
+        CUdeviceptr meshVolIasInstances;
+        size_t meshVolIasInstancesSz;
+
         CUdeviceptr optixAabbPtr;            // GPU显存指针，指向AABB数据的设备端地址
         CUdeviceptr paramsDevice;            // GPU显存指针，指向运行时参数结构体（如相机矩阵、图像尺寸等）
         size_t paramsDeviceSz;               // paramsDevice参数缓冲区的大小（字节数）
@@ -148,6 +174,22 @@ protected:
     void reallocateParamsDevice(size_t sz, cudaStream_t stream);
     //创建高斯粒子实例加速结构
     OptixTraversableHandle createParticleInstanceAS(cudaStream_t cudaStream);
+    void buildAtmosphereAccel(
+        torch::Tensor meshVerts,
+        torch::Tensor meshIdx,
+        torch::Tensor voxelKmax,
+        int nx,
+        int ny,
+        int nz,
+        int brick,
+        int nbx,
+        int nby,
+        int nbz,
+        const float origin[3],
+        float dx,
+        float dy,
+        float dz,
+        cudaStream_t cudaStream);
 
 public:
     OptixTracer(

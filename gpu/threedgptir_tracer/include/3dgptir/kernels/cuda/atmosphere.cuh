@@ -110,6 +110,42 @@ ATM_FN float atm_ray_eps(float t) {
     return fmaxf(1e-3f, 1.0e-5f * fabsf(t));
 }
 
+ATM_FN int atm_ray_aabb(
+    const float org[3],
+    const float dir[3],
+    const float lo[3],
+    const float hi[3],
+    float tmin,
+    float tmax,
+    float* t0,
+    float* t1) {
+    float a = tmin;
+    float b = tmax;
+    for (int i = 0; i < 3; ++i) {
+        if (fabsf(dir[i]) < 1e-20f) {
+            if (org[i] < lo[i] || org[i] > hi[i]) {
+                return 0;
+            }
+        } else {
+            float ta = (lo[i] - org[i]) / dir[i];
+            float tb = (hi[i] - org[i]) / dir[i];
+            if (ta > tb) {
+                const float tmp = ta;
+                ta = tb;
+                tb = tmp;
+            }
+            a = a > ta ? a : ta;
+            b = b < tb ? b : tb;
+        }
+    }
+    if (a >= b) {
+        return 0;
+    }
+    *t0 = a;
+    *t1 = b;
+    return 1;
+}
+
 ATM_FN void atm_world_to_ijk(const struct AtmVoxelGrid* g, const float p[3], int ijk[3]) {
     ijk[0] = (int)floorf((p[0] - g->origin[0]) / g->dx);
     ijk[1] = (int)floorf((p[1] - g->origin[1]) / g->dy);
@@ -208,18 +244,18 @@ ATM_FN void atm_hit_clear(struct AtmHit* h) {
 /* Voxel Woodcock in [0, tmax]. htrdr scattering_hit_filter: Ts ~ Exp(1),
  * brick ks_max, accept ks/ks_max (walk_ks=1). LW may walk kext (walk_ks=0). */
 template <typename Rng>
-ATM_FN struct AtmHit atm_woodcock_voxels(
+ATM_FN void atm_woodcock_voxels_into(
     const struct AtmVoxelGrid* g,
     const float org[3],
     const float dir[3],
     float tmax,
     Rng& rng,
-    float mie_omega = -1.f,
-    int walk_ks = 1) {
-    struct AtmHit hit;
-    atm_hit_clear(&hit);
-    if (!g || g->nx <= 0 || tmax <= 1e-8f) {
-        return hit;
+    float mie_omega,
+    int walk_ks,
+    struct AtmHit* hit) {
+    atm_hit_clear(hit);
+    if (!g || !hit || g->nx <= 0 || tmax <= 1e-8f) {
+        return;
     }
 
     const float gx0 = g->origin[0];
@@ -239,7 +275,7 @@ ATM_FN struct AtmHit atm_woodcock_voxels(
         const float hi = a == 0 ? gx1 : (a == 1 ? gy1 : gz1);
         if (fabsf(d) < 1e-20f) {
             if (o < lo || o > hi) {
-                return hit;
+                return;
             }
         } else {
             float ta = (lo - o) / d;
@@ -254,7 +290,7 @@ ATM_FN struct AtmHit atm_woodcock_voxels(
         }
     }
     if (t0 >= t1) {
-        return hit;
+        return;
     }
 
     float t = t0 > 0.f ? t0 : 0.f;
@@ -329,27 +365,111 @@ ATM_FN struct AtmHit atm_woodcock_voxels(
         /* htrdr SW: accept ks/ks_max (scatter only). LW: accept kext then ω. */
         const float k_acc = walk_ks ? ks : kext;
         if (r * kmax < k_acc) {
-            hit.t = t;
-            hit.pos[0] = pos[0];
-            hit.pos[1] = pos[1];
-            hit.pos[2] = pos[2];
-            hit.ka = ka;
-            hit.ks = ks;
-            hit.kext = kext;
-            hit.temperature = atm_fetch_temp(g, cij[0], cij[1], cij[2]);
+            hit->t = t;
+            hit->pos[0] = pos[0];
+            hit->pos[1] = pos[1];
+            hit->pos[2] = pos[2];
+            hit->ka = ka;
+            hit->ks = ks;
+            hit->kext = kext;
+            hit->temperature = atm_fetch_temp(g, cij[0], cij[1], cij[2]);
             if (walk_ks) {
-                hit.event = ATM_EVENT_SCATTER_VOXEL;
+                hit->event = ATM_EVENT_SCATTER_VOXEL;
             } else {
                 const float omega_voxel = kext > 1e-20f ? ks / kext : 0.f;
                 const float omega = mie_omega >= 0.f ? mie_omega : omega_voxel;
-                hit.event = (rng.next_1d() < omega) ? ATM_EVENT_SCATTER_VOXEL : ATM_EVENT_ABSORB_VOXEL;
+                hit->event = (rng.next_1d() < omega) ? ATM_EVENT_SCATTER_VOXEL : ATM_EVENT_ABSORB_VOXEL;
             }
-            return hit;
+            return;
         }
         /* Null collision */
         Ts = atm_ran_exp(rng.next_1d());
     }
+}
+
+template <typename Rng>
+ATM_FN struct AtmHit atm_woodcock_voxels(
+    const struct AtmVoxelGrid* g,
+    const float org[3],
+    const float dir[3],
+    float tmax,
+    Rng& rng,
+    float mie_omega = -1.f,
+    int walk_ks = 1) {
+    struct AtmHit hit;
+    atm_woodcock_voxels_into(g, org, dir, tmax, rng, mie_omega, walk_ks, &hit);
     return hit;
+}
+
+/* Woodcock inside one brick [t_enter, t_exit]. One Ts for this box (SVX leaf).
+ * Writes *out; never returned by value (NVRTC IS ABI). */
+template <typename Rng>
+ATM_FN void atm_woodcock_brick(
+    const struct AtmVoxelGrid* g,
+    const float org[3],
+    const float dir[3],
+    float t_enter,
+    float t_exit,
+    int bx,
+    int by,
+    int bz,
+    Rng& rng,
+    float mie_omega,
+    int walk_ks,
+    struct AtmHit* out) {
+    atm_hit_clear(out);
+    if (!g || !out || t_exit <= t_enter + 1e-8f) {
+        return;
+    }
+    const float kmax = atm_brick_kmax(g, bx, by, bz);
+    if (kmax <= 1e-12f) {
+        return;
+    }
+
+    float t = t_enter;
+    float Ts = atm_ran_exp(rng.next_1d());
+    for (int step = 0; step < 100000; ++step) {
+        if (t >= t_exit - 1e-6f) {
+            break;
+        }
+        const float vox_dst = t_exit - t;
+        const float Tau = vox_dst * kmax;
+        if (Ts > Tau) {
+            return;
+        }
+        const float collision_dst = Ts / kmax;
+        t += collision_dst;
+        if (t > t_exit) {
+            break;
+        }
+        float pos[3] = {org[0] + dir[0] * t, org[1] + dir[1] * t, org[2] + dir[2] * t};
+        int cij[3];
+        atm_world_to_ijk(g, pos, cij);
+        const float ka = atm_fetch_ka(g, cij[0], cij[1], cij[2]);
+        const float ks = atm_fetch_ks(g, cij[0], cij[1], cij[2]);
+        const float kext = ka + ks;
+        const float r = rng.next_1d();
+        const float k_acc = walk_ks ? ks : kext;
+        if (r * kmax < k_acc) {
+            out->t = t;
+            out->pos[0] = pos[0];
+            out->pos[1] = pos[1];
+            out->pos[2] = pos[2];
+            out->ka = ka;
+            out->ks = ks;
+            out->kext = kext;
+            out->temperature = atm_fetch_temp(g, cij[0], cij[1], cij[2]);
+            if (walk_ks) {
+                out->event = ATM_EVENT_SCATTER_VOXEL;
+            } else {
+                const float omega_voxel = kext > 1e-20f ? ks / kext : 0.f;
+                const float omega = mie_omega >= 0.f ? mie_omega : omega_voxel;
+                out->event = (rng.next_1d() < omega) ? ATM_EVENT_SCATTER_VOXEL : ATM_EVENT_ABSORB_VOXEL;
+            }
+            return;
+        }
+        Ts = atm_ran_exp(rng.next_1d());
+    }
 }
 
 /* 1D layered gas: SW walks ks (scatter only); LW walks kext then ka/ks split. */
@@ -490,15 +610,217 @@ ATM_FN float atm_ray_triangle(
     return t > 1e-6f ? t : ATM_INF;
 }
 
+/* Regular heightfield: nvert = n*n, ntri = 2*(n-1)^2, row-major (iy * n + ix). */
+ATM_FN int atm_mesh_grid_n(const struct AtmMesh* mesh) {
+    if (!mesh || mesh->nvert < 4 || mesh->ntri < 2 || !mesh->vertices || !mesh->indices) {
+        return 0;
+    }
+    const int n = (int)(sqrt((double)mesh->nvert) + 0.5);
+    if (n < 2 || n * n != mesh->nvert) {
+        return 0;
+    }
+    const int n1 = n - 1;
+    if (mesh->ntri != 2 * n1 * n1) {
+        return 0;
+    }
+    const float dx = mesh->vertices[3] - mesh->vertices[0];
+    const float dy = mesh->vertices[n * 3 + 1] - mesh->vertices[1];
+    if (!(dx > 1e-3f && dy > 1e-3f)) {
+        return 0;
+    }
+    return n;
+}
+
+ATM_FN void atm_mesh_fill_hit(const struct AtmMesh* mesh, int tri, float t, struct AtmMeshHit* hit) {
+    hit->t = t;
+    hit->tri = tri;
+    const int i0 = mesh->indices[tri * 3 + 0];
+    const int i1 = mesh->indices[tri * 3 + 1];
+    const int i2 = mesh->indices[tri * 3 + 2];
+    const float* v0 = mesh->vertices + i0 * 3;
+    const float* v1 = mesh->vertices + i1 * 3;
+    const float* v2 = mesh->vertices + i2 * 3;
+    const float e1[3] = {v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2]};
+    const float e2[3] = {v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2]};
+    hit->n[0] = e1[1] * e2[2] - e1[2] * e2[1];
+    hit->n[1] = e1[2] * e2[0] - e1[0] * e2[2];
+    hit->n[2] = e1[0] * e2[1] - e1[1] * e2[0];
+    atm_normalize3(hit->n);
+    if (mesh->albedo) {
+        hit->albedo[0] = mesh->albedo[tri * 3 + 0];
+        hit->albedo[1] = mesh->albedo[tri * 3 + 1];
+        hit->albedo[2] = mesh->albedo[tri * 3 + 2];
+    }
+    if (mesh->temperature) {
+        hit->temperature = mesh->temperature[tri];
+    }
+}
+
+ATM_FN void atm_mesh_test_grid_cell(
+    const struct AtmMesh* mesh,
+    int n,
+    int ix,
+    int iy,
+    const float org[3],
+    const float dir[3],
+    float* best,
+    int* best_i) {
+    if (ix < 0 || iy < 0 || ix >= n - 1 || iy >= n - 1) {
+        return;
+    }
+    const int cell = iy * (n - 1) + ix;
+    for (int k = 0; k < 2; ++k) {
+        const int tri = cell * 2 + k;
+        const int i0 = mesh->indices[tri * 3 + 0];
+        const int i1 = mesh->indices[tri * 3 + 1];
+        const int i2 = mesh->indices[tri * 3 + 2];
+        const float t = atm_ray_triangle(
+            org,
+            dir,
+            mesh->vertices + i0 * 3,
+            mesh->vertices + i1 * 3,
+            mesh->vertices + i2 * 3);
+        if (t < *best) {
+            *best = t;
+            *best_i = tri;
+        }
+    }
+}
+
+/* XY DDA over a heightfield. Brute-force loop is only for tiny non-grid meshes. */
+ATM_FN int atm_mesh_grid_closest(
+    const struct AtmMesh* mesh,
+    int n,
+    const float org[3],
+    const float dir[3],
+    float tmax,
+    float* best_t,
+    int* best_i) {
+    const float gx0 = mesh->vertices[0];
+    const float gy0 = mesh->vertices[1];
+    const float dx = mesh->vertices[3] - gx0;
+    const float dy = mesh->vertices[n * 3 + 1] - gy0;
+    const float gx1 = gx0 + dx * (float)(n - 1);
+    const float gy1 = gy0 + dy * (float)(n - 1);
+    float t0 = 0.f;
+    float t1 = tmax;
+    for (int a = 0; a < 2; ++a) {
+        const float o = org[a];
+        const float d = dir[a];
+        const float lo = a == 0 ? gx0 : gy0;
+        const float hi = a == 0 ? gx1 : gy1;
+        if (fabsf(d) < 1e-20f) {
+            if (o < lo || o > hi) {
+                return 0;
+            }
+        } else {
+            float ta = (lo - o) / d;
+            float tb = (hi - o) / d;
+            if (ta > tb) {
+                const float tmp = ta;
+                ta = tb;
+                tb = tmp;
+            }
+            t0 = t0 > ta ? t0 : ta;
+            t1 = t1 < tb ? t1 : tb;
+        }
+    }
+    if (t0 >= t1) {
+        return 0;
+    }
+    float t = t0 + 1e-4f;
+    const float px = org[0] + dir[0] * t;
+    const float py = org[1] + dir[1] * t;
+    int ix = (int)floorf((px - gx0) / dx);
+    int iy = (int)floorf((py - gy0) / dy);
+    if (ix < 0) {
+        ix = 0;
+    }
+    if (iy < 0) {
+        iy = 0;
+    }
+    if (ix > n - 2) {
+        ix = n - 2;
+    }
+    if (iy > n - 2) {
+        iy = n - 2;
+    }
+    int step[2];
+    float tDelta[2], tMax[2];
+    const int ijk0[2] = {ix, iy};
+    const float o2[2] = {org[0], org[1]};
+    const float d2[2] = {dir[0], dir[1]};
+    const float origin[2] = {gx0, gy0};
+    const float sp[2] = {dx, dy};
+    for (int a = 0; a < 2; ++a) {
+        if (d2[a] > 1e-20f) {
+            step[a] = 1;
+            tDelta[a] = sp[a] / d2[a];
+            tMax[a] = (origin[a] + sp[a] * (float)(ijk0[a] + 1) - o2[a]) / d2[a];
+        } else if (d2[a] < -1e-20f) {
+            step[a] = -1;
+            tDelta[a] = sp[a] / (-d2[a]);
+            tMax[a] = (origin[a] + sp[a] * (float)ijk0[a] - o2[a]) / d2[a];
+        } else {
+            step[a] = 0;
+            tDelta[a] = ATM_INF;
+            tMax[a] = ATM_INF;
+        }
+    }
+    float best = tmax;
+    int besti = -1;
+    const int nsteps = 2 * (n + 2);
+    for (int s = 0; s < nsteps; ++s) {
+        if (t >= best - 1e-6f || t >= t1 - 1e-6f) {
+            break;
+        }
+        atm_mesh_test_grid_cell(mesh, n, ix, iy, org, dir, &best, &besti);
+        const float tNext = fminf(t1, fminf(tMax[0], tMax[1]));
+        if (tNext >= t1 - 1e-6f) {
+            break;
+        }
+        if (tMax[0] < tMax[1]) {
+            ix += step[0];
+            tMax[0] += tDelta[0];
+        } else {
+            iy += step[1];
+            tMax[1] += tDelta[1];
+        }
+        t = tNext;
+        if (ix < -1 || iy < -1 || ix > n - 1 || iy > n - 1) {
+            break;
+        }
+    }
+    if (besti < 0) {
+        return 0;
+    }
+    *best_t = best;
+    *best_i = besti;
+    return 1;
+}
+
 ATM_FN float atm_mesh_closest(
     const struct AtmMesh* mesh,
     const float org[3],
     const float dir[3],
     float tmax) {
-    float best = tmax;
     if (!mesh || mesh->ntri <= 0) {
         return ATM_INF;
     }
+    const int n = atm_mesh_grid_n(mesh);
+    if (n > 0) {
+        float best = tmax;
+        int best_i = -1;
+        if (atm_mesh_grid_closest(mesh, n, org, dir, tmax, &best, &best_i)) {
+            return best;
+        }
+        return ATM_INF;
+    }
+    /* Tiny meshes only (two-triangle sand). Never scan millions of tris. */
+    if (mesh->ntri > 64) {
+        return ATM_INF;
+    }
+    float best = tmax;
     for (int i = 0; i < mesh->ntri; ++i) {
         const int i0 = mesh->indices[i * 3 + 0];
         const int i1 = mesh->indices[i * 3 + 1];
@@ -535,48 +857,36 @@ ATM_FN struct AtmMeshHit atm_mesh_closest_hit(
     }
     float best = tmax;
     int best_i = -1;
-    for (int i = 0; i < mesh->ntri; ++i) {
-        const int i0 = mesh->indices[i * 3 + 0];
-        const int i1 = mesh->indices[i * 3 + 1];
-        const int i2 = mesh->indices[i * 3 + 2];
-        const float* v0 = mesh->vertices + i0 * 3;
-        const float* v1 = mesh->vertices + i1 * 3;
-        const float* v2 = mesh->vertices + i2 * 3;
-        const float t = atm_ray_triangle(org, dir, v0, v1, v2);
-        if (t < best) {
-            best = t;
-            best_i = i;
+    const int n = atm_mesh_grid_n(mesh);
+    if (n > 0) {
+        if (!atm_mesh_grid_closest(mesh, n, org, dir, tmax, &best, &best_i)) {
+            return hit;
+        }
+    } else if (mesh->ntri > 64) {
+        return hit;
+    } else {
+        for (int i = 0; i < mesh->ntri; ++i) {
+            const int i0 = mesh->indices[i * 3 + 0];
+            const int i1 = mesh->indices[i * 3 + 1];
+            const int i2 = mesh->indices[i * 3 + 2];
+            const float* v0 = mesh->vertices + i0 * 3;
+            const float* v1 = mesh->vertices + i1 * 3;
+            const float* v2 = mesh->vertices + i2 * 3;
+            const float t = atm_ray_triangle(org, dir, v0, v1, v2);
+            if (t < best) {
+                best = t;
+                best_i = i;
+            }
+        }
+        if (best_i < 0) {
+            return hit;
         }
     }
-    if (best_i < 0) {
-        return hit;
-    }
-    hit.t = best;
-    hit.tri = best_i;
-    const int i0 = mesh->indices[best_i * 3 + 0];
-    const int i1 = mesh->indices[best_i * 3 + 1];
-    const int i2 = mesh->indices[best_i * 3 + 2];
-    const float* v0 = mesh->vertices + i0 * 3;
-    const float* v1 = mesh->vertices + i1 * 3;
-    const float* v2 = mesh->vertices + i2 * 3;
-    const float e1[3] = {v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2]};
-    const float e2[3] = {v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2]};
-    hit.n[0] = e1[1] * e2[2] - e1[2] * e2[1];
-    hit.n[1] = e1[2] * e2[0] - e1[0] * e2[2];
-    hit.n[2] = e1[0] * e2[1] - e1[1] * e2[0];
-    atm_normalize3(hit.n);
+    atm_mesh_fill_hit(mesh, best_i, best, &hit);
     if (atm_dot3(hit.n, dir) > 0.f) {
         hit.n[0] = -hit.n[0];
         hit.n[1] = -hit.n[1];
         hit.n[2] = -hit.n[2];
-    }
-    if (mesh->albedo) {
-        hit.albedo[0] = mesh->albedo[best_i * 3 + 0];
-        hit.albedo[1] = mesh->albedo[best_i * 3 + 1];
-        hit.albedo[2] = mesh->albedo[best_i * 3 + 2];
-    }
-    if (mesh->temperature) {
-        hit.temperature = mesh->temperature[best_i];
     }
     return hit;
 }

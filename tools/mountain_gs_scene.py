@@ -459,6 +459,53 @@ def downsample_to_gs(grid: np.ndarray, step: int = 8) -> dict:
     }
 
 
+def heightfield_to_mesh(grid: np.ndarray) -> dict:
+    """Regular grid → triangle soup matching atm_mesh_grid_n (iy * n + ix)."""
+    n = int(grid.shape[0])
+    verts = np.ascontiguousarray(grid.reshape(-1, 3), dtype=np.float32)
+    n1 = n - 1
+    iy = np.arange(n1, dtype=np.int32)[:, None]
+    ix = np.arange(n1, dtype=np.int32)[None, :]
+    i00 = iy * n + ix
+    i10 = i00 + 1
+    i01 = i00 + n
+    i11 = i01 + 1
+    t0 = np.stack([i00, i10, i11], axis=-1)
+    t1 = np.stack([i00, i11, i01], axis=-1)
+    idx = np.stack([t0, t1], axis=2).reshape(-1, 3).astype(np.int32)
+    v0 = verts[idx[:, 0]]
+    e1 = verts[idx[:, 1]] - v0
+    e2 = verts[idx[:, 2]] - v0
+    nn = np.cross(e1, e2)
+    nn[nn[:, 2] < 0] *= -1.0
+    ln = np.linalg.norm(nn, axis=1, keepdims=True)
+    nn = nn / np.maximum(ln, 1e-12)
+    slope = np.degrees(np.arccos(np.clip(nn[:, 2], 0.0, 1.0)))
+    s = np.clip(slope / 55.0, 0.0, 1.0)
+    alb = np.stack(
+        [0.22 * (1.0 - 0.22 * s), 0.16 * (1.0 - 0.18 * s), 0.10 * (1.0 - 0.12 * s)],
+        axis=-1,
+    ).astype(np.float32)
+    temp = np.full((idx.shape[0],), 300.0, np.float32)
+    print(f"mountain mesh {n}x{n} verts={verts.shape[0]} tris={idx.shape[0]} z=[{verts[:,2].min():.1f},{verts[:,2].max():.1f}]")
+    return {"verts": verts, "idx": idx, "albedo": alb, "temp": temp}
+
+
+def ensure_mountain_mesh(outdir: str = DEFAULT_OUT, obj_path: str = DEFAULT_OBJ, rebuild: bool = False) -> dict:
+    cache = os.path.join(outdir, "mountain_mesh.npz")
+    if (not rebuild) and os.path.isfile(cache):
+        data = np.load(cache)
+        mesh = {k: data[k] for k in ("verts", "idx", "albedo", "temp")}
+        print(f"mountain mesh from cache {cache}  verts={mesh['verts'].shape[0]} tris={mesh['idx'].shape[0]}")
+        return mesh
+    grid = load_mountain_grid(obj_path)
+    mesh = heightfield_to_mesh(grid)
+    os.makedirs(outdir, exist_ok=True)
+    np.savez_compressed(cache, **mesh)
+    print(f"wrote {cache}")
+    return mesh
+
+
 def write_ply(path: str, gs: dict) -> None:
     n = gs["pos"].shape[0]
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)

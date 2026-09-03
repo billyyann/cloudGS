@@ -247,6 +247,31 @@ def diagnose_cloud_sun_tr(ka, ks, origin, spacing, sun):
         print("warning: expected analog sun Tr in (0,1)")
 
 
+def make_persp_rays(w, h, pos, tgt, up, fov_y_deg, spp, device):
+    """htrdr perspective: fov is vertical FOV in degrees (mountain.sh fov=30)."""
+    look = tgt - pos
+    look = look / np.linalg.norm(look)
+    up = up - look * np.dot(up, look)
+    up = up / np.linalg.norm(up)
+    right = np.cross(look, up)
+    right = right / np.linalg.norm(right)
+    half_v = math.tan(0.5 * math.radians(fov_y_deg))
+    half_u = half_v * (w / float(h))
+    rng = np.random.default_rng(0)
+    ori = np.zeros((spp, h, w, 3), np.float32)
+    drc = np.zeros((spp, h, w, 3), np.float32)
+    for s in range(spp):
+        js = (np.arange(w, dtype=np.float32)[None, :] + rng.random((h, w))) / w
+        is_ = (np.arange(h, dtype=np.float32)[:, None] + rng.random((h, w))) / h
+        u = (js - 0.5) * 2.0 * half_u
+        v = (0.5 - is_) * 2.0 * half_v
+        d = look[None, None, :] + right[None, None, :] * u[..., None] + up[None, None, :] * v[..., None]
+        nrm = np.linalg.norm(d, axis=-1, keepdims=True)
+        ori[s] = pos[None, None, :]
+        drc[s] = (d / np.maximum(nrm, 1e-12)).astype(np.float32)
+    return torch.from_numpy(ori).to(device), torch.from_numpy(drc).to(device)
+
+
 def make_ortho_rays(w, h, center, height, up, look, spp, device):
     """htrdr orthographic: pos/tgt/up, height = vertical sensor extent (meters)."""
     look = look / np.linalg.norm(look)
@@ -289,6 +314,23 @@ def main():
     p.add_argument("--max-bounces", type=int, default=1024, help="volume walk budget (htrdr is unbounded)")
     p.add_argument("--mie-g", type=float, default=0.865, help="HG asymmetry (Mie LUT ~0.865 at 550 nm)")
     p.add_argument("--rebuild-scene", action="store_true", help="rebuild ply/voxels/gas in Python")
+    p.add_argument(
+        "--no-clouds",
+        action="store_true",
+        help="zero voxel ka/ks and 1D gas so only GS+mesh ground is lit",
+    )
+    p.add_argument(
+        "--camera",
+        choices=("ortho", "mountain"),
+        default="ortho",
+        help="ortho = desert_ortho nadir 6.4 km; mountain = mountain.sh perspective",
+    )
+    p.add_argument(
+        "--ground",
+        choices=("gs", "mesh"),
+        default="gs",
+        help="gs = 3DGS mountain + hole-fill quad; mesh = htrdr mountain.obj",
+    )
     args = p.parse_args()
     os.makedirs(args.outdir, exist_ok=True)
 
@@ -329,9 +371,14 @@ def main():
     )
     print("OptixTracer ready")
 
-    gs = load_ply_gs(args.ply, device)
-    print(f"GS particles: {gs['pos'].shape[0]}")
-    tracer.build_bvh(gs["pos"], gs["rot"], gs["scl"], gs["dns"], 1, False)
+    use_mesh_ground = args.ground == "mesh"
+    if use_mesh_ground:
+        mountain_mesh = mgs.ensure_mountain_mesh(outdir=args.outdir)
+        print("ground: htrdr mountain.obj mesh (GS off)")
+    else:
+        gs = load_ply_gs(args.ply, device)
+        print(f"GS particles: {gs['pos'].shape[0]}")
+        tracer.build_bvh(gs["pos"], gs["rot"], gs["scl"], gs["dns"], 1, False)
 
     if os.path.isfile(args.htcp_bin):
         ka, ks, temp, origin, spacing = load_htcp_bin(args.htcp_bin)
@@ -348,6 +395,13 @@ def main():
     az = math.radians(225.0)
     el = math.radians(30.0)
     sun = (math.cos(el) * math.cos(az), math.cos(el) * math.sin(az), math.sin(el))
+    gas_ka, gas_ks = gas["ka"], gas["ks"]
+    if args.no_clouds:
+        ka = np.zeros_like(ka)
+        ks = np.zeros_like(ks)
+        gas_ka = np.zeros_like(gas_ka)
+        gas_ks = np.zeros_like(gas_ks)
+        print("no-clouds: voxel ka/ks and gas ka/ks zeroed")
     diagnose_cloud_sun_tr(ka, ks, origin, spacing, sun)
     buffers = AtmosphereBuffers.from_numpy(
         device=device,
@@ -358,8 +412,8 @@ def main():
         voxel_spacing=tuple(np.asarray(spacing, np.float32).tolist()),
         brick=8,
         gas_z=gas["z"],
-        gas_ka=gas["ka"],
-        gas_ks=gas["ks"],
+        gas_ka=gas_ka,
+        gas_ks=gas_ks,
         gas_temp=gas["temp"],
         sun_dir=sun,
         sun_radiance=24.0,
@@ -371,23 +425,34 @@ def main():
         path_tmax=1.2e5,
         max_bounces=args.max_bounces,
     )
-    buffers.particle_density = gs["density"]
-    buffers.particle_material = gs["material"]
-    buffers.particle_radiance = gs["radiance"]
-    buffers.particle_shading_normal = gs["normal"]
-    # Sand plane mesh (same domain as htrdr desert ortho) fills GS holes; GS is closer relief.
-    mesh_verts = torch.tensor(
-        [[0.0, 0.0, 1.0], [6400.0, 0.0, 1.0], [6400.0, 6400.0, 1.0], [0.0, 6400.0, 1.0]],
-        dtype=torch.float32,
-        device=device,
-    )
-    mesh_idx = torch.tensor([[0, 1, 2], [0, 2, 3]], dtype=torch.int32, device=device)
-    mesh_alb = torch.tensor([[0.22, 0.16, 0.10], [0.22, 0.16, 0.10]], dtype=torch.float32, device=device)
-    mesh_t = torch.tensor([300.0, 300.0], dtype=torch.float32, device=device)
-    buffers.mesh_verts = mesh_verts
-    buffers.mesh_idx = mesh_idx
-    buffers.mesh_albedo = mesh_alb
-    buffers.mesh_temp = mesh_t
+    if use_mesh_ground:
+        buffers.particle_density = torch.zeros((0, 12), dtype=torch.float32, device=device)
+        buffers.particle_material = torch.zeros((0, 5), dtype=torch.float32, device=device)
+        buffers.particle_radiance = torch.zeros((0, 1), dtype=torch.float32, device=device)
+        buffers.particle_shading_normal = torch.zeros((0, 3), dtype=torch.float32, device=device)
+        buffers.mesh_verts = torch.from_numpy(mountain_mesh["verts"]).to(device)
+        buffers.mesh_idx = torch.from_numpy(mountain_mesh["idx"]).to(device)
+        buffers.mesh_albedo = torch.from_numpy(mountain_mesh["albedo"]).to(device)
+        buffers.mesh_temp = torch.from_numpy(mountain_mesh["temp"]).to(device)
+    else:
+        buffers.particle_density = gs["density"]
+        buffers.particle_material = gs["material"]
+        buffers.particle_radiance = gs["radiance"]
+        buffers.particle_shading_normal = gs["normal"]
+        if args.camera == "ortho":
+            # Sand plane mesh (same domain as htrdr desert ortho) fills GS holes.
+            mesh_verts = torch.tensor(
+                [[0.0, 0.0, 1.0], [6400.0, 0.0, 1.0], [6400.0, 6400.0, 1.0], [0.0, 6400.0, 1.0]],
+                dtype=torch.float32,
+                device=device,
+            )
+            mesh_idx = torch.tensor([[0, 1, 2], [0, 2, 3]], dtype=torch.int32, device=device)
+            mesh_alb = torch.tensor([[0.22, 0.16, 0.10], [0.22, 0.16, 0.10]], dtype=torch.float32, device=device)
+            mesh_t = torch.tensor([300.0, 300.0], dtype=torch.float32, device=device)
+            buffers.mesh_verts = mesh_verts
+            buffers.mesh_idx = mesh_idx
+            buffers.mesh_albedo = mesh_alb
+            buffers.mesh_temp = mesh_t
     print(
         "voxel ks max/mean",
         float(np.max(ks)),
@@ -396,20 +461,30 @@ def main():
         float(buffers.voxel_kmax.max().item()),
     )
 
-    # Match htrdr DZVAR_ortho: pos=3200,3200,80000 tgt=3200,3200,0 up=0,1,0 height=6400
-    center = np.array([3200.0, 3200.0, 80000.0], np.float32)
-    look = np.array([0.0, 0.0, -1.0], np.float32)
-    up = np.array([0.0, 1.0, 0.0], np.float32)
-    w = h = args.res
     acc = None
     chunk = min(args.spp, 4)
     nchunk = (args.spp + chunk - 1) // chunk
-    print(f"GPU PTIR ortho {w}x{h} spp={args.spp} (chunks of {chunk})")
     from threedgptir_tracer.atmosphere import trace_atmosphere
+
+    if args.camera == "mountain":
+        w, h = 960, 540
+        pos = np.array([10245.37, 615.02, 422.34], np.float32)
+        tgt = np.array([-2977.39, 6829.40, 842.40], np.float32)
+        up = np.array([0.0, 0.0, 1.0], np.float32)
+        print(f"GPU PTIR mountain.sh persp {w}x{h} spp={args.spp} fov=30 (chunks of {chunk})")
+    else:
+        w = h = args.res
+        center = np.array([3200.0, 3200.0, 80000.0], np.float32)
+        look = np.array([0.0, 0.0, -1.0], np.float32)
+        up = np.array([0.0, 1.0, 0.0], np.float32)
+        print(f"GPU PTIR ortho {w}x{h} spp={args.spp} (chunks of {chunk})")
 
     for c in range(nchunk):
         n = min(chunk, args.spp - c * chunk)
-        ori, drc = make_ortho_rays(w, h, center, args.height, up, look, n, device)
+        if args.camera == "mountain":
+            ori, drc = make_persp_rays(w, h, pos, tgt, up, 30.0, n, device)
+        else:
+            ori, drc = make_ortho_rays(w, h, center, args.height, up, look, n, device)
         out = trace_atmosphere(tracer, ori, drc, buffers, frame_number=c)
         rgb = out[10]  # ray_pbr
         part = rgb.float().mean(dim=0).cpu().numpy()
@@ -452,17 +527,28 @@ def main():
     import datetime
 
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    gpu_path = os.path.join(args.outdir, f"render_ortho_gpu_{stamp}.png")
+    tag = ""
+    if args.camera == "mountain":
+        tag += "_mountain"
+    if args.ground == "mesh":
+        tag += "_mesh"
+    if args.no_clouds:
+        tag += "_nocloud"
+    gpu_path = os.path.join(args.outdir, f"render_ortho_gpu{tag}_{stamp}.png")
     Image.fromarray(rgb8).save(gpu_path)
     print("wrote", gpu_path)
     # Never overwrite frozen keep copies.
     keep_gpu = os.path.join(args.outdir, "render_ortho_gpu_keep.png")
-    if not os.path.isfile(keep_gpu):
+    if args.camera == "ortho" and args.ground == "gs" and not args.no_clouds and not os.path.isfile(keep_gpu):
         Image.fromarray(rgb8).save(keep_gpu)
 
-    orig = os.path.join(
-        ROOT, "htrdr-atmosphere-spk/htrdr-Atmosphere-Starter-Pack-0.8.0/ortho_512x512x32.ppm"
-    )
+    spk = os.path.join(ROOT, "htrdr-atmosphere-spk/htrdr-Atmosphere-Starter-Pack-0.8.0")
+    if args.camera == "mountain":
+        orig = os.path.join(spk, "test_320x240x16.ppm")
+        left_label = "htrdr test_320x240x16 (mountain.sh style)"
+    else:
+        orig = os.path.join(spk, "ortho_512x512x32.ppm")
+        left_label = "htrdr ortho 512x512 spp32  (DZVAR + desert)"
     if os.path.isfile(orig):
         oim = Image.open(orig).convert("RGB").resize((w, h), Image.NEAREST)
         canvas = Image.new("RGB", (w * 2 + 24, h + 48), (18, 18, 18))
@@ -471,15 +557,24 @@ def main():
         try:
             from PIL import ImageDraw, ImageFont
             d = ImageDraw.Draw(canvas)
-            d.text((8, 8), "htrdr ortho 512x512 spp32  (DZVAR + desert)", fill=(220, 220, 220))
-            d.text((w + 16, 8), "GPU PTIR  Ks walk + Tr_abs + mesh-only volume NEE", fill=(220, 220, 220))
+            d.text((8, 8), left_label, fill=(220, 220, 220))
+            gpu_label = (
+                "GPU PTIR  ground only (no voxel cloud, no gas)"
+                if args.no_clouds
+                else "GPU PTIR  Ks walk + Tr_abs + mesh-only volume NEE"
+            )
+            if args.ground == "mesh":
+                gpu_label = "GPU PTIR  mountain.obj mesh" + ("  no clouds" if args.no_clouds else "")
+            if args.camera == "mountain":
+                gpu_label = "GPU PTIR  mountain.sh camera" + ("  no clouds" if args.no_clouds else "")
+            d.text((w + 16, 8), gpu_label, fill=(220, 220, 220))
         except Exception:
             pass
-        cmp = os.path.join(args.outdir, f"compare_ortho_{stamp}.png")
+        cmp = os.path.join(args.outdir, f"compare_ortho{tag}_{stamp}.png")
         canvas.save(cmp)
         print("wrote", cmp)
         keep_cmp = os.path.join(args.outdir, "compare_ortho_keep.png")
-        if not os.path.isfile(keep_cmp):
+        if args.camera == "ortho" and args.ground == "gs" and not args.no_clouds and not os.path.isfile(keep_cmp):
             canvas.save(keep_cmp)
 
 

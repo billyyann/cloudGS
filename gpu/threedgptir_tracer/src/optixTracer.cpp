@@ -31,6 +31,7 @@
 #include <3dgptir/optixTracer.h>
 #include <3dgptir/particlePrimitives.h>
 #include <3dgptir/pipelineParameters.h>
+#include <3dgptir/atmosphere.h>
 #include <3dgptir/tensorBuffering.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <cstdio>
@@ -44,6 +45,7 @@
 #include <nvrtc.h>
 #include <optix.h>
 #include <optix_function_table_definition.h>
+#include <vector>
 
 //------------------------------------------------------------------------------
 //
@@ -403,7 +405,8 @@ OptixTracer::OptixTracer(
     _state->pipelineTracingFwd = nullptr;
     _state->sbtTracingFwd      = {};
     //调用 createPipeline 函数，编译着色器源码、创建 OptiX 模块、链接程序组、生成着色器绑定表，最终建立一条完整的光线追踪管线。
-    createPipeline(_state->context, path, path, cuda_path, defines, pipeline + "Optix", sharedFlags | PipelineFlag_HasRG | PipelineFlag_HasAH,
+    createPipeline(_state->context, path, path, cuda_path, defines, pipeline + "Optix",
+                   sharedFlags | PipelineFlag_HasRG | PipelineFlag_HasAH | PipelineFlag_AtmAccel,
                    &_state->moduleTracingFwd, &_state->pipelineTracingFwd, _state->sbtTracingFwd, 32);
 
     _state->moduleTracingBwd   = nullptr;
@@ -448,6 +451,12 @@ OptixTracer::~OptixTracer(void) {
     CUDA_CHECK(cudaFree(reinterpret_cast<void*>(_state->paramsDevice)));
 
     CUDA_CHECK(cudaFree(reinterpret_cast<void*>(_state->gasBuffer)));
+    CUDA_CHECK(cudaFree(reinterpret_cast<void*>(_state->meshGasBuffer)));
+    CUDA_CHECK(cudaFree(reinterpret_cast<void*>(_state->volGasBuffer)));
+    CUDA_CHECK(cudaFree(reinterpret_cast<void*>(_state->volAabbBuffer)));
+    CUDA_CHECK(cudaFree(reinterpret_cast<void*>(_state->volBrickIdBuffer)));
+    CUDA_CHECK(cudaFree(reinterpret_cast<void*>(_state->meshVolIasBuffer)));
+    CUDA_CHECK(cudaFree(reinterpret_cast<void*>(_state->meshVolIasInstances)));
     if (_state->raygenSetupCycleCounter) {
         CUDA_CHECK(cudaFree(reinterpret_cast<void*>(_state->raygenSetupCycleCounter)));
         _state->raygenSetupCycleCounter = 0;
@@ -508,19 +517,21 @@ void OptixTracer::createPipeline(
 
         // ---------- 1.2 设置管线编译选项 ----------
         pipeline_compile_options.usesMotionBlur = false;  // 不使用运动模糊（简化）
-        pipeline_compile_options.traversableGraphFlags = OPTIX_TRAVERSABLE_GRAPH_FLAG_ALLOW_SINGLE_GAS;  // 只允许单个 GAS
+        pipeline_compile_options.traversableGraphFlags =
+            (flags & PipelineFlag_AtmAccel)
+                ? (OPTIX_TRAVERSABLE_GRAPH_FLAG_ALLOW_SINGLE_GAS |
+                   OPTIX_TRAVERSABLE_GRAPH_FLAG_ALLOW_SINGLE_LEVEL_INSTANCING)
+                : OPTIX_TRAVERSABLE_GRAPH_FLAG_ALLOW_SINGLE_GAS;
         pipeline_compile_options.numPayloadValues = numPayloadValues;  // 光线载荷大小（32 个 uint32_t）
-        pipeline_compile_options.numAttributeValues = 0;  // 不使用顶点属性（无插值数据）
+        pipeline_compile_options.numAttributeValues = (flags & PipelineFlag_AtmAccel) ? 2 : 0;
         pipeline_compile_options.exceptionFlags = OPTIX_EXCEPTION_FLAG_NONE;  // 不启用异常处理（性能优先）
         pipeline_compile_options.pipelineLaunchParamsVariableName = "params";  // 启动参数结构体名称（在着色器中对应 extern "C" __constant__ Params params）
 
         // ---------- 1.3 设置图元类型 ----------
         pipeline_compile_options.usesPrimitiveTypeFlags = OPTIX_PRIMITIVE_TYPE_FLAGS_TRIANGLE;  // 默认支持三角形
-        if (flags & PipelineFlag_HasIS) {
-            // 自定义图元（如四面体、八面体等）→ 需要用户实现相交着色器
+        if ((flags & PipelineFlag_HasIS) || (flags & PipelineFlag_AtmAccel)) {
             pipeline_compile_options.usesPrimitiveTypeFlags |= OPTIX_PRIMITIVE_TYPE_FLAGS_CUSTOM;
         } else if (flags & PipelineFlag_SpherePrim) {
-            // 球体图元 → 使用 OptiX 内置球体相交（性能更好）
             pipeline_compile_options.usesPrimitiveTypeFlags |= OPTIX_PRIMITIVE_TYPE_FLAGS_SPHERE;
         }
 
@@ -591,7 +602,9 @@ void OptixTracer::createPipeline(
 
     OptixProgramGroup raygen_prog_group = nullptr;    // 光线生成程序组
     OptixProgramGroup miss_prog_group = nullptr;      // 未命中程序组
-    OptixProgramGroup hitgroup_prog_group = nullptr;  // 命中组程序组
+    OptixProgramGroup hitgroup_prog_group = nullptr;  // GS anyhit
+    OptixProgramGroup hitgroup_mesh_prog_group = nullptr;
+    OptixProgramGroup hitgroup_vol_prog_group = nullptr;
 
     {
         OptixProgramGroupOptions program_group_options = {};  // 程序组选项（全零）
@@ -672,6 +685,26 @@ void OptixTracer::createPipeline(
             &sizeof_log,
             &hitgroup_prog_group
         ));
+
+        if (flags & PipelineFlag_AtmAccel) {
+            OptixProgramGroupDesc mesh_hg = {};
+            mesh_hg.kind = OPTIX_PROGRAM_GROUP_KIND_HITGROUP;
+            mesh_hg.hitgroup.moduleCH = *module;
+            mesh_hg.hitgroup.entryFunctionNameCH = "__closesthit__mesh";
+            sizeof_log = sizeof(log);
+            OPTIX_CHECK_LOG(optixProgramGroupCreate(
+                context, &mesh_hg, 1, &program_group_options, log, &sizeof_log, &hitgroup_mesh_prog_group));
+
+            OptixProgramGroupDesc vol_hg = {};
+            vol_hg.kind = OPTIX_PROGRAM_GROUP_KIND_HITGROUP;
+            vol_hg.hitgroup.moduleCH = *module;
+            vol_hg.hitgroup.entryFunctionNameCH = "__closesthit__vol";
+            vol_hg.hitgroup.moduleIS = *module;
+            vol_hg.hitgroup.entryFunctionNameIS = "__intersection__vol";
+            sizeof_log = sizeof(log);
+            OPTIX_CHECK_LOG(optixProgramGroupCreate(
+                context, &vol_hg, 1, &program_group_options, log, &sizeof_log, &hitgroup_vol_prog_group));
+        }
     }
 
     // =========================================================================
@@ -688,6 +721,10 @@ void OptixTracer::createPipeline(
         program_groups.push_back(raygen_prog_group);
         program_groups.push_back(miss_prog_group);
         program_groups.push_back(hitgroup_prog_group);
+        if (flags & PipelineFlag_AtmAccel) {
+            program_groups.push_back(hitgroup_mesh_prog_group);
+            program_groups.push_back(hitgroup_vol_prog_group);
+        }
 
         // ---------- 3.1 设置管线链接选项 ----------
         OptixPipelineLinkOptions pipeline_link_options = {};
@@ -720,14 +757,30 @@ void OptixTracer::createPipeline(
         uint32_t direct_callable_stack_size_from_state;
         uint32_t continuation_stack_size;
         OPTIX_CHECK(optixUtilComputeStackSizes(
-            &stack_sizes,                  // 累加的栈大小
-            max_trace_depth,               // 最大追踪深度
-            0,                             // maxCCDepth（无可调用程序）
-            0,                             // maxDCDepth（无可调用程序）
+            &stack_sizes,
+            max_trace_depth,
+            0,
+            0,
             &direct_callable_stack_size_from_traversal,
             &direct_callable_stack_size_from_state,
             &continuation_stack_size
         ));
+        if (flags & PipelineFlag_AtmAccel) {
+            /* 8M-triangle mesh GAS + custom volume IS needs a deeper continuation stack. */
+            if (direct_callable_stack_size_from_traversal < 2048u) {
+                direct_callable_stack_size_from_traversal = 2048u;
+            }
+            if (direct_callable_stack_size_from_state < 2048u) {
+                direct_callable_stack_size_from_state = 2048u;
+            }
+            if (continuation_stack_size < 16384u) {
+                continuation_stack_size = 16384u;
+            }
+            std::fprintf(stderr, "[atm] pipeline stack trav=%u state=%u cont=%u\n",
+                         direct_callable_stack_size_from_traversal,
+                         direct_callable_stack_size_from_state,
+                         continuation_stack_size);
+        }
 
         // ---------- 3.4 设置管线栈大小 ----------
         OPTIX_CHECK(optixPipelineSetStackSize(
@@ -735,7 +788,7 @@ void OptixTracer::createPipeline(
             direct_callable_stack_size_from_traversal,
             direct_callable_stack_size_from_state,
             continuation_stack_size,
-            1  // maxTraversableDepth（最大可遍历深度）
+            (flags & PipelineFlag_AtmAccel) ? 2 : 1
         ));
     }
 
@@ -779,28 +832,33 @@ void OptixTracer::createPipeline(
         ));
 
         // ---------- 4.3 创建命中组记录 ----------
+        const unsigned hgCount = (flags & PipelineFlag_AtmAccel) ? ATM_SBT_HITGROUP_COUNT : 1u;
         CUdeviceptr hitgroup_record;
-        size_t hitgroup_record_size = sizeof(HitGroupSbtRecord);
+        size_t hitgroup_record_size = sizeof(HitGroupSbtRecord) * hgCount;
         CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&hitgroup_record), hitgroup_record_size));
 
-        HitGroupSbtRecord hg_sbt;
-        OPTIX_CHECK(optixSbtRecordPackHeader(hitgroup_prog_group, &hg_sbt));
+        std::vector<HitGroupSbtRecord> hg_sbt(hgCount);
+        OPTIX_CHECK(optixSbtRecordPackHeader(hitgroup_prog_group, &hg_sbt[0]));
+        if (hgCount > 1) {
+            OPTIX_CHECK(optixSbtRecordPackHeader(hitgroup_mesh_prog_group, &hg_sbt[ATM_SBT_MESH]));
+            OPTIX_CHECK(optixSbtRecordPackHeader(hitgroup_vol_prog_group, &hg_sbt[ATM_SBT_VOL]));
+        }
         CUDA_CHECK(cudaMemcpy(
             reinterpret_cast<void*>(hitgroup_record),
-            &hg_sbt,
+            hg_sbt.data(),
             hitgroup_record_size,
             cudaMemcpyHostToDevice
         ));
 
         // ---------- 4.4 填充 SBT 结构 ----------
-        // SBT 包含所有记录在 GPU 中的地址和布局信息
-        sbt.raygenRecord = raygen_record;                              // 光线生成记录地址
-        sbt.missRecordBase = miss_record;                              // 未命中记录基地址
-        sbt.missRecordStrideInBytes = sizeof(MissSbtRecord);          // 未命中记录步长（字节）
-        sbt.missRecordCount = 1;                                       // 未命中记录数量
-        sbt.hitgroupRecordBase = hitgroup_record;                     // 命中组记录基地址
-        sbt.hitgroupRecordStrideInBytes = sizeof(HitGroupSbtRecord);  // 命中组记录步长（字节）
-        sbt.hitgroupRecordCount = 1;                                   // 命中组记录数量
+        sbt.raygenRecord = raygen_record;
+        sbt.missRecordBase = miss_record;
+        sbt.missRecordStrideInBytes = sizeof(MissSbtRecord);
+        sbt.missRecordCount = 1;
+        sbt.hitgroupRecordBase = hitgroup_record;
+        sbt.hitgroupRecordStrideInBytes = sizeof(HitGroupSbtRecord);
+        sbt.hitgroupRecordCount = hgCount;
+        std::fprintf(stderr, "[atm] SBT hitgroups=%u recSize=%zu\n", hgCount, sizeof(HitGroupSbtRecord));
     }
     // 函数结束：管线已创建，SBT 已就绪，可以调用 optixLaunch 执行渲染
 }
@@ -1438,6 +1496,11 @@ paramsHost.atmosphere.enabled = 0;
 
 // ---- 2.1 OptiX 加速结构句柄 ----
 paramsHost.handle = _state->gasHandle;  // GAS 或 IAS 句柄
+paramsHost.meshHandle = 0;
+paramsHost.volHandle = 0;
+paramsHost.meshVolIas = 0;
+paramsHost.volBrickId = nullptr;
+paramsHost.volPrimCount = 0;
 paramsHost.aabb   = _state->gasAABB;    // 场景包围盒
 
 // ---- 2.2 帧信息 ----
@@ -1667,6 +1730,11 @@ OptixTracer::traceBwd(uint32_t frameNumber,
     std::memset(&paramsHost.atmosphere, 0, sizeof(paramsHost.atmosphere));
     paramsHost.atmosphere.enabled = 0;
     paramsHost.handle = _state->gasHandle;
+    paramsHost.meshHandle = 0;
+    paramsHost.volHandle = 0;
+    paramsHost.meshVolIas = 0;
+    paramsHost.volBrickId = nullptr;
+    paramsHost.volPrimCount = 0;
     paramsHost.aabb   = _state->gasAABB;
 
     paramsHost.frameBounds.x = rayOri.size(2) - 1;
@@ -1779,6 +1847,181 @@ void atmCopy3(const torch::Tensor& t, float out[3], float x, float y, float z) {
 }
 
 } // namespace
+
+void OptixTracer::buildAtmosphereAccel(
+    torch::Tensor meshVerts,
+    torch::Tensor meshIdx,
+    torch::Tensor voxelKmax,
+    int nx,
+    int ny,
+    int nz,
+    int brick,
+    int nbx,
+    int nby,
+    int nbz,
+    const float origin[3],
+    float dx,
+    float dy,
+    float dz,
+    cudaStream_t stream) {
+    State* st = _state;
+
+    auto reallocDevice = [&](CUdeviceptr* ptr, size_t* sz, size_t need) {
+        if (*sz >= need && *ptr) {
+            return;
+        }
+        CUDA_CHECK(cudaFreeAsync(reinterpret_cast<void*>(*ptr), stream));
+        *ptr = 0;
+        *sz = 0;
+        if (need == 0) {
+            return;
+        }
+        CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(ptr), need, stream));
+        *sz = need;
+    };
+
+    auto buildGASFromInput = [&](const OptixBuildInput& input,
+                                 OptixTraversableHandle* outHandle,
+                                 CUdeviceptr* outBuffer,
+                                 size_t* outBufferSz) {
+        OptixAccelBuildOptions accel_options = {};
+        accel_options.buildFlags = OPTIX_BUILD_FLAG_PREFER_FAST_TRACE;
+        accel_options.operation = OPTIX_BUILD_OPERATION_BUILD;
+        OptixAccelBufferSizes sizes;
+        OPTIX_CHECK(optixAccelComputeMemoryUsage(st->context, &accel_options, &input, 1, &sizes));
+        if (st->gasBufferTmpSz < sizes.tempSizeInBytes) {
+            CUDA_CHECK(cudaFreeAsync(reinterpret_cast<void*>(st->gasBufferTmp), stream));
+            CUDA_CHECK(cudaMallocAsync(
+                reinterpret_cast<void**>(&st->gasBufferTmp), sizes.tempSizeInBytes, stream));
+            st->gasBufferTmpSz = sizes.tempSizeInBytes;
+        }
+        reallocDevice(outBuffer, outBufferSz, sizes.outputSizeInBytes);
+        OPTIX_CHECK(optixAccelBuild(
+            st->context,
+            stream,
+            &accel_options,
+            &input,
+            1,
+            st->gasBufferTmp,
+            sizes.tempSizeInBytes,
+            *outBuffer,
+            *outBufferSz,
+            outHandle,
+            nullptr,
+            0));
+    };
+
+    if (!meshVerts.defined() || !meshIdx.defined() || meshIdx.numel() < 3) {
+        st->meshGasHandle = 0;
+        st->meshGasNtri = 0;
+        st->meshGasNvert = 0;
+        st->meshGasVertsPtr = 0;
+        st->meshGasIdxPtr = 0;
+    } else {
+        meshVerts = meshVerts.contiguous();
+        meshIdx = meshIdx.contiguous();
+        const int nvert = static_cast<int>(meshVerts.size(0));
+        const int ntri = static_cast<int>(meshIdx.size(0));
+        const CUdeviceptr vptr = reinterpret_cast<CUdeviceptr>(meshVerts.data_ptr());
+        const CUdeviceptr iptr = reinterpret_cast<CUdeviceptr>(meshIdx.data_ptr());
+        if (!(st->meshGasHandle && st->meshGasNtri == ntri && st->meshGasNvert == nvert &&
+              st->meshGasVertsPtr == vptr && st->meshGasIdxPtr == iptr)) {
+            CUdeviceptr vertexBuffer = vptr;
+            uint32_t geomFlags = OPTIX_GEOMETRY_FLAG_DISABLE_ANYHIT;
+            OptixBuildInput input = {};
+            input.type = OPTIX_BUILD_INPUT_TYPE_TRIANGLES;
+            input.triangleArray.vertexFormat = OPTIX_VERTEX_FORMAT_FLOAT3;
+            input.triangleArray.numVertices = static_cast<unsigned int>(nvert);
+            input.triangleArray.vertexBuffers = &vertexBuffer;
+            input.triangleArray.indexFormat = OPTIX_INDICES_FORMAT_UNSIGNED_INT3;
+            input.triangleArray.numIndexTriplets = static_cast<unsigned int>(ntri);
+            input.triangleArray.indexBuffer = iptr;
+            input.triangleArray.flags = &geomFlags;
+            input.triangleArray.numSbtRecords = 1;
+            buildGASFromInput(input, &st->meshGasHandle, &st->meshGasBuffer, &st->meshGasBufferSz);
+            st->meshGasNtri = ntri;
+            st->meshGasNvert = nvert;
+            st->meshGasVertsPtr = vptr;
+            st->meshGasIdxPtr = iptr;
+            std::fprintf(stderr, "[atm] mesh GAS nvert=%d ntri=%d\n", nvert, ntri);
+        }
+    }
+
+    AtmVoxelGrid grid = {};
+    grid.nx = nx;
+    grid.ny = ny;
+    grid.nz = nz;
+    grid.brick = brick > 0 ? brick : 8;
+    grid.nbx = nbx;
+    grid.nby = nby;
+    grid.nbz = nbz;
+    grid.origin[0] = origin[0];
+    grid.origin[1] = origin[1];
+    grid.origin[2] = origin[2];
+    grid.dx = dx;
+    grid.dy = dy;
+    grid.dz = dz;
+
+    if (!voxelKmax.defined() || voxelKmax.numel() == 0 || grid.nbx <= 0) {
+        st->volGasHandle = 0;
+        st->volPrimCount = 0;
+        st->volKmaxPtr = 0;
+    } else {
+        const CUdeviceptr kptr = reinterpret_cast<CUdeviceptr>(voxelKmax.data_ptr());
+        if (!(st->volGasHandle && st->volKmaxPtr == kptr && st->volPrimCount == 1)) {
+            const torch::Tensor kHost = voxelKmax.detach().cpu().contiguous();
+            const float* kmax = kHost.data_ptr<float>();
+            int any = 0;
+            const int nbrick = grid.nbx * grid.nby * grid.nbz;
+            for (int i = 0; i < nbrick; ++i) {
+                if (kmax[i] > 1e-12f) {
+                    any = 1;
+                    break;
+                }
+            }
+            if (!any) {
+                st->volGasHandle = 0;
+                st->volPrimCount = 0;
+                st->volKmaxPtr = kptr;
+                std::fprintf(stderr, "[atm] vol GAS empty (all bricks kmax=0)\n");
+            } else {
+                /* One Custom AABB for the voxel grid. IS runs sequential Woodcock
+                 * with a single Ts (htrdr SVX). Empty bricks are skipped inside the walk. */
+                OptixAabb box;
+                box.minX = grid.origin[0];
+                box.minY = grid.origin[1];
+                box.minZ = grid.origin[2];
+                box.maxX = grid.origin[0] + (float)grid.nx * grid.dx;
+                box.maxY = grid.origin[1] + (float)grid.ny * grid.dy;
+                box.maxZ = grid.origin[2] + (float)grid.nz * grid.dz;
+                const int brick0 = 0;
+                reallocDevice(&st->volAabbBuffer, &st->volAabbBufferSz, sizeof(OptixAabb));
+                reallocDevice(&st->volBrickIdBuffer, &st->volBrickIdBufferSz, sizeof(int));
+                CUDA_CHECK(cudaMemcpyAsync(
+                    reinterpret_cast<void*>(st->volAabbBuffer), &box, sizeof(box), cudaMemcpyHostToDevice, stream));
+                CUDA_CHECK(cudaMemcpyAsync(
+                    reinterpret_cast<void*>(st->volBrickIdBuffer), &brick0, sizeof(brick0), cudaMemcpyHostToDevice, stream));
+
+                uint32_t geomFlags = OPTIX_GEOMETRY_FLAG_DISABLE_ANYHIT;
+                OptixBuildInput input = {};
+                input.type = OPTIX_BUILD_INPUT_TYPE_CUSTOM_PRIMITIVES;
+                input.customPrimitiveArray.aabbBuffers = &st->volAabbBuffer;
+                input.customPrimitiveArray.numPrimitives = 1;
+                input.customPrimitiveArray.strideInBytes = 0;
+                input.customPrimitiveArray.flags = &geomFlags;
+                input.customPrimitiveArray.numSbtRecords = 1;
+                buildGASFromInput(input, &st->volGasHandle, &st->volGasBuffer, &st->volGasBufferSz);
+                st->volPrimCount = 1;
+                st->volKmaxPtr = kptr;
+                std::fprintf(stderr, "[atm] vol GAS 1 AABB (grid) / %d bricks\n", nbrick);
+            }
+        }
+    }
+
+    /* Volume and mesh stay separate GAS traces (htrdr Embree ∥ SVX). */
+    st->meshVolIasHandle = 0;
+    std::fprintf(stderr, "[atm] IAS disabled (separate mesh GAS + vol GAS traces)\n");
+}
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
            torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
@@ -1958,11 +2201,39 @@ OptixTracer::traceAtmosphere(
     atm.sun.radiance = sunRadiance;
     atm.sun.cos_half_angle = sunCosHalf;
 
-    std::fprintf(stderr, "[atm] sizeof PipelineParameters=%zu AtmParams=%zu sunL=%g mesh_ntri=%d voxels=%dx%dx%d gs=%d\n",
-                 sizeof(PipelineParameters), sizeof(AtmParams), (double)atm.sun.radiance,
-                 atm.mesh.ntri, atm.voxels.nx, atm.voxels.ny, atm.voxels.nz, atm.gs_enabled);
-
     cudaStream_t cudaStream = at::cuda::getCurrentCUDAStream();
+    buildAtmosphereAccel(
+        meshVerts,
+        meshIdx,
+        voxelKmax,
+        atm.voxels.nx,
+        atm.voxels.ny,
+        atm.voxels.nz,
+        atm.voxels.brick,
+        atm.voxels.nbx,
+        atm.voxels.nby,
+        atm.voxels.nbz,
+        atm.voxels.origin,
+        atm.voxels.dx,
+        atm.voxels.dy,
+        atm.voxels.dz,
+        cudaStream);
+    paramsHost.meshHandle = _state->meshGasHandle;
+    paramsHost.volHandle = _state->volGasHandle;
+    paramsHost.meshVolIas = 0;
+    paramsHost.volBrickId = _state->volBrickIdBuffer
+                                ? reinterpret_cast<const int*>(_state->volBrickIdBuffer)
+                                : nullptr;
+    paramsHost.volPrimCount = _state->volPrimCount;
+
+    std::fprintf(stderr,
+                 "[atm] sizeof PipelineParameters=%zu AtmParams=%zu sunL=%g mesh_ntri=%d voxels=%dx%dx%d gs=%d "
+                 "meshGAS=%d volGAS=%d ias=%d volPrims=%d\n",
+                 sizeof(PipelineParameters), sizeof(AtmParams), (double)atm.sun.radiance,
+                 atm.mesh.ntri, atm.voxels.nx, atm.voxels.ny, atm.voxels.nz, atm.gs_enabled,
+                 paramsHost.meshHandle != 0, paramsHost.volHandle != 0, paramsHost.meshVolIas != 0,
+                 paramsHost.volPrimCount);
+
     reallocateParamsDevice(sizeof(paramsHost), cudaStream);
     CUDA_CHECK(cudaMemcpyAsync(
         reinterpret_cast<void*>(_state->paramsDevice),

@@ -23,6 +23,13 @@
 #include <3dgptir/pipelineDefinitions.h>
 #include <3dgptir/tensorAccessor.h>
 #include <3dgptir/atmosphere.h>
+
+enum AtmHitgroupSbt {
+    ATM_SBT_GS   = 0,
+    ATM_SBT_MESH = 1,
+    ATM_SBT_VOL  = 2,
+    ATM_SBT_HITGROUP_COUNT = 3
+};
 /**
  * @brief 渲染管线参数结构体
  * 
@@ -317,6 +324,16 @@
      * 光线追踪的入口点
      */
     OptixTraversableHandle handle;
+
+    /// Triangle GAS for AtmMesh (DISABLE_ANYHIT). 0 = none.
+    OptixTraversableHandle meshHandle;
+    /// Custom GAS: one AABB per non-empty voxel brick. 0 = none.
+    OptixTraversableHandle volHandle;
+    /// IAS of mesh+vol for one closest-event trace. 0 = sequential GAS traces.
+    OptixTraversableHandle meshVolIas;
+    /// Device int32[volPrimCount]: primitive → linear brick index.
+    const int* volBrickId;
+    int volPrimCount;
 
     /**
      * @brief 场景的AABB包围盒

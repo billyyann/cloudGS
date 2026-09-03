@@ -6,6 +6,7 @@
 
 #include <3dgptir/kernels/cuda/atmosphere.cuh>
 #include <3dgptir/kernels/cuda/pathTracer.cuh>
+#include <3dgptir/pipelineParameters.h>
 
 static constexpr float kAtmSurfEps = 2e-3f;
 
@@ -17,6 +18,139 @@ static __device__ __forceinline__ void atm_f3_to_arr(const float3& v, float o[3]
 
 static __device__ __forceinline__ float3 atm_arr_to_f3(const float a[3]) {
     return make_float3(a[0], a[1], a[2]);
+}
+
+struct AtmAccelHit {
+    float t;
+    int kind; /* 0 miss, 1 mesh, 2 vol */
+    int prim;
+    int event;
+    float temperature;
+};
+
+static __device__ AtmAccelHit atm_trace_accel(
+    OptixTraversableHandle handle,
+    const float org[3],
+    const float dir[3],
+    float tmin,
+    float tmax,
+    unsigned sbtOffset,
+    unsigned rayFlags,
+    Sampler& sampler) {
+    AtmAccelHit hit;
+    hit.t = ATM_INF;
+    hit.kind = 0;
+    hit.prim = -1;
+    hit.event = ATM_EVENT_NONE;
+    hit.temperature = 0.f;
+    if (!handle || tmax <= tmin) {
+        return hit;
+    }
+    unsigned int p0 = __float_as_uint(ATM_INF);
+    unsigned int p1 = 0;
+    unsigned int p2 = 0xFFFFFFFFu;
+    unsigned int p3 = 0;
+    unsigned int p4 = 0;
+    unsigned int p5 = static_cast<unsigned int>(sampler.state);
+    unsigned int p6 = static_cast<unsigned int>(sampler.state >> 32ull);
+    unsigned int p7 = 0, p8 = 0, p9 = 0, p10 = 0, p11 = 0, p12 = 0, p13 = 0, p14 = 0, p15 = 0;
+    unsigned int p16 = 0, p17 = 0, p18 = 0, p19 = 0, p20 = 0, p21 = 0, p22 = 0, p23 = 0;
+    unsigned int p24 = 0, p25 = 0, p26 = 0, p27 = 0, p28 = 0, p29 = 0, p30 = 0, p31 = 0;
+    optixTrace(
+        handle,
+        make_float3(org[0], org[1], org[2]),
+        make_float3(dir[0], dir[1], dir[2]),
+        tmin,
+        tmax,
+        0.0f,
+        OptixVisibilityMask(255),
+        rayFlags,
+        sbtOffset,
+        1,
+        0,
+        p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12, p13, p14, p15,
+        p16, p17, p18, p19, p20, p21, p22, p23, p24, p25, p26, p27, p28, p29, p30, p31);
+    if (p1 == 1u || p1 == 2u) {
+        hit.t = __uint_as_float(p0);
+        hit.kind = static_cast<int>(p1);
+        hit.prim = static_cast<int>(p2);
+        hit.event = static_cast<int>(p3);
+        hit.temperature = __uint_as_float(p4);
+    }
+    return hit;
+}
+
+static __device__ void atm_mesh_from_accel(
+    const struct AtmMesh* mesh,
+    const AtmAccelHit& a,
+    const float dir[3],
+    struct AtmMeshHit* hit) {
+    atm_mesh_hit_clear(hit);
+    if (a.kind != 1 || a.prim < 0) {
+        return;
+    }
+    hit->t = a.t;
+    hit->tri = a.prim;
+    hit->albedo[0] = 0.22f;
+    hit->albedo[1] = 0.16f;
+    hit->albedo[2] = 0.10f;
+    hit->n[0] = 0.f;
+    hit->n[1] = 0.f;
+    hit->n[2] = 1.f;
+    hit->temperature = 300.f;
+    if (mesh && mesh->indices && mesh->vertices && mesh->ntri > 0 && a.prim < mesh->ntri) {
+        atm_mesh_fill_hit(mesh, a.prim, a.t, hit);
+        if (atm_dot3(hit->n, dir) > 0.f) {
+            hit->n[0] = -hit->n[0];
+            hit->n[1] = -hit->n[1];
+            hit->n[2] = -hit->n[2];
+        }
+    }
+}
+
+static __device__ void atm_vol_from_accel(
+    const struct AtmParams* atm,
+    const float org[3],
+    const float dir[3],
+    const AtmAccelHit& a,
+    struct AtmHit* hit) {
+    atm_hit_clear(hit);
+    if (!hit || a.kind != 2 || a.event == ATM_EVENT_NONE) {
+        return;
+    }
+    hit->t = a.t;
+    hit->event = a.event;
+    hit->pos[0] = org[0] + dir[0] * a.t;
+    hit->pos[1] = org[1] + dir[1] * a.t;
+    hit->pos[2] = org[2] + dir[2] * a.t;
+    int ijk[3];
+    atm_world_to_ijk(&atm->voxels, hit->pos, ijk);
+    hit->ka = atm_fetch_ka(&atm->voxels, ijk[0], ijk[1], ijk[2]);
+    hit->ks = atm_fetch_ks(&atm->voxels, ijk[0], ijk[1], ijk[2]);
+    hit->kext = hit->ka + hit->ks;
+    hit->temperature = a.temperature > 0.f ? a.temperature : atm_fetch_temp(&atm->voxels, ijk[0], ijk[1], ijk[2]);
+}
+
+static __device__ struct AtmHit atm_merge_gas(
+    const struct AtmParams* atm,
+    const float org[3],
+    const float dir[3],
+    float tmax,
+    Sampler& sampler,
+    struct AtmHit vox) {
+    const int walk_ks = atm->spectral_mode != ATM_SPECTRAL_LW;
+    struct AtmHit gas = atm_gas_free_path(&atm->gas, org, dir, tmax, sampler, walk_ks);
+    if (gas.event != ATM_EVENT_NONE && gas.t <= vox.t && gas.t < tmax) {
+        return gas;
+    }
+    if (vox.event != ATM_EVENT_NONE && vox.t < tmax) {
+        return vox;
+    }
+    struct AtmHit none;
+    atm_hit_clear(&none);
+    none.t = tmax;
+    none.event = ATM_EVENT_NONE;
+    return none;
 }
 
 /* First GS surface along the ray. Stochastic α is the object model, not cloud k. */
@@ -110,9 +244,23 @@ static __device__ int atm_ground_occluded(
     float tmax) {
     /* htrdr atmosphere_ground_trace_ray: triangles only. Volume NEE must not
      * use GS shadows (sun from cloud is upward; GS false hits zero scatter). */
+    if (params.meshHandle) {
+        Sampler rng;
+        rng.init(1ull, 1ull);
+        const AtmAccelHit h = atm_trace_accel(
+            params.meshHandle,
+            org,
+            dir,
+            2.f,
+            tmax,
+            ATM_SBT_MESH,
+            OPTIX_RAY_FLAG_DISABLE_ANYHIT | OPTIX_RAY_FLAG_TERMINATE_ON_FIRST_HIT,
+            rng);
+        return (h.kind == 1 && h.t < tmax && h.t > 2.f) ? 1 : 0;
+    }
     if (params.atmosphere.mesh.ntri > 0) {
         const float t_mesh = atm_mesh_closest(&params.atmosphere.mesh, org, dir, tmax);
-        if (t_mesh < tmax && t_mesh > 0.05f) {
+        if (t_mesh < tmax && t_mesh > 2.f) {
             return 1;
         }
     }
@@ -184,7 +332,11 @@ static __device__ void atm_add_sun_nee_surface(
     const float3 brdfTimesCos = eval_material_fast_brdf_light_sample(rayDir, ix, L, scatterPdf);
     (void)scatterPdf;
     const float3 fcos = (brdfTimesCos.x + brdfTimesCos.y + brdfTimesCos.z) > 1e-8f ? brdfTimesCos : lambert;
-    float p[3] = {org[0] + wo[0] * kAtmSurfEps, org[1] + wo[1] * kAtmSurfEps, org[2] + wo[2] * kAtmSurfEps};
+    /* Offset along shading normal so 8M heightfield NEE does not self-hit. */
+    float p[3] = {
+        org[0] + ix.shadingnormal.x * 2.f + wo[0] * 0.05f,
+        org[1] + ix.shadingnormal.y * 2.f + wo[1] * 0.05f,
+        org[2] + ix.shadingnormal.z * 2.f + wo[2] * 0.05f};
     const float vis = atm_sun_visibility(atm, p, wo, atm->path_tmax, sampler);
     if (vis <= 0.f) {
         return;
@@ -305,27 +457,65 @@ static __device__ void traceAtmospherePath(const uint3& idx, Sampler& sampler) {
         const int above_terrain = (org[2] > 850.f);
         struct AtmMeshHit meshHit;
         atm_mesh_hit_clear(&meshHit);
-        /* Clouds sit at ~1–2 km; skip GS/mesh while the walk is still above the
-         * mountain so thick Cu can take hundreds of volume bounces (htrdr is unbounded). */
-        if (!above_terrain && atm->mesh.ntri > 0) {
-            meshHit = atm_mesh_closest_hit(&atm->mesh, org, dir, tmax);
-        }
+        struct AtmHit vol;
+        atm_hit_clear(&vol);
+        vol.t = tmax;
+        float t_surf = tmax;
 
         Interaction gsIx;
         const Ray gsRay(make_float3(org[0], org[1], org[2]), make_float3(dir[0], dir[1], dir[2]));
         float t_gs = ATM_INF;
+        /* GS skipped above the mountain so Cu can bounce (104659). Mesh is
+         * htrdr ground — always trace, including --ground mesh heightfield. */
         if (!above_terrain) {
-            t_gs = atm_gs_closest_surface(gsRay, 0.f, fminf(meshHit.t, tmax), sampler, gsIx);
+            t_gs = atm_gs_closest_surface(gsRay, 0.f, tmax, sampler, gsIx);
         }
 
-        float t_surf = fminf(fminf(t_gs, meshHit.t), tmax);
+        /* --ground gs: skip mesh above 850 so the walk reaches GS (104659).
+         * --ground mesh: GS off — always trace mountain.obj from the camera. */
+        if (!above_terrain || !atm->gs_enabled) {
+            if (!params.meshHandle) {
+                meshHit = atm_mesh_closest_hit(&atm->mesh, org, dir, tmax);
+            } else {
+                const AtmAccelHit a = atm_trace_accel(
+                    params.meshHandle,
+                    org,
+                    dir,
+                    1e-4f,
+                    tmax,
+                    ATM_SBT_MESH,
+                    OPTIX_RAY_FLAG_DISABLE_ANYHIT,
+                    sampler);
+                atm_mesh_from_accel(&atm->mesh, a, dir, &meshHit);
+            }
+        }
+
+        t_surf = fminf(fminf(t_gs, meshHit.t), tmax);
         if (above_terrain && dir[2] < -1e-5f) {
             const float t_band = (850.f - org[2]) / dir[2];
             if (t_band > 0.f) {
                 t_surf = fminf(t_surf, t_band);
             }
         }
-        const struct AtmHit vol = atm_next_volume_event(atm, org, dir, t_surf, sampler);
+        if (params.volHandle) {
+            const AtmAccelHit a = atm_trace_accel(
+                params.volHandle,
+                org,
+                dir,
+                1e-4f,
+                t_surf,
+                ATM_SBT_VOL,
+                0u,
+                sampler);
+            atm_vol_from_accel(atm, org, dir, a, &vol);
+            if (vol.event == ATM_EVENT_NONE) {
+                vol = atm_next_volume_event(atm, org, dir, t_surf, sampler);
+            } else {
+                vol = atm_merge_gas(atm, org, dir, t_surf, sampler, vol);
+            }
+        } else {
+            vol = atm_next_volume_event(atm, org, dir, t_surf, sampler);
+        }
 
         const int vol_first = (vol.event != ATM_EVENT_NONE && vol.t < t_surf);
         const int gs_first = (!vol_first && t_gs < meshHit.t && t_gs < tmax);
