@@ -69,6 +69,17 @@ ATM_FN int atm_voxel_index(const struct AtmVoxelGrid* g, int ix, int iy, int iz)
     return (iz * g->ny + iy) * g->nx + ix;
 }
 
+ATM_FN int atm_imod(int a, int n) {
+    if (n <= 0) {
+        return 0;
+    }
+    int r = a % n;
+    if (r < 0) {
+        r += n;
+    }
+    return r;
+}
+
 ATM_FN int atm_in_grid(const struct AtmVoxelGrid* g, int ix, int iy, int iz) {
     return ix >= 0 && iy >= 0 && iz >= 0 && ix < g->nx && iy < g->ny && iz < g->nz;
 }
@@ -767,31 +778,26 @@ ATM_FN float atm_voxel_optical_depth(
     const float dx[3] = {g->dx, g->dy, g->dz};
     const float origin[3] = {gx0, gy0, gz0};
     const int n[3] = {g->nx, g->ny, g->nz};
-    const float gx1 = gx0 + dx[0] * (float)n[0];
-    const float gy1 = gy0 + dx[1] * (float)n[1];
     const float gz1 = gz0 + dx[2] * (float)n[2];
+    /* NEE analog τ: clip Z only (htrdr -r). XY is periodic; a finite XY AABB
+     * lets sun rays from the bottom/left exit before the opposite-tile cloud.
+     * Camera Woodcock stays finite-XY. */
     float t0 = 0.f;
     float t1 = tmax;
-    for (int a = 0; a < 3; ++a) {
-        const float o = org[a];
-        const float d = dir[a];
-        const float lo = a == 0 ? gx0 : (a == 1 ? gy0 : gz0);
-        const float hi = a == 0 ? gx1 : (a == 1 ? gy1 : gz1);
-        if (fabsf(d) < 1e-20f) {
-            if (o < lo || o > hi) {
-                return 0.f;
-            }
-        } else {
-            float ta = (lo - o) / d;
-            float tb = (hi - o) / d;
-            if (ta > tb) {
-                const float tmp = ta;
-                ta = tb;
-                tb = tmp;
-            }
-            t0 = t0 > ta ? t0 : ta;
-            t1 = t1 < tb ? t1 : tb;
+    if (fabsf(dir[2]) < 1e-20f) {
+        if (org[2] < gz0 || org[2] > gz1) {
+            return 0.f;
         }
+    } else {
+        float ta = (gz0 - org[2]) / dir[2];
+        float tb = (gz1 - org[2]) / dir[2];
+        if (ta > tb) {
+            const float tmp = ta;
+            ta = tb;
+            tb = tmp;
+        }
+        t0 = t0 > ta ? t0 : ta;
+        t1 = t1 < tb ? t1 : tb;
     }
     if (t0 >= t1) {
         return 0.f;
@@ -804,8 +810,13 @@ ATM_FN float atm_voxel_optical_depth(
     float p[3] = {org[0] + dir[0] * t, org[1] + dir[1] * t, org[2] + dir[2] * t};
     int ijk[3];
     atm_world_to_ijk(g, p, ijk);
-    atm_snap_ijk_enter(g, dir, ijk);
-    if (!atm_in_grid(g, ijk[0], ijk[1], ijk[2])) {
+    if (ijk[2] >= n[2] && dir[2] < 0.f) {
+        ijk[2] = n[2] - 1;
+    }
+    if (ijk[2] < 0 && dir[2] > 0.f) {
+        ijk[2] = 0;
+    }
+    if (ijk[2] < 0 || ijk[2] >= n[2]) {
         return 0.f;
     }
     int step[3];
@@ -827,15 +838,18 @@ ATM_FN float atm_voxel_optical_depth(
         }
     }
     float tau = 0.f;
-    for (int s = 0; s < n[0] + n[1] + n[2] + 4; ++s) {
+    const int nsteps = 2 * (n[0] + n[1]) + n[2] + 8;
+    for (int s = 0; s < nsteps; ++s) {
         if (t >= t1 - 1e-6f) {
             break;
         }
-        if (!atm_in_grid(g, ijk[0], ijk[1], ijk[2])) {
+        if (ijk[2] < 0 || ijk[2] >= n[2]) {
             break;
         }
+        const int fx = atm_imod(ijk[0], n[0]);
+        const int fy = atm_imod(ijk[1], n[1]);
         const float tNext = fminf(t1, fminf(tMax[0], fminf(tMax[1], tMax[2])));
-        tau += atm_cell_k(g, ijk[0], ijk[1], ijk[2], kind) * fmaxf(tNext - t, 0.f);
+        tau += atm_cell_k(g, fx, fy, ijk[2], kind) * fmaxf(tNext - t, 0.f);
         if (tNext >= t1 - 1e-6f) {
             break;
         }
