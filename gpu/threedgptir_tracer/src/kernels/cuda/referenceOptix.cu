@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#define ATM_KERNEL_REV 22
+#define ATM_KERNEL_REV 34
 #include <3dgptir/pipelineParameters.h>
 #include <3dgptir/kernels/cuda/sampler.cuh>
 // clang-format on
@@ -25,7 +25,7 @@ __constant__ PipelineParameters params;
 #include <3dgptir/kernels/cuda/environment.cuh>
 #include <3dgptir/kernels/cuda/pathTracer.cuh>
 #include <3dgptir/kernels/cuda/atmospherePathTracer.cuh>
-/* NVRTC: ATM_KERNEL_REV 22 no mesh+vol IAS; vol 1-AABB Woodcock; mesh NEE tmin 2m. */
+/* NVRTC: ATM_KERNEL_REV 34 gas scatter keeps Rayleigh NEE (no ks_tot break). */
 
 // Ablation early-return stages (only with ENABLE_RAYGEN_SETUP_PROFILING).
 // Official release: do not define ENABLE_RAYGEN_SETUP_PROFILING.
@@ -303,10 +303,22 @@ extern "C" __global__ void __intersection__vol() {
     rng.init(seed ? seed : 1ull, 1ull);
     const int walk_ks = params.atmosphere.spectral_mode != ATM_SPECTRAL_LW;
     const float omega_arg = params.atmosphere.mie_omega > 0.f ? params.atmosphere.mie_omega : -1.f;
-    AtmHit hit;
+    /* Competing risks in IS: voxel Z-slab Woodcock + 1D gas over the full ray
+     * interval. AABB Z must cover the gas column so sky rays are not clipped
+     * at the cloud top (that miss used to skip Rayleigh entirely). */
+    AtmHit vox;
+    AtmHit gas;
     atm_woodcock_voxels_into(
-        &params.atmosphere.voxels, org, dir, tmax, rng, omega_arg, walk_ks, &hit);
-    if (hit.event == ATM_EVENT_NONE || hit.t < tmin || hit.t > tmax) {
+        &params.atmosphere.voxels, org, dir, tmax, rng, omega_arg, walk_ks, &vox);
+    atm_gas_free_path_into(
+        &params.atmosphere.gas, org, dir, tmax, rng, walk_ks, &gas);
+    AtmHit hit;
+    atm_hit_clear(&hit);
+    if (gas.event != ATM_EVENT_NONE && gas.t <= vox.t && gas.t >= tmin && gas.t <= tmax) {
+        hit = gas;
+    } else if (vox.event != ATM_EVENT_NONE && vox.t >= tmin && vox.t <= tmax) {
+        hit = vox;
+    } else {
         return;
     }
     optixReportIntersection(

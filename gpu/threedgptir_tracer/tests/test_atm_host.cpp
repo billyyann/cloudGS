@@ -83,7 +83,39 @@ int main() {
         }
     }
     expect_near("voxel_mfp", sum_t / nreal, 1.0 / k, 0.08);
-    expect_near("voxel_hit_frac", static_cast<double>(nreal) / nsamp, 1.0 - std::exp(-k * 31.5), 0.02);
+    /* Z-slab + XY wrap: +X never leaves the cloud band, so τ = k * tmax. */
+    expect_near("voxel_hit_frac", static_cast<double>(nreal) / nsamp, 1.0 - std::exp(-k * 100.f), 0.02);
+
+    /* Nadir must exit the Z slab (do not walk to tmax inside an infinite XY box). */
+    rng.init(3);
+    int n_beyond_slab = 0;
+    int n_nadir_hit = 0;
+    for (int i = 0; i < nsamp; ++i) {
+        float org[3] = {16.f, 16.f, 64.f};
+        float dir[3] = {0.f, 0.f, -1.f};
+        AtmHit h = atm_woodcock_voxels(&grid, org, dir, 200.f, rng, -1.f);
+        if (h.event == ATM_EVENT_SCATTER_VOXEL || h.event == ATM_EVENT_ABSORB_VOXEL) {
+            ++n_nadir_hit;
+            if (h.t > 64.5f) {
+                ++n_beyond_slab;
+            }
+        }
+    }
+    expect_near("nadir_z_hit_frac", static_cast<double>(n_nadir_hit) / nsamp, 1.0 - std::exp(-k * 32.f), 0.03);
+    expect_near("nadir_z_exit", static_cast<double>(n_beyond_slab) / nsamp, 0.0, 0.01);
+
+    /* Camera outside the canonical XY tile must still sample wrapped k. */
+    rng.init(11);
+    int n_wrap = 0;
+    for (int i = 0; i < nsamp; ++i) {
+        float org[3] = {-8.f, 16.f, 16.f};
+        float dir[3] = {1.f, 0.f, 0.f};
+        AtmHit h = atm_woodcock_voxels(&grid, org, dir, 40.f, rng, -1.f);
+        if (h.event == ATM_EVENT_SCATTER_VOXEL || h.event == ATM_EVENT_ABSORB_VOXEL) {
+            ++n_wrap;
+        }
+    }
+    expect_near("wrap_xy_hit_frac", static_cast<double>(n_wrap) / nsamp, 1.0 - std::exp(-k * 40.f), 0.03);
 
     /* 1D gas layer along z */
     const float kg = 0.5f;

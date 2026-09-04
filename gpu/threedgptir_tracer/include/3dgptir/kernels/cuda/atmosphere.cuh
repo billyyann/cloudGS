@@ -152,34 +152,58 @@ ATM_FN void atm_world_to_ijk(const struct AtmVoxelGrid* g, const float p[3], int
     ijk[2] = (int)floorf((p[2] - g->origin[2]) / g->dz);
 }
 
+/* htrdr -r: XY is periodic; Z is a finite slab. */
+ATM_FN void atm_wrap_xy_cell(const struct AtmVoxelGrid* g, int* ix, int* iy) {
+    if (g->nx > 0) {
+        *ix = atm_imod(*ix, g->nx);
+    }
+    if (g->ny > 0) {
+        *iy = atm_imod(*iy, g->ny);
+    }
+}
+
 ATM_FN float atm_fetch_ka(const struct AtmVoxelGrid* g, int ix, int iy, int iz) {
-    if (!g->ka || !atm_in_grid(g, ix, iy, iz)) {
+    if (!g->ka || iz < 0 || iz >= g->nz) {
+        return 0.f;
+    }
+    atm_wrap_xy_cell(g, &ix, &iy);
+    if (!g->ka || ix < 0 || iy < 0 || ix >= g->nx || iy >= g->ny) {
         return 0.f;
     }
     return g->ka[atm_voxel_index(g, ix, iy, iz)];
 }
 
 ATM_FN float atm_fetch_ks(const struct AtmVoxelGrid* g, int ix, int iy, int iz) {
-    if (!g->ks || !atm_in_grid(g, ix, iy, iz)) {
+    if (!g->ks || iz < 0 || iz >= g->nz) {
+        return 0.f;
+    }
+    atm_wrap_xy_cell(g, &ix, &iy);
+    if (!g->ks || ix < 0 || iy < 0 || ix >= g->nx || iy >= g->ny) {
         return 0.f;
     }
     return g->ks[atm_voxel_index(g, ix, iy, iz)];
 }
 
 ATM_FN float atm_fetch_temp(const struct AtmVoxelGrid* g, int ix, int iy, int iz) {
-    if (!g->temperature || !atm_in_grid(g, ix, iy, iz)) {
+    if (!g->temperature || iz < 0 || iz >= g->nz) {
+        return 0.f;
+    }
+    atm_wrap_xy_cell(g, &ix, &iy);
+    if (!g->temperature || ix < 0 || iy < 0 || ix >= g->nx || iy >= g->ny) {
         return 0.f;
     }
     return g->temperature[atm_voxel_index(g, ix, iy, iz)];
 }
 
 ATM_FN float atm_brick_kmax(const struct AtmVoxelGrid* g, int bx, int by, int bz) {
-    if (!g->kext_max) {
+    if (!g->kext_max || g->nbx <= 0 || g->nby <= 0) {
         return 0.f;
     }
-    if (bx < 0 || by < 0 || bz < 0 || bx >= g->nbx || by >= g->nby || bz >= g->nbz) {
+    if (bz < 0 || bz >= g->nbz) {
         return 0.f;
     }
+    bx = atm_imod(bx, g->nbx);
+    by = atm_imod(by, g->nby);
     return g->kext_max[(bz * g->nby + by) * g->nbx + bx];
 }
 
@@ -261,33 +285,26 @@ ATM_FN void atm_woodcock_voxels_into(
     const float gx0 = g->origin[0];
     const float gy0 = g->origin[1];
     const float gz0 = g->origin[2];
-    const float gx1 = gx0 + g->dx * (float)g->nx;
-    const float gy1 = gy0 + g->dy * (float)g->ny;
     const float gz1 = gz0 + g->dz * (float)g->nz;
 
+    /* htrdr -r / analog τ: clip Z only. XY is periodic. Do not set t1=path_tmax
+     * without a Z exit — nadir would never leave the cloud slab. */
     float t0 = 0.f;
     float t1 = tmax;
-    /* Ray-AABB of the whole grid */
-    for (int a = 0; a < 3; ++a) {
-        const float o = org[a];
-        const float d = dir[a];
-        const float lo = a == 0 ? gx0 : (a == 1 ? gy0 : gz0);
-        const float hi = a == 0 ? gx1 : (a == 1 ? gy1 : gz1);
-        if (fabsf(d) < 1e-20f) {
-            if (o < lo || o > hi) {
-                return;
-            }
-        } else {
-            float ta = (lo - o) / d;
-            float tb = (hi - o) / d;
-            if (ta > tb) {
-                const float tmp = ta;
-                ta = tb;
-                tb = tmp;
-            }
-            t0 = t0 > ta ? t0 : ta;
-            t1 = t1 < tb ? t1 : tb;
+    if (fabsf(dir[2]) < 1e-20f) {
+        if (org[2] < gz0 || org[2] > gz1) {
+            return;
         }
+    } else {
+        float ta = (gz0 - org[2]) / dir[2];
+        float tb = (gz1 - org[2]) / dir[2];
+        if (ta > tb) {
+            const float tmp = ta;
+            ta = tb;
+            tb = tmp;
+        }
+        t0 = t0 > ta ? t0 : ta;
+        t1 = t1 < tb ? t1 : tb;
     }
     if (t0 >= t1) {
         return;
@@ -308,15 +325,19 @@ ATM_FN void atm_woodcock_voxels_into(
         float p[3] = {org[0] + dir[0] * (t + atm_ray_eps(t)),
                       org[1] + dir[1] * (t + atm_ray_eps(t)),
                       org[2] + dir[2] * (t + atm_ray_eps(t))};
-        int ijk[3];
-        atm_world_to_ijk(g, p, ijk);
-        atm_snap_ijk_enter(g, dir, ijk);
-        if (!atm_in_grid(g, ijk[0], ijk[1], ijk[2])) {
+        /* World brick indices (XY may be any tile; Z must stay in the slab). */
+        const int bx = (int)floorf((p[0] - gx0) / bdx);
+        const int by = (int)floorf((p[1] - gy0) / bdy);
+        int bz = (int)floorf((p[2] - gz0) / bdz);
+        if (bz >= g->nbz && dir[2] < 0.f) {
+            bz = g->nbz - 1;
+        }
+        if (bz < 0 && dir[2] > 0.f) {
+            bz = 0;
+        }
+        if (bz < 0 || bz >= g->nbz) {
             break;
         }
-        const int bx = ijk[0] / b;
-        const int by = ijk[1] / b;
-        const int bz = ijk[2] / b;
         const float kmax = atm_brick_kmax(g, bx, by, bz);
 
         const float bx0 = gx0 + (float)bx * bdx;
@@ -472,19 +493,20 @@ ATM_FN void atm_woodcock_brick(
     }
 }
 
-/* 1D layered gas: SW walks ks (scatter only); LW walks kext then ka/ks split. */
+/* 1D layered gas: SW walks ks (scatter only); LW walks kext then ka/ks split.
+ * Writes *hit (NVRTC must not return AtmHit by value). */
 template <typename Rng>
-ATM_FN struct AtmHit atm_gas_free_path(
+ATM_FN void atm_gas_free_path_into(
     const struct AtmGasLayers* gas,
     const float org[3],
     const float dir[3],
     float tmax,
     Rng& rng,
-    int walk_ks = 1) {
-    struct AtmHit hit;
-    atm_hit_clear(&hit);
-    if (!gas || gas->nlayers <= 0 || !gas->z_iface || tmax <= 1e-8f) {
-        return hit;
+    int walk_ks,
+    struct AtmHit* hit) {
+    atm_hit_clear(hit);
+    if (!gas || !hit || gas->nlayers <= 0 || !gas->z_iface || tmax <= 1e-8f) {
+        return;
     }
     float Ts = atm_ran_exp(rng.next_1d());
     float t = 0.f;
@@ -541,14 +563,14 @@ ATM_FN struct AtmHit atm_gas_free_path(
         const float kext = ka + ks;
         const float k_walk = walk_ks ? ks : kext;
         if (k_walk <= 1e-12f) {
-            t += t_exit_layer + 1e-5f;
+            t += t_exit_layer + atm_ray_eps(t);
             z = org[2] + dir[2] * t;
             continue;
         }
         const float Tau = t_exit_layer * k_walk;
         if (Ts > Tau) {
             Ts -= Tau;
-            t += t_exit_layer + 1e-5f;
+            t += t_exit_layer + atm_ray_eps(t);
             z = org[2] + dir[2] * t;
             continue;
         }
@@ -559,21 +581,33 @@ ATM_FN struct AtmHit atm_gas_free_path(
         }
         float pos[3] = {org[0] + dir[0] * t, org[1] + dir[1] * t, org[2] + dir[2] * t};
         if (walk_ks) {
-            hit.event = ATM_EVENT_SCATTER_GAS;
+            hit->event = ATM_EVENT_SCATTER_GAS;
         } else {
             const float r = rng.next_1d();
-            hit.event = (r < ka / kext) ? ATM_EVENT_ABSORB_GAS : ATM_EVENT_SCATTER_GAS;
+            hit->event = (r < ka / kext) ? ATM_EVENT_ABSORB_GAS : ATM_EVENT_SCATTER_GAS;
         }
-        hit.t = t;
-        hit.pos[0] = pos[0];
-        hit.pos[1] = pos[1];
-        hit.pos[2] = pos[2];
-        hit.ka = ka;
-        hit.ks = ks;
-        hit.kext = kext;
-        hit.temperature = gas->temperature ? gas->temperature[layer] : 0.f;
-        return hit;
+        hit->t = t;
+        hit->pos[0] = pos[0];
+        hit->pos[1] = pos[1];
+        hit->pos[2] = pos[2];
+        hit->ka = ka;
+        hit->ks = ks;
+        hit->kext = kext;
+        hit->temperature = gas->temperature ? gas->temperature[layer] : 0.f;
+        return;
     }
+}
+
+template <typename Rng>
+ATM_FN struct AtmHit atm_gas_free_path(
+    const struct AtmGasLayers* gas,
+    const float org[3],
+    const float dir[3],
+    float tmax,
+    Rng& rng,
+    int walk_ks = 1) {
+    struct AtmHit hit;
+    atm_gas_free_path_into(gas, org, dir, tmax, rng, walk_ks, &hit);
     return hit;
 }
 
@@ -1017,7 +1051,38 @@ ATM_FN void atm_sample_rayleigh(Rng& rng, const float wi[3], float wo[3]) {
     atm_normalize3(wo);
 }
 
-/* Competing risks: surface tmax truncates volume. Volume never reads Gaussian k. */
+/* Competing risks: surface tmax truncates volume. Volume never reads Gaussian k.
+ * Writes *out (NVRTC must not return AtmHit by value). */
+template <typename Rng>
+ATM_FN void atm_next_volume_event_into(
+    const struct AtmParams* atm,
+    const float org[3],
+    const float dir[3],
+    float t_surface,
+    Rng& rng,
+    struct AtmHit* out) {
+    atm_hit_clear(out);
+    if (!out) {
+        return;
+    }
+    const float tmax = t_surface < atm->path_tmax ? t_surface : atm->path_tmax;
+    out->t = tmax;
+    const int walk_ks = atm->spectral_mode != ATM_SPECTRAL_LW;
+    const float omega_arg = atm->mie_omega > 0.f ? atm->mie_omega : -1.f;
+    struct AtmHit gas;
+    struct AtmHit vox;
+    atm_gas_free_path_into(&atm->gas, org, dir, tmax, rng, walk_ks, &gas);
+    atm_woodcock_voxels_into(&atm->voxels, org, dir, tmax, rng, omega_arg, walk_ks, &vox);
+    if (gas.event != ATM_EVENT_NONE && gas.t <= vox.t && gas.t < tmax) {
+        *out = gas;
+        return;
+    }
+    if (vox.event != ATM_EVENT_NONE && vox.t < tmax) {
+        *out = vox;
+        return;
+    }
+}
+
 template <typename Rng>
 ATM_FN struct AtmHit atm_next_volume_event(
     const struct AtmParams* atm,
@@ -1025,22 +1090,9 @@ ATM_FN struct AtmHit atm_next_volume_event(
     const float dir[3],
     float t_surface,
     Rng& rng) {
-    const float tmax = t_surface < atm->path_tmax ? t_surface : atm->path_tmax;
-    const int walk_ks = atm->spectral_mode != ATM_SPECTRAL_LW;
-    const float omega_arg = atm->mie_omega > 0.f ? atm->mie_omega : -1.f;
-    struct AtmHit gas = atm_gas_free_path(&atm->gas, org, dir, tmax, rng, walk_ks);
-    struct AtmHit vox = atm_woodcock_voxels(&atm->voxels, org, dir, tmax, rng, omega_arg, walk_ks);
-    if (gas.event != ATM_EVENT_NONE && gas.t <= vox.t && gas.t < tmax) {
-        return gas;
-    }
-    if (vox.event != ATM_EVENT_NONE && vox.t < tmax) {
-        return vox;
-    }
-    struct AtmHit none;
-    atm_hit_clear(&none);
-    none.t = tmax;
-    none.event = ATM_EVENT_NONE;
-    return none;
+    struct AtmHit hit;
+    atm_next_volume_event_into(atm, org, dir, t_surface, rng, &hit);
+    return hit;
 }
 
 ATM_FN float atm_layer_k(const struct AtmGasLayers* gas, int layer, int kind) {
@@ -1089,9 +1141,8 @@ ATM_FN float atm_voxel_optical_depth(
     const float origin[3] = {gx0, gy0, gz0};
     const int n[3] = {g->nx, g->ny, g->nz};
     const float gz1 = gz0 + dx[2] * (float)n[2];
-    /* NEE analog τ: clip Z only (htrdr -r). XY is periodic; a finite XY AABB
-     * lets sun rays from the bottom/left exit before the opposite-tile cloud.
-     * Camera Woodcock stays finite-XY. */
+    /* NEE analog τ: clip Z only (htrdr -r). XY is periodic. Camera Woodcock
+     * uses the same Z-slab clip so nadir still exits at z=0 and hits mesh. */
     float t0 = 0.f;
     float t1 = tmax;
     if (fabsf(dir[2]) < 1e-20f) {
@@ -1237,7 +1288,7 @@ ATM_FN float atm_gas_optical_depth(
         }
         const float ds = fminf(t_exit_layer, tmax - t);
         tau += atm_layer_k(gas, layer, kind) * fmaxf(ds, 0.f);
-        t += ds + 1e-5f;
+        t += ds + atm_ray_eps(t);
         z = org[2] + dir[2] * t;
     }
     return tau;
@@ -1293,6 +1344,7 @@ ATM_FN int atm_volume_occluded(
     const float dir[3],
     float tmax,
     Rng& rng) {
-    struct AtmHit h = atm_next_volume_event(atm, org, dir, tmax, rng);
+    struct AtmHit h;
+    atm_next_volume_event_into(atm, org, dir, tmax, rng, &h);
     return h.event != ATM_EVENT_NONE && h.t < tmax;
 }

@@ -327,9 +327,9 @@ def main():
     )
     p.add_argument(
         "--ground",
-        choices=("gs", "mesh"),
-        default="gs",
-        help="gs = 3DGS mountain + hole-fill quad; mesh = htrdr mountain.obj",
+        choices=("mesh", "gs"),
+        default="mesh",
+        help="mesh = htrdr mountain.obj (default); gs = 3DGS + hole-fill quad (legacy 104659)",
     )
     args = p.parse_args()
     os.makedirs(args.outdir, exist_ok=True)
@@ -467,7 +467,7 @@ def main():
     from threedgptir_tracer.atmosphere import trace_atmosphere
 
     if args.camera == "mountain":
-        w, h = 960, 540
+        w, h = 1280, 720
         pos = np.array([10245.37, 615.02, 422.34], np.float32)
         tgt = np.array([-2977.39, 6829.40, 842.40], np.float32)
         up = np.array([0.0, 0.0, 1.0], np.float32)
@@ -495,6 +495,72 @@ def main():
             rad = rgb.float().mean(dim=-1).cpu().numpy().reshape(-1)
             dns = out[1][..., 0].float().cpu().numpy().reshape(-1)
             light = out[11].float().mean(dim=-1).cpu().numpy().reshape(-1)
+            ev = out[8][..., 0].float().cpu().numpy()
+            ev_flat = ev.reshape(-1)
+            names = {
+                0: "none",
+                1: "absorb_vox",
+                2: "scatter_vox",
+                3: "absorb_gas",
+                4: "scatter_gas",
+                5: "surface",
+                6: "escape",
+            }
+            ev_parts = []
+            for k, name in names.items():
+                ev_parts.append(f"{name}={float((ev_flat == k).mean()):.3f}")
+            print("  diag first_event", " ".join(ev_parts))
+            if args.camera == "mountain":
+                ntop = max(1, ev.shape[-2] // 5)
+                top_ev = ev[..., :ntop, :].reshape(-1)
+                top_lum = rgb.float().mean(dim=-1).cpu().numpy()[..., :ntop, :].reshape(-1)
+                print(
+                    "  diag sky_top20 first scatter_gas",
+                    float((top_ev == 4).mean()),
+                    "escape",
+                    float((top_ev == 6).mean()),
+                    "lum<5",
+                    float((top_lum < 5.0).mean()),
+                    "lum_mean",
+                    float(top_lum.mean()),
+                )
+
+                def _lum_by_event(label, ev_a, lum_a):
+                    print(f"  diag {label} by first_event")
+                    for k, name in ((4, "scatter_gas"), (6, "escape"), (2, "scatter_vox"), (5, "surface")):
+                        m = ev_a == k
+                        n = int(m.sum())
+                        if n == 0:
+                            print(f"    {name}: n=0")
+                            continue
+                        sl = lum_a[m]
+                        print(
+                            f"    {name}: n={n} frac={n / len(ev_a):.3f} "
+                            f"lum_mean={float(sl.mean()):.4g} lum_p50={float(np.median(sl)):.4g} "
+                            f"lum_p90={float(np.percentile(sl, 90)):.4g} "
+                            f"frac<0.05={float((sl < 0.05).mean()):.3f}"
+                        )
+                    holes = (ev_a != 2) & (ev_a != 5)
+                    print(
+                        f"    non_cloud_ground: n={int(holes.sum())} "
+                        f"scatter_gas={float((ev_a[holes] == 4).mean()) if holes.any() else 0.0} "
+                        f"escape={float((ev_a[holes] == 6).mean()) if holes.any() else 0.0} "
+                        f"lum_mean={float(lum_a[holes].mean()) if holes.any() else 0.0}"
+                    )
+
+                _lum_by_event("sky_top20", top_ev, top_lum)
+                top_hit = out[2][..., 0].float().cpu().numpy()[..., :ntop, :].reshape(-1)
+                for k, name in ((4, "scatter_gas"), (6, "escape"), (2, "scatter_vox")):
+                    m = top_ev == k
+                    if not m.any():
+                        continue
+                    ht = top_hit[m]
+                    print(
+                        f"    {name} hitT p10/50/90",
+                        np.percentile(ht, [10, 50, 90]),
+                        "z≈",
+                        422.34 + 0.26 * np.percentile(ht, [10, 50, 90]),
+                    )
             print(
                 "  diag hitT p10/50/90",
                 np.percentile(hit, [10, 50, 90]),
@@ -544,11 +610,15 @@ def main():
 
     spk = os.path.join(ROOT, "htrdr-atmosphere-spk/htrdr-Atmosphere-Starter-Pack-0.8.0")
     if args.camera == "mountain":
-        orig = os.path.join(spk, "test_320x240x16.ppm")
-        left_label = "htrdr test_320x240x16 (mountain.sh style)"
+        orig = os.path.join(args.outdir, "htrdr_ref_mountain_1280x720x256.png")
+        if not os.path.isfile(orig):
+            orig = os.path.join(spk, "test_320x240x16.ppm")
+        left_label = "htrdr mountain.sh 1280x720 spp256  (mountain.obj)"
     else:
-        orig = os.path.join(spk, "ortho_512x512x32.ppm")
-        left_label = "htrdr ortho 512x512 spp32  (DZVAR + desert)"
+        orig = os.path.join(args.outdir, "htrdr_ref_ortho_512x512x256.png")
+        if not os.path.isfile(orig):
+            orig = os.path.join(spk, "ortho_512x512x32.ppm")
+        left_label = "htrdr ortho 512x512 spp256  (mountain.obj)"
     if os.path.isfile(orig):
         oim = Image.open(orig).convert("RGB").resize((w, h), Image.NEAREST)
         canvas = Image.new("RGB", (w * 2 + 24, h + 48), (18, 18, 18))
@@ -567,6 +637,7 @@ def main():
                 gpu_label = "GPU PTIR  mountain.obj mesh" + ("  no clouds" if args.no_clouds else "")
             if args.camera == "mountain":
                 gpu_label = "GPU PTIR  mountain.sh camera" + ("  no clouds" if args.no_clouds else "")
+            gpu_label = f"{gpu_label}  spp{args.spp}"
             d.text((w + 16, 8), gpu_label, fill=(220, 220, 220))
         except Exception:
             pass

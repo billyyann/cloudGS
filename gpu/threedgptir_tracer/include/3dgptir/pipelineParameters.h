@@ -415,6 +415,10 @@ enum AtmHitgroupSbt {
     // ============================================================
     AtmParams atmosphere;
 
+    /* htrdr -R: repeating mesh tile AABB in world XY (and Z slab). Zero extent = no wrap. */
+    float meshRepeatLow[3];
+    float meshRepeatUpp[3];
+
     // ============================================================
     // 7. 帧信息
     // ============================================================

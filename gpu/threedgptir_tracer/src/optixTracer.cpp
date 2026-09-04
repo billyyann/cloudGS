@@ -143,6 +143,7 @@ void getPtxFromCuString(std::string& ptx,
     NVRTC_CHECK_ERROR(nvrtcGetPTXSize(prog, &ptx_size));
     ptx.resize(ptx_size);
     NVRTC_CHECK_ERROR(nvrtcGetPTX(prog, &ptx[0]));
+    std::fprintf(stderr, "[atm] nvrtc %s ptx=%zu src=%zu\n", name, ptx.size(), std::strlen(cu_source));
 
     // Cleanup
     NVRTC_CHECK_ERROR(nvrtcDestroyProgram(&prog));
@@ -1501,6 +1502,8 @@ paramsHost.volHandle = 0;
 paramsHost.meshVolIas = 0;
 paramsHost.volBrickId = nullptr;
 paramsHost.volPrimCount = 0;
+paramsHost.meshRepeatLow[0] = paramsHost.meshRepeatLow[1] = paramsHost.meshRepeatLow[2] = 0.f;
+paramsHost.meshRepeatUpp[0] = paramsHost.meshRepeatUpp[1] = paramsHost.meshRepeatUpp[2] = 0.f;
 paramsHost.aabb   = _state->gasAABB;    // 场景包围盒
 
 // ---- 2.2 帧信息 ----
@@ -1735,6 +1738,8 @@ OptixTracer::traceBwd(uint32_t frameNumber,
     paramsHost.meshVolIas = 0;
     paramsHost.volBrickId = nullptr;
     paramsHost.volPrimCount = 0;
+    paramsHost.meshRepeatLow[0] = paramsHost.meshRepeatLow[1] = paramsHost.meshRepeatLow[2] = 0.f;
+    paramsHost.meshRepeatUpp[0] = paramsHost.meshRepeatUpp[1] = paramsHost.meshRepeatUpp[2] = 0.f;
     paramsHost.aabb   = _state->gasAABB;
 
     paramsHost.frameBounds.x = rayOri.size(2) - 1;
@@ -1968,7 +1973,7 @@ void OptixTracer::buildAtmosphereAccel(
         st->volKmaxPtr = 0;
     } else {
         const CUdeviceptr kptr = reinterpret_cast<CUdeviceptr>(voxelKmax.data_ptr());
-        if (!(st->volGasHandle && st->volKmaxPtr == kptr && st->volPrimCount == 1)) {
+        if (!(st->volGasHandle && st->volKmaxPtr == kptr && st->volPrimCount == 1 && st->volAabbWrap == 2)) {
             const torch::Tensor kHost = voxelKmax.detach().cpu().contiguous();
             const float* kmax = kHost.data_ptr<float>();
             int any = 0;
@@ -1983,17 +1988,20 @@ void OptixTracer::buildAtmosphereAccel(
                 st->volGasHandle = 0;
                 st->volPrimCount = 0;
                 st->volKmaxPtr = kptr;
+                st->volAabbWrap = 2;
                 std::fprintf(stderr, "[atm] vol GAS empty (all bricks kmax=0)\n");
             } else {
-                /* One Custom AABB for the voxel grid. IS runs sequential Woodcock
-                 * with a single Ts (htrdr SVX). Empty bricks are skipped inside the walk. */
+                /* Wide XY + tall Z so camera-outside and sky rays still enter IS.
+                 * IS Woodcock clips the cloud Z-slab and wraps XY; gas walks tmax. */
+                const float span = 2.0e5f;
+                const float zTop = fmaxf(grid.origin[2] + (float)grid.nz * grid.dz, 1.0e5f);
                 OptixAabb box;
-                box.minX = grid.origin[0];
-                box.minY = grid.origin[1];
-                box.minZ = grid.origin[2];
-                box.maxX = grid.origin[0] + (float)grid.nx * grid.dx;
-                box.maxY = grid.origin[1] + (float)grid.ny * grid.dy;
-                box.maxZ = grid.origin[2] + (float)grid.nz * grid.dz;
+                box.minX = grid.origin[0] - span;
+                box.minY = grid.origin[1] - span;
+                box.minZ = fminf(grid.origin[2], 0.f);
+                box.maxX = grid.origin[0] + (float)grid.nx * grid.dx + span;
+                box.maxY = grid.origin[1] + (float)grid.ny * grid.dy + span;
+                box.maxZ = zTop;
                 const int brick0 = 0;
                 reallocDevice(&st->volAabbBuffer, &st->volAabbBufferSz, sizeof(OptixAabb));
                 reallocDevice(&st->volBrickIdBuffer, &st->volBrickIdBufferSz, sizeof(int));
@@ -2013,7 +2021,8 @@ void OptixTracer::buildAtmosphereAccel(
                 buildGASFromInput(input, &st->volGasHandle, &st->volGasBuffer, &st->volGasBufferSz);
                 st->volPrimCount = 1;
                 st->volKmaxPtr = kptr;
-                std::fprintf(stderr, "[atm] vol GAS 1 AABB (grid) / %d bricks\n", nbrick);
+                st->volAabbWrap = 2;
+                std::fprintf(stderr, "[atm] vol GAS 1 AABB (Z-atm + wrap XY) / %d bricks\n", nbrick);
             }
         }
     }
@@ -2225,14 +2234,33 @@ OptixTracer::traceAtmosphere(
                                 ? reinterpret_cast<const int*>(_state->volBrickIdBuffer)
                                 : nullptr;
     paramsHost.volPrimCount = _state->volPrimCount;
+    if (meshVerts.defined() && meshVerts.numel() >= 3) {
+        const torch::Tensor mnH = std::get<0>(meshVerts.min(0)).detach().cpu().contiguous();
+        const torch::Tensor mxH = std::get<0>(meshVerts.max(0)).detach().cpu().contiguous();
+        const float* a = mnH.data_ptr<float>();
+        const float* b = mxH.data_ptr<float>();
+        paramsHost.meshRepeatLow[0] = a[0];
+        paramsHost.meshRepeatLow[1] = a[1];
+        paramsHost.meshRepeatLow[2] = a[2];
+        paramsHost.meshRepeatUpp[0] = b[0];
+        paramsHost.meshRepeatUpp[1] = b[1];
+        paramsHost.meshRepeatUpp[2] = b[2];
+        if (paramsHost.meshRepeatUpp[2] - paramsHost.meshRepeatLow[2] < 1.f) {
+            paramsHost.meshRepeatLow[2] -= 1.f;
+            paramsHost.meshRepeatUpp[2] += 1.f;
+        }
+        std::fprintf(stderr, "[atm] mesh -R AABB [%.1f,%.1f,%.1f] / [%.1f,%.1f,%.1f]\n",
+                     (double)a[0], (double)a[1], (double)a[2],
+                     (double)b[0], (double)b[1], (double)b[2]);
+    }
 
     std::fprintf(stderr,
                  "[atm] sizeof PipelineParameters=%zu AtmParams=%zu sunL=%g mesh_ntri=%d voxels=%dx%dx%d gs=%d "
-                 "meshGAS=%d volGAS=%d ias=%d volPrims=%d\n",
+                 "meshGAS=%d volGAS=%d ias=%d volPrims=%d gas_nlayers=%d gas_ks=%d path_tmax=%g\n",
                  sizeof(PipelineParameters), sizeof(AtmParams), (double)atm.sun.radiance,
                  atm.mesh.ntri, atm.voxels.nx, atm.voxels.ny, atm.voxels.nz, atm.gs_enabled,
                  paramsHost.meshHandle != 0, paramsHost.volHandle != 0, paramsHost.meshVolIas != 0,
-                 paramsHost.volPrimCount);
+                 paramsHost.volPrimCount, atm.gas.nlayers, atm.gas.ks != nullptr, (double)atm.path_tmax);
 
     reallocateParamsDevice(sizeof(paramsHost), cudaStream);
     CUDA_CHECK(cudaMemcpyAsync(

@@ -28,6 +28,13 @@ struct AtmAccelHit {
     float temperature;
 };
 
+static constexpr int kAtmMeshSlabMaxSteps = 32;
+
+static __device__ int atm_mesh_repeat_ok() {
+    return (params.meshRepeatUpp[0] - params.meshRepeatLow[0] > 1.f) &&
+           (params.meshRepeatUpp[1] - params.meshRepeatLow[1] > 1.f);
+}
+
 static __device__ AtmAccelHit atm_trace_accel(
     OptixTraversableHandle handle,
     const float org[3],
@@ -78,6 +85,198 @@ static __device__ AtmAccelHit atm_trace_accel(
         hit.temperature = __uint_as_float(p4);
     }
     return hit;
+}
+
+/* htrdr_slab_trace_ray / -R: fold origin into the mesh tile, OptiX the GAS,
+ * miss → step to the next XY neighbour (max 32). Cloud period is voxels, not this AABB. */
+static __device__ AtmAccelHit atm_trace_mesh_slab(
+    const float org[3],
+    const float dir[3],
+    float tmin,
+    float tmax,
+    unsigned rayFlags,
+    Sampler& sampler) {
+    AtmAccelHit miss;
+    miss.t = ATM_INF;
+    miss.kind = 0;
+    miss.prim = -1;
+    miss.event = ATM_EVENT_NONE;
+    miss.temperature = 0.f;
+    if (!params.meshHandle || tmax <= tmin) {
+        return miss;
+    }
+    if (!atm_mesh_repeat_ok()) {
+        return atm_trace_accel(
+            params.meshHandle, org, dir, tmin, tmax, ATM_SBT_MESH, rayFlags, sampler);
+    }
+
+    const float lo[3] = {params.meshRepeatLow[0], params.meshRepeatLow[1], params.meshRepeatLow[2]};
+    const float hi[3] = {params.meshRepeatUpp[0], params.meshRepeatUpp[1], params.meshRepeatUpp[2]};
+    const float sx = hi[0] - lo[0];
+    const float sy = hi[1] - lo[1];
+
+    float t_min_z = tmin;
+    float t_max_z = tmax;
+    if (fabsf(dir[2]) < 1e-20f) {
+        if (org[2] < lo[2] || org[2] > hi[2]) {
+            return miss;
+        }
+    } else {
+        float ta = (lo[2] - org[2]) / dir[2];
+        float tb = (hi[2] - org[2]) / dir[2];
+        if (ta > tb) {
+            const float tmp = ta;
+            ta = tb;
+            tb = tmp;
+        }
+        t_min_z = fmaxf(ta, tmin);
+        t_max_z = fminf(tb, tmax);
+        if (t_min_z > t_max_z) {
+            return miss;
+        }
+    }
+
+    const float posx = org[0] + t_min_z * dir[0];
+    const float posy = org[1] + t_min_z * dir[1];
+    int xy0 = (int)floorf((posx - lo[0]) / sx);
+    int xy1 = (int)floorf((posy - lo[1]) / sy);
+    const int incr0 = dir[0] < 0.f ? -1 : 1;
+    const int incr1 = dir[1] < 0.f ? -1 : 1;
+
+    float cell0 = lo[0] + (float)xy0 * sx;
+    float cell1 = lo[1] + (float)xy1 * sy;
+    float t_max0 = (fabsf(dir[0]) < 1e-20f)
+                       ? ATM_INF
+                       : (((dir[0] < 0.f ? cell0 : cell0 + sx) - org[0]) / dir[0]);
+    float t_max1 = (fabsf(dir[1]) < 1e-20f)
+                       ? ATM_INF
+                       : (((dir[1] < 0.f ? cell1 : cell1 + sy) - org[1]) / dir[1]);
+    const float t_max2 = t_max_z;
+    const float t_delta0 = (fabsf(dir[0]) < 1e-20f) ? ATM_INF : ((incr0 < 0 ? -sx : sx) / dir[0]);
+    const float t_delta1 = (fabsf(dir[1]) < 1e-20f) ? ATM_INF : ((incr1 < 0 ? -sy : sy) / dir[1]);
+
+    for (int istep = 0; istep < kAtmMeshSlabMaxSteps; ++istep) {
+        const float org_cs[3] = {
+            org[0] - (float)xy0 * sx,
+            org[1] - (float)xy1 * sy,
+            org[2]};
+        const AtmAccelHit h = atm_trace_accel(
+            params.meshHandle, org_cs, dir, tmin, tmax, ATM_SBT_MESH, rayFlags, sampler);
+        if (h.kind == 1 && h.t < tmax && h.t >= tmin) {
+            return h;
+        }
+
+        const int iaxis = (t_max0 < t_max1) ? ((t_max0 < t_max2) ? 0 : 2)
+                                            : ((t_max1 < t_max2) ? 1 : 2);
+        if (iaxis == 2) {
+            break;
+        }
+        if (iaxis == 0) {
+            if (t_max0 >= tmax) {
+                break;
+            }
+            t_max0 += t_delta0;
+            xy0 += incr0;
+        } else {
+            if (t_max1 >= tmax) {
+                break;
+            }
+            t_max1 += t_delta1;
+            xy1 += incr1;
+        }
+    }
+    return miss;
+}
+
+static __device__ struct AtmMeshHit atm_mesh_closest_slab(
+    const struct AtmMesh* mesh,
+    const float org[3],
+    const float dir[3],
+    float tmax) {
+    if (!mesh || mesh->ntri <= 0) {
+        struct AtmMeshHit none;
+        atm_mesh_hit_clear(&none);
+        return none;
+    }
+    if (!atm_mesh_repeat_ok()) {
+        return atm_mesh_closest_hit(mesh, org, dir, tmax);
+    }
+
+    const float lo[3] = {params.meshRepeatLow[0], params.meshRepeatLow[1], params.meshRepeatLow[2]};
+    const float hi[3] = {params.meshRepeatUpp[0], params.meshRepeatUpp[1], params.meshRepeatUpp[2]};
+    const float sx = hi[0] - lo[0];
+    const float sy = hi[1] - lo[1];
+    struct AtmMeshHit miss;
+    atm_mesh_hit_clear(&miss);
+
+    float t_min_z = 0.f;
+    float t_max_z = tmax;
+    if (fabsf(dir[2]) < 1e-20f) {
+        if (org[2] < lo[2] || org[2] > hi[2]) {
+            return miss;
+        }
+    } else {
+        float ta = (lo[2] - org[2]) / dir[2];
+        float tb = (hi[2] - org[2]) / dir[2];
+        if (ta > tb) {
+            const float tmp = ta;
+            ta = tb;
+            tb = tmp;
+        }
+        t_min_z = fmaxf(ta, 0.f);
+        t_max_z = fminf(tb, tmax);
+        if (t_min_z > t_max_z) {
+            return miss;
+        }
+    }
+
+    const float posx = org[0] + t_min_z * dir[0];
+    const float posy = org[1] + t_min_z * dir[1];
+    int xy0 = (int)floorf((posx - lo[0]) / sx);
+    int xy1 = (int)floorf((posy - lo[1]) / sy);
+    const int incr0 = dir[0] < 0.f ? -1 : 1;
+    const int incr1 = dir[1] < 0.f ? -1 : 1;
+    float cell0 = lo[0] + (float)xy0 * sx;
+    float cell1 = lo[1] + (float)xy1 * sy;
+    float t_max0 = (fabsf(dir[0]) < 1e-20f)
+                       ? ATM_INF
+                       : (((dir[0] < 0.f ? cell0 : cell0 + sx) - org[0]) / dir[0]);
+    float t_max1 = (fabsf(dir[1]) < 1e-20f)
+                       ? ATM_INF
+                       : (((dir[1] < 0.f ? cell1 : cell1 + sy) - org[1]) / dir[1]);
+    const float t_max2 = t_max_z;
+    const float t_delta0 = (fabsf(dir[0]) < 1e-20f) ? ATM_INF : ((incr0 < 0 ? -sx : sx) / dir[0]);
+    const float t_delta1 = (fabsf(dir[1]) < 1e-20f) ? ATM_INF : ((incr1 < 0 ? -sy : sy) / dir[1]);
+
+    for (int istep = 0; istep < kAtmMeshSlabMaxSteps; ++istep) {
+        const float org_cs[3] = {
+            org[0] - (float)xy0 * sx,
+            org[1] - (float)xy1 * sy,
+            org[2]};
+        struct AtmMeshHit h = atm_mesh_closest_hit(mesh, org_cs, dir, tmax);
+        if (h.t < tmax) {
+            return h;
+        }
+        const int iaxis = (t_max0 < t_max1) ? ((t_max0 < t_max2) ? 0 : 2)
+                                            : ((t_max1 < t_max2) ? 1 : 2);
+        if (iaxis == 2) {
+            break;
+        }
+        if (iaxis == 0) {
+            if (t_max0 >= tmax) {
+                break;
+            }
+            t_max0 += t_delta0;
+            xy0 += incr0;
+        } else {
+            if (t_max1 >= tmax) {
+                break;
+            }
+            t_max1 += t_delta1;
+            xy1 += incr1;
+        }
+    }
+    return miss;
 }
 
 static __device__ void atm_mesh_from_accel(
@@ -131,26 +330,27 @@ static __device__ void atm_vol_from_accel(
     hit->temperature = a.temperature > 0.f ? a.temperature : atm_fetch_temp(&atm->voxels, ijk[0], ijk[1], ijk[2]);
 }
 
-static __device__ struct AtmHit atm_merge_gas(
+static __device__ void atm_merge_gas(
     const struct AtmParams* atm,
     const float org[3],
     const float dir[3],
     float tmax,
     Sampler& sampler,
-    struct AtmHit vox) {
+    const struct AtmHit& vox,
+    struct AtmHit* out) {
     const int walk_ks = atm->spectral_mode != ATM_SPECTRAL_LW;
-    struct AtmHit gas = atm_gas_free_path(&atm->gas, org, dir, tmax, sampler, walk_ks);
+    struct AtmHit gas;
+    atm_gas_free_path_into(&atm->gas, org, dir, tmax, sampler, walk_ks, &gas);
     if (gas.event != ATM_EVENT_NONE && gas.t <= vox.t && gas.t < tmax) {
-        return gas;
+        *out = gas;
+        return;
     }
     if (vox.event != ATM_EVENT_NONE && vox.t < tmax) {
-        return vox;
+        *out = vox;
+        return;
     }
-    struct AtmHit none;
-    atm_hit_clear(&none);
-    none.t = tmax;
-    none.event = ATM_EVENT_NONE;
-    return none;
+    atm_hit_clear(out);
+    out->t = tmax;
 }
 
 /* First GS surface along the ray. Stochastic α is the object model, not cloud k. */
@@ -238,6 +438,19 @@ static __device__ float atm_gs_closest_surface(
     return ATM_INF;
 }
 
+static __device__ __noinline__ void atm_apply_gas_after_vol(
+    const struct AtmParams* atm,
+    const float org[3],
+    const float dir[3],
+    float tmax,
+    Sampler& sampler,
+    struct AtmHit* vol) {
+    if (vol->event == ATM_EVENT_NONE) {
+        /* IS missed the volume AABB: still walk gas + Z-slab voxels. */
+        atm_next_volume_event_into(atm, org, dir, tmax, sampler, vol);
+    }
+}
+
 static __device__ int atm_ground_occluded(
     const float org[3],
     const float dir[3],
@@ -247,20 +460,18 @@ static __device__ int atm_ground_occluded(
     if (params.meshHandle) {
         Sampler rng;
         rng.init(1ull, 1ull);
-        const AtmAccelHit h = atm_trace_accel(
-            params.meshHandle,
+        const AtmAccelHit h = atm_trace_mesh_slab(
             org,
             dir,
             2.f,
             tmax,
-            ATM_SBT_MESH,
             OPTIX_RAY_FLAG_DISABLE_ANYHIT | OPTIX_RAY_FLAG_TERMINATE_ON_FIRST_HIT,
             rng);
         return (h.kind == 1 && h.t < tmax && h.t > 2.f) ? 1 : 0;
     }
     if (params.atmosphere.mesh.ntri > 0) {
-        const float t_mesh = atm_mesh_closest(&params.atmosphere.mesh, org, dir, tmax);
-        if (t_mesh < tmax && t_mesh > 2.f) {
+        const struct AtmMeshHit mh = atm_mesh_closest_slab(&params.atmosphere.mesh, org, dir, tmax);
+        if (mh.t < tmax && mh.t > 2.f) {
             return 1;
         }
     }
@@ -396,7 +607,8 @@ static __device__ void writeAtmosphereOutputs(
     const float3& direct,
     const float3& indirect,
     float hitT,
-    int escaped) {
+    int escaped,
+    int firstEvent) {
     params.rayRadiance[idx.z][idx.y][idx.x][0] = radiance.x;
     params.rayRadiance[idx.z][idx.y][idx.x][1] = radiance.y;
     params.rayRadiance[idx.z][idx.y][idx.x][2] = radiance.z;
@@ -428,7 +640,7 @@ static __device__ void writeAtmosphereOutputs(
     params.rayMaterial[idx.z][idx.y][idx.x][2] = 0.f;
     params.rayMaterial[idx.z][idx.y][idx.x][3] = 0.f;
     params.rayMaterial[idx.z][idx.y][idx.x][4] = 0.f;
-    params.rayHitsCount[idx.z][idx.y][idx.x][0] = 0.f;
+    params.rayHitsCount[idx.z][idx.y][idx.x][0] = static_cast<float>(firstEvent);
 }
 
 static __device__ void traceAtmospherePath(const uint3& idx, Sampler& sampler) {
@@ -446,6 +658,7 @@ static __device__ void traceAtmospherePath(const uint3& idx, Sampler& sampler) {
     float3 indirect = make_float3(0.f, 0.f, 0.f);
     float firstHitT = 0.f;
     int recordedHit = 0;
+    int firstEvent = ATM_EVENT_ESCAPE;
     int escaped = 1;
 
     const int maxB = atm->max_bounces > 0 ? atm->max_bounces : (int)params.maxBounces;
@@ -475,15 +688,13 @@ static __device__ void traceAtmospherePath(const uint3& idx, Sampler& sampler) {
          * --ground mesh: GS off — always trace mountain.obj from the camera. */
         if (!above_terrain || !atm->gs_enabled) {
             if (!params.meshHandle) {
-                meshHit = atm_mesh_closest_hit(&atm->mesh, org, dir, tmax);
+                meshHit = atm_mesh_closest_slab(&atm->mesh, org, dir, tmax);
             } else {
-                const AtmAccelHit a = atm_trace_accel(
-                    params.meshHandle,
+                const AtmAccelHit a = atm_trace_mesh_slab(
                     org,
                     dir,
                     1e-4f,
                     tmax,
-                    ATM_SBT_MESH,
                     OPTIX_RAY_FLAG_DISABLE_ANYHIT,
                     sampler);
                 atm_mesh_from_accel(&atm->mesh, a, dir, &meshHit);
@@ -491,7 +702,9 @@ static __device__ void traceAtmospherePath(const uint3& idx, Sampler& sampler) {
         }
 
         t_surf = fminf(fminf(t_gs, meshHit.t), tmax);
-        if (above_terrain && dir[2] < -1e-5f) {
+        /* GS-only: stop the volume at the Cu band so the walk can enter GS.
+         * Mesh ground must not clip t_surf — gas/voxels compete all the way to mountain.obj. */
+        if (atm->gs_enabled && above_terrain && dir[2] < -1e-5f) {
             const float t_band = (850.f - org[2]) / dir[2];
             if (t_band > 0.f) {
                 t_surf = fminf(t_surf, t_band);
@@ -508,13 +721,9 @@ static __device__ void traceAtmospherePath(const uint3& idx, Sampler& sampler) {
                 0u,
                 sampler);
             atm_vol_from_accel(atm, org, dir, a, &vol);
-            if (vol.event == ATM_EVENT_NONE) {
-                vol = atm_next_volume_event(atm, org, dir, t_surf, sampler);
-            } else {
-                vol = atm_merge_gas(atm, org, dir, t_surf, sampler, vol);
-            }
+            atm_apply_gas_after_vol(atm, org, dir, t_surf, sampler, &vol);
         } else {
-            vol = atm_next_volume_event(atm, org, dir, t_surf, sampler);
+            atm_next_volume_event_into(atm, org, dir, t_surf, sampler, &vol);
         }
 
         const int vol_first = (vol.event != ATM_EVENT_NONE && vol.t < t_surf);
@@ -524,12 +733,16 @@ static __device__ void traceAtmospherePath(const uint3& idx, Sampler& sampler) {
         if (!recordedHit) {
             if (vol_first) {
                 firstHitT = vol.t;
+                firstEvent = vol.event;
             } else if (gs_first) {
                 firstHitT = t_gs;
+                firstEvent = ATM_EVENT_HIT_SURFACE;
             } else if (mesh_first) {
                 firstHitT = meshHit.t;
+                firstEvent = ATM_EVENT_HIT_SURFACE;
             } else {
                 firstHitT = tmax;
+                firstEvent = ATM_EVENT_ESCAPE;
             }
             recordedHit = 1;
         }
@@ -557,17 +770,24 @@ static __device__ void traceAtmospherePath(const uint3& idx, Sampler& sampler) {
                 break;
             }
 
-            /* Collision-point Bernoulli: r < ks_gas/ks → Rayleigh else HG. */
-            float ka_g = 0.f, ks_g = 0.f;
-            atm_gas_k_at_z(&atm->gas, vol.pos[2], &ka_g, &ks_g);
-            int ijk[3];
-            atm_world_to_ijk(&atm->voxels, vol.pos, ijk);
-            const float ks_p = atm_fetch_ks(&atm->voxels, ijk[0], ijk[1], ijk[2]);
-            const float ks_tot = ks_g + ks_p;
-            if (ks_tot <= 1e-20f) {
-                break;
+            /* Competing risks already chose gas vs voxel. Do not re-Bernoulli
+             * and do not break on a second k fetch: vis=1 A/B left scatter_gas
+             * lum p50=0, so NEE never ran (ks_tot==0). */
+            int voxelScatter = 1;
+            if (vol.event == ATM_EVENT_SCATTER_GAS) {
+                voxelScatter = 0;
+            } else {
+                float ka_g = 0.f, ks_g = 0.f;
+                atm_gas_k_at_z(&atm->gas, vol.pos[2], &ka_g, &ks_g);
+                int ijk[3];
+                atm_world_to_ijk(&atm->voxels, vol.pos, ijk);
+                const float ks_p = atm_fetch_ks(&atm->voxels, ijk[0], ijk[1], ijk[2]);
+                const float ks_tot = ks_g + ks_p;
+                if (ks_tot <= 1e-20f) {
+                    break;
+                }
+                voxelScatter = sampler.next_1d() >= (ks_g / ks_tot) ? 1 : 0;
             }
-            const int voxelScatter = sampler.next_1d() >= (ks_g / ks_tot);
             atm_add_sun_nee_volume(atm, vol.pos, dir, voxelScatter, throughput, sampler, radiance, bounce == 0 ? direct : indirect);
 
             float wo[3];
@@ -655,7 +875,7 @@ static __device__ void traceAtmospherePath(const uint3& idx, Sampler& sampler) {
         } else {
             /* Above the mountain: no volume hit this segment — step into the
              * terrain band and keep walking (do not treat as space escape). */
-            if (above_terrain && dir[2] < -1e-5f) {
+            if (atm->gs_enabled && above_terrain && dir[2] < -1e-5f) {
                 const float t_band = (850.f - org[2]) / dir[2];
                 if (t_band > 1e-3f && t_band < tmax) {
                     const float Tr_abs = atm_absorption_transmittance(atm, org, dir, t_band);
@@ -697,5 +917,5 @@ static __device__ void traceAtmospherePath(const uint3& idx, Sampler& sampler) {
         }
     }
 
-    writeAtmosphereOutputs(idx, radiance, direct, indirect, firstHitT, escaped);
+    writeAtmosphereOutputs(idx, radiance, direct, indirect, firstHitT, escaped, firstEvent);
 }

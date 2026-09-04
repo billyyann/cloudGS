@@ -87,6 +87,7 @@ protected:
         size_t volBrickIdBufferSz;
         int volPrimCount;
         CUdeviceptr volKmaxPtr;
+        int volAabbWrap;
 
         OptixTraversableHandle meshVolIasHandle;
         CUdeviceptr meshVolIasBuffer;
