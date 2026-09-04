@@ -751,6 +751,18 @@ static __device__ void traceAtmospherePath(const uint3& idx, Sampler& sampler) {
     int firstEvent = ATM_EVENT_ESCAPE;
     int escaped = 1;
 
+    /* htrdr SW: if the *camera* dir is in the solar cone, add L_sun * Tr(Kext)
+     * before the walk. After a scatter/bounce, htrdr only uses NEE — a miss
+     * does not add the disk (except specular, which CIE sand is not). */
+    if (!isLW && atm_dir_in_sun_cone(&atm->sun, dir) && atm->sun.radiance > 0.f) {
+        const float vis = atm_sun_visibility(atm, org, dir, tmax0, sampler);
+        if (vis > 0.f) {
+            const float3 contrib = throughput * (atm->sun.radiance * vis);
+            radiance += contrib;
+            direct += contrib;
+        }
+    }
+
     for (int bounce = 0; bounce < maxB; ++bounce) {
         const float tmax = tmax0;
         const int above_terrain = (org[2] > 850.f);
@@ -858,24 +870,11 @@ static __device__ void traceAtmospherePath(const uint3& idx, Sampler& sampler) {
                 break;
             }
 
-            /* Competing risks already chose gas vs voxel. Do not re-Bernoulli
-             * and do not break on a second k fetch: vis=1 A/B left scatter_gas
-             * lum p50=0, so NEE never ran (ks_tot==0). */
-            int voxelScatter = 1;
-            if (vol.event == ATM_EVENT_SCATTER_GAS) {
-                voxelScatter = 0;
-            } else {
-                float ka_g = 0.f, ks_g = 0.f;
-                atm_gas_k_at_z(&atm->gas, vol.pos[2], &ka_g, &ks_g);
-                int ijk[3];
-                atm_world_to_ijk(&atm->voxels, vol.pos, ijk);
-                const float ks_p = atm_fetch_ks(&atm->voxels, ijk[0], ijk[1], ijk[2]) * atm_path_ks_scale(atm);
-                const float ks_tot = ks_g + ks_p;
-                if (ks_tot <= 1e-20f) {
-                    break;
-                }
-                voxelScatter = sampler.next_1d() >= (ks_g / ks_tot) ? 1 : 0;
-            }
+            /* Competing risks already chose the component (htrdr: one Ks walk then
+             * Bernoulli once). A second ks_g/ks_tot roll would make
+             * P(HG)=(ks_p/ks_tot)^2. In this cloud that flip is ~0.05% of events
+             * — not the 12% core gap; still wrong, so do not re-Bernoulli. */
+            const int voxelScatter = (vol.event == ATM_EVENT_SCATTER_GAS) ? 0 : 1;
             atm_add_sun_nee_volume(atm, vol.pos, dir, voxelScatter, throughput, sampler, radiance, bounce == 0 ? direct : indirect);
 
             float wo[3];
@@ -995,16 +994,8 @@ static __device__ void traceAtmospherePath(const uint3& idx, Sampler& sampler) {
                     continue;
                 }
             }
-            /* Escaped atmosphere: SW looking into the sun (Tr already sampled as 1). */
-            if (!isLW && atm_dir_in_sun_cone(&atm->sun, dir) && atm->sun.radiance > 0.f) {
-                const float3 contrib = throughput * atm->sun.radiance;
-                radiance += contrib;
-                if (bounce == 0) {
-                    direct += contrib;
-                } else {
-                    indirect += contrib;
-                }
-            }
+            /* htrdr: no scatter and no surface → break. Sun after a bounce
+             * is NEE only; do not add the disk on miss. */
             escaped = 1;
             break;
         }

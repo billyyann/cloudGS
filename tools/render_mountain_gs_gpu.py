@@ -331,6 +331,14 @@ def main():
         default="mesh",
         help="mesh = htrdr mountain.obj (default); gs = 3DGS + hole-fill quad (legacy 104659)",
     )
+    p.add_argument(
+        "--crop",
+        nargs=4,
+        type=int,
+        metavar=("X0", "Y0", "X1", "Y1"),
+        default=None,
+        help="trace a pixel window only (does not overwrite gpu_xyz_*.npy)",
+    )
     args = p.parse_args()
     os.makedirs(args.outdir, exist_ok=True)
 
@@ -526,6 +534,10 @@ def main():
             ori, drc = make_persp_rays(w, h, pos, tgt, up, 30.0, n, device)
         else:
             ori, drc = make_ortho_rays(w, h, center, args.height, up, look, n, device)
+        if args.crop is not None:
+            x0, y0, x1, y1 = args.crop
+            ori = ori[:, y0:y1, x0:x1].contiguous()
+            drc = drc[:, y0:y1, x0:x1].contiguous()
         out = trace_atmosphere(tracer, ori, drc, buffers, frame_number=c)
         rgb = out[10]  # ray_pbr
         part = rgb.float().mean(dim=0).cpu().numpy()
@@ -629,6 +641,40 @@ def main():
         del ori, drc, out, rgb
         torch.cuda.empty_cache()
     img = acc / float(nchunk)
+    if args.crop is not None:
+        x0, y0, x1, y1 = args.crop
+        print(
+            f"crop {x0},{y0}-{x1},{y1} max_bounces={args.max_bounces} "
+            f"GPU Y mean/p50={float(img[...,1].mean()):.3f}/{float(np.median(img[...,1])):.3f}"
+        )
+        htrdr_txt = (
+            os.path.join(args.outdir, "htrdr_ref_mountain_1280x720x256.txt")
+            if args.camera == "mountain"
+            else os.path.join(args.outdir, "htrdr_ref_ortho_512x512x256.txt")
+        )
+        if os.path.isfile(htrdr_txt):
+            href = np.loadtxt(htrdr_txt, skiprows=1, dtype=np.float64).reshape(-1, 8)
+            hy = href[:, 2].reshape(h, w)[y0:y1, x0:x1]
+            hx = href[:, 0].reshape(h, w)[y0:y1, x0:x1]
+            hz = href[:, 4].reshape(h, w)[y0:y1, x0:x1]
+            gy = img[..., 1]
+            print(
+                f"  htrdr crop Y mean/p50={float(hy.mean()):.3f}/{float(np.median(hy)):.3f}  "
+                f"GPU/htrdr mean={float(gy.mean()/max(hy.mean(),1e-12)):.3f}  "
+                f"p50={float(np.median(gy)/max(np.median(hy),1e-12)):.3f}  "
+                f"Y/X htrdr={float(hy.mean()/max(hx.mean(),1e-12)):.3f} GPU={float(gy.mean()/max(img[...,0].mean(),1e-12)):.3f}"
+            )
+            thr = float(np.percentile(hy, 70))
+            bright = hy > thr
+            if bright.any():
+                print(
+                    f"  bright Y>p70 n={int(bright.sum())}  "
+                    f"htrdr mean/p50={float(hy[bright].mean()):.3f}/{float(np.median(hy[bright])):.3f}  "
+                    f"GPU mean/p50={float(gy[bright].mean()):.3f}/{float(np.median(gy[bright])):.3f}  "
+                    f"ratio mean={float(gy[bright].mean()/hy[bright].mean()):.3f}  "
+                    f"p50={float(np.median(gy[bright])/max(np.median(hy[bright]),1e-12)):.3f}"
+                )
+        return
     if buffers.spectral_mode == SPECTRAL_SW_CIE_XYZ and buffers.cie_cdf is not None and buffers.cie_cdf.numel() > 0:
         X, Y, Z = img[..., 0], img[..., 1], img[..., 2]
         y995 = float(np.percentile(Y, 99.5))

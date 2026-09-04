@@ -127,13 +127,18 @@ def fetch_mie(wavelength_nm: float = 550.0, mie_path: str = DEFAULT_MIE) -> dict
 
 def load_htcp_voxels(
     htcp_path: str = DEFAULT_HTCP,
-    nreg: int = 80,
-    z0: float = 0.0,
-    z1: float = 4000.0,
+    nreg: int | None = None,
+    z0: float | None = None,
+    z1: float | None = None,
     wavelength_nm: float = 550.0,
     mie_path: str = DEFAULT_MIE,
 ) -> dict:
-    """RCT → regular (nz, ny, nx) ks/ka/T. k = ρ_da · RCT · C_{s,a} (same as htsky)."""
+    """RCT → regular (nz, ny, nx) ks/ka/T. k = ρ_da · RCT · C_{s,a} (same as htsky).
+
+    Default Z grid is native layer count over native [lower_z, upper_z].
+    nreg=80 / z1=4000 smeared 5–50 m HTCP cells into 50 m bins and dropped the
+    top ~200 m; sun-path Tr at camera first-hits was ~0.89 vs nreg=160.
+    """
     mie = fetch_mie(wavelength_nm, mie_path)
     Cs, Ca = mie["Cs"], mie["Ca"]
     lib = _so("libhtcp.so")
@@ -158,6 +163,13 @@ def load_htcp_voxels(
         raise RuntimeError("htcp_get_desc failed")
 
     nx, ny, nz = (int(d.spatial_definition[0]), int(d.spatial_definition[1]), int(d.spatial_definition[2]))
+    if z0 is None:
+        z0 = float(d.lower[2])
+    if z1 is None:
+        z1 = float(d.upper[2])
+    if nreg is None:
+        nreg = nz
+    nreg = int(nreg)
     nt = max(int(d.time_definition), 1)
     ncell = nx * ny * nz * nt
     rct = _np_from_c_double(d.RCT, ncell).reshape(nt, nz, ny, nx)
@@ -775,13 +787,21 @@ def ensure_assets(
                     break
         write_scene_json(scene, "mountain_gs.ply", nvert)
 
-    if rebuild or not os.path.isfile(voxels_bin) or not os.path.isfile(os.path.join(outdir, "dzvar_voxels.mie.json")):
+    need_vox = (
+        rebuild
+        or not os.path.isfile(voxels_bin)
+        or not os.path.isfile(os.path.join(outdir, "dzvar_voxels.mie.json"))
+    )
+    if not need_vox:
+        voxels = load_voxel_bin(voxels_bin)
+        # 80×50 m bins smear sunlit tops (~11% Tr) and clip native z≈4201.
+        if int(voxels["ks"].shape[0]) < 160:
+            need_vox = True
+    if need_vox:
         voxels = load_htcp_voxels(htcp_path)
         save_voxel_bin(voxels_bin, voxels)
         with open(os.path.join(outdir, "dzvar_voxels.mie.json"), "w") as f:
             json.dump({"Cs_source": "htmie", "note": "k=rho*RCT*C"}, f)
-    else:
-        voxels = load_voxel_bin(voxels_bin)
 
     if rebuild or not os.path.isfile(gas_npz):
         gas = load_ecrad_gas_1d(ecrad_path)
