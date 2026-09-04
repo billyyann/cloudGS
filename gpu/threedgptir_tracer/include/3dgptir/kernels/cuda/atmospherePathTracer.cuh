@@ -518,6 +518,54 @@ static __device__ float atm_sun_visibility_volume(
     return atm_volume_transmittance(atm, org, dir, tmax);
 }
 
+static __device__ int atm_lambert_bounce(
+    const Interaction& ix,
+    Sampler& sampler,
+    float3& throughput,
+    float org[3],
+    float dir[3]) {
+    const float R = fmaxf(ix.material.albedo.x, fmaxf(ix.material.albedo.y, ix.material.albedo.z));
+    if (R <= 1e-8f) {
+        return 0;
+    }
+    float n[3] = {ix.shadingnormal.x, ix.shadingnormal.y, ix.shadingnormal.z};
+    atm_normalize3(n);
+    float wo[3];
+    const float u1 = sampler.next_1d();
+    const float u2 = sampler.next_1d();
+    const float r = sqrtf(fmaxf(u1, 0.f));
+    const float phi = 6.28318530718f * u2;
+    const float z = sqrtf(fmaxf(1.f - u1, 0.f));
+    float T[3], B[3];
+    if (fabsf(n[2]) < 0.999f) {
+        T[0] = n[1];
+        T[1] = -n[0];
+        T[2] = 0.f;
+    } else {
+        T[0] = 1.f;
+        T[1] = 0.f;
+        T[2] = 0.f;
+    }
+    atm_normalize3(T);
+    B[0] = n[1] * T[2] - n[2] * T[1];
+    B[1] = n[2] * T[0] - n[0] * T[2];
+    B[2] = n[0] * T[1] - n[1] * T[0];
+    const float cp = cosf(phi);
+    const float sp = sinf(phi);
+    wo[0] = r * cp * T[0] + r * sp * B[0] + z * n[0];
+    wo[1] = r * cp * T[1] + r * sp * B[1] + z * n[1];
+    wo[2] = r * cp * T[2] + r * sp * B[2] + z * n[2];
+    atm_normalize3(wo);
+    throughput = throughput * R;
+    org[0] = ix.position.x + n[0] * 2.f + wo[0] * 0.05f;
+    org[1] = ix.position.y + n[1] * 2.f + wo[1] * 0.05f;
+    org[2] = ix.position.z + n[2] * 2.f + wo[2] * 0.05f;
+    dir[0] = wo[0];
+    dir[1] = wo[1];
+    dir[2] = wo[2];
+    return 1;
+}
+
 static __device__ void atm_add_sun_nee_surface(
     const struct AtmParams* atm,
     const float org[3],
@@ -538,11 +586,17 @@ static __device__ void atm_add_sun_nee_surface(
         return;
     }
     const float ndl = fmaxf(0.f, ix.shadingnormal.x * L.x + ix.shadingnormal.y * L.y + ix.shadingnormal.z * L.z);
-    const float3 lambert = ix.material.albedo * (ndl * (1.f / 3.14159265f));
-    float scatterPdf = 0.f;
-    const float3 brdfTimesCos = eval_material_fast_brdf_light_sample(rayDir, ix, L, scatterPdf);
-    (void)scatterPdf;
-    const float3 fcos = (brdfTimesCos.x + brdfTimesCos.y + brdfTimesCos.z) > 1e-8f ? brdfTimesCos : lambert;
+    float3 fcos;
+    if (atm->path_albedo >= 0.f) {
+        /* htrdr mrumtl lambertian: R/π * n·L. Disney F0=0.04 is not sand. */
+        fcos = ix.material.albedo * (ndl * (1.f / 3.14159265f));
+    } else {
+        const float3 lambert = ix.material.albedo * (ndl * (1.f / 3.14159265f));
+        float scatterPdf = 0.f;
+        const float3 brdfTimesCos = eval_material_fast_brdf_light_sample(rayDir, ix, L, scatterPdf);
+        (void)scatterPdf;
+        fcos = (brdfTimesCos.x + brdfTimesCos.y + brdfTimesCos.z) > 1e-8f ? brdfTimesCos : lambert;
+    }
     /* Offset along shading normal so 8M heightfield NEE does not self-hit. */
     float p[3] = {
         org[0] + ix.shadingnormal.x * 2.f + wo[0] * 0.05f,
@@ -564,6 +618,10 @@ static __device__ void atm_add_sky_surface(
     float3& radiance,
     float3& direct) {
     if (atm->spectral_mode == ATM_SPECTRAL_LW || atm->sun.radiance <= 0.f) {
+        return;
+    }
+    /* htrdr has no constant skylight on surfaces. 0.08*sun was for mono-550. */
+    if (atm->cie_enabled) {
         return;
     }
     const float sky = atm->sun.radiance * 0.08f;
@@ -644,13 +702,45 @@ static __device__ void writeAtmosphereOutputs(
 }
 
 static __device__ void traceAtmospherePath(const uint3& idx, Sampler& sampler) {
-    const AtmParams* atm = &params.atmosphere;
+    const AtmParams* atm_base = &params.atmosphere;
     Ray ray(params.rayWorldOrigin(idx), params.rayWorldDirection(idx));
 
-    float org[3], dir[3];
-    atm_f3_to_arr(ray.origin, org);
-    atm_f3_to_arr(ray.direction, dir);
-    atm_normalize3(dir);
+    float org0[3], dir0[3];
+    atm_f3_to_arr(ray.origin, org0);
+    atm_f3_to_arr(ray.direction, dir0);
+    atm_normalize3(dir0);
+
+    const int cieOn = (atm_base->cie_enabled && atm_base->cie_cdf && atm_base->cie_nbins > 0) ? 1 : 0;
+    const int nch = cieOn ? 3 : 1;
+    float xyz[3] = {0.f, 0.f, 0.f};
+    float firstHitTKeep = 0.f;
+    int firstEventKeep = ATM_EVENT_ESCAPE;
+    int escapedKeep = 1;
+
+    const int maxB = atm_base->max_bounces > 0 ? atm_base->max_bounces : (int)params.maxBounces;
+    const float tmax0 = atm_base->path_tmax > 0.f ? atm_base->path_tmax : 1.0e5f;
+    const int isLW = atm_base->spectral_mode == ATM_SPECTRAL_LW;
+
+    float3 radianceOut = make_float3(0.f, 0.f, 0.f);
+    float3 directOut = make_float3(0.f, 0.f, 0.f);
+    float3 indirectOut = make_float3(0.f, 0.f, 0.f);
+
+    for (int cie_ch = 0; cie_ch < nch; ++cie_ch) {
+    float org[3] = {org0[0], org0[1], org0[2]};
+    float dir[3] = {dir0[0], dir0[1], dir0[2]};
+    AtmParams atm_ch = *atm_base;
+    float wlen_pdf = 1.f;
+    if (cieOn) {
+        const float r0 = sampler.next_1d();
+        const float r1 = sampler.next_1d();
+        const float r_quad = sampler.next_1d();
+        atm_cie_bind_path(&atm_ch, cie_ch, r0, r1, r_quad, &wlen_pdf);
+        const float wlen_nm = atm_ch.wavelength_m * 1.0e9f;
+        atm_ch.path_albedo = atm_mrumtl_fetch_R(&atm_ch, wlen_nm, sampler.next_1d());
+    } else {
+        atm_ch.path_albedo = -1.f;
+    }
+    const AtmParams* atm = &atm_ch;
 
     float3 throughput = make_float3(1.f, 1.f, 1.f);
     float3 radiance = make_float3(0.f, 0.f, 0.f);
@@ -660,10 +750,6 @@ static __device__ void traceAtmospherePath(const uint3& idx, Sampler& sampler) {
     int recordedHit = 0;
     int firstEvent = ATM_EVENT_ESCAPE;
     int escaped = 1;
-
-    const int maxB = atm->max_bounces > 0 ? atm->max_bounces : (int)params.maxBounces;
-    const float tmax0 = atm->path_tmax > 0.f ? atm->path_tmax : 1.0e5f;
-    const int isLW = atm->spectral_mode == ATM_SPECTRAL_LW;
 
     for (int bounce = 0; bounce < maxB; ++bounce) {
         const float tmax = tmax0;
@@ -710,7 +796,9 @@ static __device__ void traceAtmospherePath(const uint3& idx, Sampler& sampler) {
                 t_surf = fminf(t_surf, t_band);
             }
         }
-        if (params.volHandle) {
+        /* CIE: skip vol GAS. __intersection__vol reads params.atmosphere.gas
+         * (host 550 nm), not the per-path HTGOP band. */
+        if (params.volHandle && !cieOn) {
             const AtmAccelHit a = atm_trace_accel(
                 params.volHandle,
                 org,
@@ -781,7 +869,7 @@ static __device__ void traceAtmospherePath(const uint3& idx, Sampler& sampler) {
                 atm_gas_k_at_z(&atm->gas, vol.pos[2], &ka_g, &ks_g);
                 int ijk[3];
                 atm_world_to_ijk(&atm->voxels, vol.pos, ijk);
-                const float ks_p = atm_fetch_ks(&atm->voxels, ijk[0], ijk[1], ijk[2]);
+                const float ks_p = atm_fetch_ks(&atm->voxels, ijk[0], ijk[1], ijk[2]) * atm_path_ks_scale(atm);
                 const float ks_tot = ks_g + ks_p;
                 if (ks_tot <= 1e-20f) {
                     break;
@@ -809,6 +897,9 @@ static __device__ void traceAtmospherePath(const uint3& idx, Sampler& sampler) {
                 break;
             }
             throughput *= Tr_abs;
+            if (atm->cie_enabled && atm->path_albedo >= 0.f) {
+                gsIx.material.albedo = make_float3(atm->path_albedo, atm->path_albedo, atm->path_albedo);
+            }
             if (isLW) {
                 const float B = atm_planck_monochromatic(atm->wavelength_m, 288.15f);
                 const float rho = fmaxf(gsIx.material.albedo.x, fmaxf(gsIx.material.albedo.y, gsIx.material.albedo.z));
@@ -819,6 +910,11 @@ static __device__ void traceAtmospherePath(const uint3& idx, Sampler& sampler) {
             atm_add_sun_nee_surface(atm, gsPos, gsRay.direction, gsIx, throughput, sampler, radiance, bounce == 0 ? direct : indirect);
             atm_add_sky_surface(atm, gsIx, throughput, radiance, bounce == 0 ? direct : indirect);
 
+            if (atm->path_albedo >= 0.f) {
+                if (!atm_lambert_bounce(gsIx, sampler, throughput, org, dir)) {
+                    break;
+                }
+            } else {
             pathPayload path(1u, (unsigned int)bounce, (unsigned int)maxB);
             path.pathThroughput = throughput;
             path.currentRayPayload.ray = gsRay;
@@ -831,6 +927,7 @@ static __device__ void traceAtmospherePath(const uint3& idx, Sampler& sampler) {
             atm_f3_to_arr(path.currentRayPayload.ray.origin, org);
             atm_f3_to_arr(path.currentRayPayload.ray.direction, dir);
             atm_normalize3(dir);
+            }
         } else if (mesh_first) {
             escaped = 0;
             const float Tr_abs = atm_absorption_transmittance(atm, org, dir, meshHit.t);
@@ -842,15 +939,18 @@ static __device__ void traceAtmospherePath(const uint3& idx, Sampler& sampler) {
                 org[0] + dir[0] * meshHit.t,
                 org[1] + dir[1] * meshHit.t,
                 org[2] + dir[2] * meshHit.t};
+            float ar = meshHit.albedo[0];
+            float ag = meshHit.albedo[1];
+            float ab = meshHit.albedo[2];
+            if (atm->cie_enabled && atm->path_albedo >= 0.f) {
+                ar = ag = ab = atm->path_albedo;
+            }
             if (isLW) {
                 const float B = atm_planck_monochromatic(atm->wavelength_m, meshHit.temperature);
-                const float rho = fmaxf(meshHit.albedo[0], fmaxf(meshHit.albedo[1], meshHit.albedo[2]));
+                const float rho = fmaxf(ar, fmaxf(ag, ab));
                 radiance += throughput * ((1.f - atm_clampf(rho, 0.f, 1.f)) * B);
             }
-            const Material mat(
-                make_float3(meshHit.albedo[0], meshHit.albedo[1], meshHit.albedo[2]),
-                1.f,
-                0.f);
+            const Material mat(make_float3(ar, ag, ab), 1.f, 0.f);
             const Interaction ix(
                 make_float3(p[0], p[1], p[2]),
                 make_float3(meshHit.n[0], meshHit.n[1], meshHit.n[2]),
@@ -860,6 +960,11 @@ static __device__ void traceAtmospherePath(const uint3& idx, Sampler& sampler) {
             atm_add_sun_nee_surface(atm, p, rayDir, ix, throughput, sampler, radiance, bounce == 0 ? direct : indirect);
             atm_add_sky_surface(atm, ix, throughput, radiance, bounce == 0 ? direct : indirect);
 
+            if (atm->path_albedo >= 0.f) {
+                if (!atm_lambert_bounce(ix, sampler, throughput, org, dir)) {
+                    break;
+                }
+            } else {
             pathPayload path(1u, (unsigned int)bounce, (unsigned int)maxB);
             path.pathThroughput = throughput;
             path.currentRayPayload.ray = Ray(ix.position, rayDir);
@@ -872,6 +977,7 @@ static __device__ void traceAtmospherePath(const uint3& idx, Sampler& sampler) {
             atm_f3_to_arr(path.currentRayPayload.ray.origin, org);
             atm_f3_to_arr(path.currentRayPayload.ray.direction, dir);
             atm_normalize3(dir);
+            }
         } else {
             /* Above the mountain: no volume hit this segment — step into the
              * terrain band and keep walking (do not treat as space escape). */
@@ -917,5 +1023,28 @@ static __device__ void traceAtmospherePath(const uint3& idx, Sampler& sampler) {
         }
     }
 
-    writeAtmosphereOutputs(idx, radiance, direct, indirect, firstHitT, escaped, firstEvent);
+    if (cieOn) {
+        const float L = (radiance.x + radiance.y + radiance.z) * (1.f / 3.f);
+        xyz[cie_ch] = L / fmaxf(wlen_pdf, 1e-20f);
+        if (cie_ch == 0) {
+            firstHitTKeep = firstHitT;
+            firstEventKeep = firstEvent;
+            escapedKeep = escaped;
+        }
+    } else {
+        radianceOut = radiance;
+        directOut = direct;
+        indirectOut = indirect;
+        firstHitTKeep = firstHitT;
+        firstEventKeep = firstEvent;
+        escapedKeep = escaped;
+    }
+    } /* cie_ch */
+
+    if (cieOn) {
+        radianceOut = make_float3(xyz[0], xyz[1], xyz[2]);
+        directOut = radianceOut;
+        indirectOut = make_float3(0.f, 0.f, 0.f);
+    }
+    writeAtmosphereOutputs(idx, radianceOut, directOut, indirectOut, firstHitTKeep, escapedKeep, firstEventKeep);
 }

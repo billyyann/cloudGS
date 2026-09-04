@@ -12,6 +12,7 @@ import torch
 
 SPECTRAL_SW = 0
 SPECTRAL_LW = 1
+SPECTRAL_SW_CIE_XYZ = 2
 
 
 def identity_ray_to_world(device: torch.device | str) -> torch.Tensor:
@@ -41,6 +42,96 @@ def build_brick_majorants(
                 sl = ks_a[bz * b : min((bz + 1) * b, nz), by * b : min((by + 1) * b, ny), bx * b : min((bx + 1) * b, nx)]
                 kmax[bz, by, bx] = float(sl.max()) if sl.size else 0.0
     return kmax
+
+
+def _cie_xbar(lam):
+    a = (lam - 442.0) * np.where(lam < 442.0, 0.0624, 0.0374)
+    b = (lam - 599.8) * np.where(lam < 599.8, 0.0264, 0.0323)
+    c = (lam - 501.1) * np.where(lam < 501.1, 0.0490, 0.0382)
+    return 0.362 * np.exp(-0.5 * a * a) + 1.056 * np.exp(-0.5 * b * b) - 0.065 * np.exp(-0.5 * c * c)
+
+
+def _cie_ybar(lam):
+    a = (lam - 568.8) * np.where(lam < 568.8, 0.0213, 0.0247)
+    b = (lam - 530.9) * np.where(lam < 530.9, 0.0613, 0.0322)
+    return 0.821 * np.exp(-0.5 * a * a) + 0.286 * np.exp(-0.5 * b * b)
+
+
+def _cie_zbar(lam):
+    a = (lam - 437.0) * np.where(lam < 437.0, 0.0845, 0.0278)
+    b = (lam - 459.0) * np.where(lam < 459.0, 0.0385, 0.0725)
+    return 1.217 * np.exp(-0.5 * a * a) + 0.681 * np.exp(-0.5 * b * b)
+
+
+def _trap_cmf(lo, hi, fn, n=None):
+    if n is None:
+        n = int(hi - lo) + 1
+    n = max(int(n), 1)
+    d = (hi - lo) / n
+    x = lo + d * np.arange(n + 1, dtype=np.float64)
+    f = fn(x)
+    return float(np.sum((f[:-1] + f[1:]) * d * 0.5))
+
+
+def build_cie_xyz_tables(lambda0_nm: float = 380.0, lambda1_nm: float = 780.0, nbins: int = 400):
+    """Same CDF construction as htrdr_ran_wlen_cie_xyz (380-780 nm, 1 nm bins)."""
+    band_len = (lambda1_nm - lambda0_nm) / float(nbins)
+    fns = (_cie_xbar, _cie_ybar, _cie_zbar)
+    pdf = np.zeros((3, nbins), dtype=np.float64)
+    rcp = np.zeros(3, dtype=np.float32)
+    for ch, fn in enumerate(fns):
+        for i in range(nbins):
+            lo = lambda0_nm + i * band_len
+            hi = min(lo + band_len, lambda1_nm)
+            pdf[ch, i] = _trap_cmf(lo, hi, fn)
+        s = float(pdf[ch].sum())
+        rcp[ch] = np.float32(1.0 / max(s, 1e-30))
+        pdf[ch] /= max(s, 1e-30)
+    cdf = np.cumsum(pdf, axis=1).astype(np.float32)
+    cdf[:, -1] = 1.0
+    return {
+        "nbins": nbins,
+        "lambda0_nm": float(lambda0_nm),
+        "dlambda_nm": float(band_len),
+        "rcp_integral": rcp,
+        "cdf": cdf.reshape(-1),
+    }
+
+
+def htpp_xyz_to_srgb(xyz: np.ndarray, exposure: float = 0.2, white: float | None = None) -> np.ndarray:
+    """htpp pp_image: filmic on XYZ, D65*XYZ → sRGB, sRGB gamma. xyz is (H,W,3).
+    white: htpp image.white; None → 99.5% Y (htpp default)."""
+    x = np.asarray(xyz, dtype=np.float64)
+    y = x[..., 1]
+    ys = np.sort(y.reshape(-1))
+    imax = int(min(len(ys) - 1, max(0, round((len(ys) - 1) * 0.995))))
+    ymax_auto = float(ys[imax]) if ys.size else 1.0
+    ymax = float(white) if white is not None and white > 0 else ymax_auto
+    ymax = max(ymax, 1e-12)
+    a, b, c, d, e, f = 0.15, 0.50, 0.10, 0.20, 0.02, 0.30
+
+    def tone(v):
+        return ((v * (a * v + c * b) + d * e) / (v * (a * v + b) + d * f)) - e / f
+
+    white = tone(ymax * exposure)
+    t = tone(np.maximum(x * exposure, 0.0)) / white
+    d65_x, d65_y = 0.31271, 0.32902
+    d65 = np.array([d65_x / d65_y, 1.0, (1.0 - d65_x - d65_y) / d65_y], dtype=np.float64)
+    xyz_d65 = t * d65
+    mat = np.array(
+        [
+            [3.2404542, -1.5371385, -0.4985314],
+            [-0.9692660, 1.8760108, 0.0415560],
+            [0.0556434, -0.2040259, 1.0572252],
+        ],
+        dtype=np.float64,
+    )
+    rgb = np.clip(xyz_d65 @ mat.T, 0.0, None)
+
+    def gamma(v):
+        return np.where(v <= 0.0031308, v * 12.92, 1.055 * np.power(np.maximum(v, 0.0), 1.0 / 2.4) - 0.055)
+
+    return np.clip(gamma(rgb), 0.0, 1.0)
 
 
 def _to_cuda_f32(value, shape, device) -> torch.Tensor:
@@ -89,6 +180,23 @@ class AtmosphereBuffers:
     particle_material: torch.Tensor = field(default=None)  # type: ignore
     particle_radiance: torch.Tensor = field(default=None)  # type: ignore
     particle_shading_normal: torch.Tensor = field(default=None)  # type: ignore
+    cie_cdf: torch.Tensor = field(default=None)  # type: ignore
+    cie_rcp_integral: torch.Tensor = field(default=None)  # type: ignore
+    cie_lambda0_nm: float = 380.0
+    cie_dlambda_nm: float = 1.0
+    sw_lambda_lo: torch.Tensor = field(default=None)  # type: ignore
+    sw_lambda_hi: torch.Tensor = field(default=None)  # type: ignore
+    sw_gas_ka: torch.Tensor = field(default=None)  # type: ignore
+    sw_gas_ks: torch.Tensor = field(default=None)  # type: ignore
+    brdf_lambda_nm: torch.Tensor = field(default=None)  # type: ignore
+    brdf_R: torch.Tensor = field(default=None)  # type: ignore
+    sw_nquad: torch.Tensor = field(default=None)  # type: ignore
+    sw_quad_cdf: torch.Tensor = field(default=None)  # type: ignore
+    mie_cs_band: torch.Tensor = field(default=None)  # type: ignore
+    mie_ca_band: torch.Tensor = field(default=None)  # type: ignore
+    mie_g_nm: torch.Tensor = field(default=None)  # type: ignore
+    mie_cs_ref: float = 1.0
+    mie_ca_ref: float = 1.0
 
     @classmethod
     def from_numpy(
@@ -162,6 +270,23 @@ class AtmosphereBuffers:
             particle_material=torch.empty((0, 5), dtype=torch.float32, device=device),
             particle_radiance=empty0,
             particle_shading_normal=torch.empty((0, 3), dtype=torch.float32, device=device),
+            cie_cdf=torch.empty(0, dtype=torch.float32, device=device),
+            cie_rcp_integral=torch.zeros(3, dtype=torch.float32, device=device),
+            cie_lambda0_nm=380.0,
+            cie_dlambda_nm=1.0,
+            sw_lambda_lo=torch.empty(0, dtype=torch.float32, device=device),
+            sw_lambda_hi=torch.empty(0, dtype=torch.float32, device=device),
+            sw_gas_ka=torch.empty((0, 0), dtype=torch.float32, device=device),
+            sw_gas_ks=torch.empty((0, 0), dtype=torch.float32, device=device),
+            brdf_lambda_nm=torch.empty(0, dtype=torch.float32, device=device),
+            brdf_R=torch.empty(0, dtype=torch.float32, device=device),
+            sw_nquad=torch.empty(0, dtype=torch.int32, device=device),
+            sw_quad_cdf=torch.empty(0, dtype=torch.float32, device=device),
+            mie_cs_band=torch.empty(0, dtype=torch.float32, device=device),
+            mie_ca_band=torch.empty(0, dtype=torch.float32, device=device),
+            mie_g_nm=torch.empty(0, dtype=torch.float32, device=device),
+            mie_cs_ref=1.0,
+            mie_ca_ref=1.0,
         )
 
 
@@ -205,4 +330,21 @@ def trace_atmosphere(tracer_wrapper, ray_ori: torch.Tensor, ray_dir: torch.Tenso
         float(buffers.mie_g),
         float(buffers.path_tmax),
         int(buffers.max_bounces),
+        buffers.cie_cdf if buffers.cie_cdf is not None else torch.empty(0, dtype=torch.float32, device=device),
+        buffers.cie_rcp_integral if buffers.cie_rcp_integral is not None else torch.zeros(3, dtype=torch.float32, device=device),
+        float(buffers.cie_lambda0_nm),
+        float(buffers.cie_dlambda_nm),
+        buffers.sw_lambda_lo if buffers.sw_lambda_lo is not None else torch.empty(0, dtype=torch.float32, device=device),
+        buffers.sw_lambda_hi if buffers.sw_lambda_hi is not None else torch.empty(0, dtype=torch.float32, device=device),
+        buffers.sw_gas_ka if buffers.sw_gas_ka is not None else torch.empty((0, 0), dtype=torch.float32, device=device),
+        buffers.sw_gas_ks if buffers.sw_gas_ks is not None else torch.empty((0, 0), dtype=torch.float32, device=device),
+        buffers.brdf_lambda_nm if buffers.brdf_lambda_nm is not None else torch.empty(0, dtype=torch.float32, device=device),
+        buffers.brdf_R if buffers.brdf_R is not None else torch.empty(0, dtype=torch.float32, device=device),
+        buffers.sw_nquad if buffers.sw_nquad is not None else torch.empty(0, dtype=torch.int32, device=device),
+        buffers.sw_quad_cdf if buffers.sw_quad_cdf is not None else torch.empty(0, dtype=torch.float32, device=device),
+        buffers.mie_cs_band if buffers.mie_cs_band is not None else torch.empty(0, dtype=torch.float32, device=device),
+        buffers.mie_ca_band if buffers.mie_ca_band is not None else torch.empty(0, dtype=torch.float32, device=device),
+        buffers.mie_g_nm if buffers.mie_g_nm is not None else torch.empty(0, dtype=torch.float32, device=device),
+        float(buffers.mie_cs_ref),
+        float(buffers.mie_ca_ref),
     )

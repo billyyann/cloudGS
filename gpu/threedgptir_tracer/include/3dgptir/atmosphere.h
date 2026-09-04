@@ -9,7 +9,8 @@ extern "C" {
 
 enum AtmSpectralMode {
     ATM_SPECTRAL_SW = 0,
-    ATM_SPECTRAL_LW = 1
+    ATM_SPECTRAL_LW = 1,
+    ATM_SPECTRAL_SW_CIE_XYZ = 2 /* htrdr default image: CIE 1931 380-780 nm */
 };
 
 enum AtmEvent {
@@ -80,6 +81,37 @@ struct AtmParams {
     struct AtmGasLayers gas;
     struct AtmMesh mesh;
     struct AtmSun sun;
+    /* Appended only: do not insert above (layout of origin/ka/ks/mesh). */
+    int cie_enabled; /* 1 = sample CIE X,Y,Z like htrdr draw_pixel_image */
+    int cie_nbins;
+    float cie_lambda0_nm;
+    float cie_dlambda_nm;
+    float cie_rcp_integral[3]; /* 1/∫ CMF dλ, nm^-1; pdf = this (htrdr) */
+    const float* cie_cdf;      /* [3 * cie_nbins] X then Y then Z */
+    int sw_nbands;
+    const float* sw_lambda_lo_nm; /* [sw_nbands] */
+    const float* sw_lambda_hi_nm; /* [sw_nbands] */
+    const float* sw_gas_ka;       /* [sw_nbands * sw_nquad_max * nlayers] */
+    const float* sw_gas_ks;
+    /* sand.mrumtl lambertian knots; path_albedo set per CIE sample */
+    int brdf_n;
+    const float* brdf_lambda_nm;
+    const float* brdf_R;
+    float path_albedo; /* >=0 scalar R(λ); <0 use mesh RGB */
+    /* HTGOP quadrature (htrdr iquad) + htsky Mie band averages. Append only. */
+    int sw_nquad_max;
+    const int* sw_nquad;         /* [sw_nbands] */
+    const float* sw_quad_cdf;    /* [sw_nbands * sw_nquad_max] */
+    const float* mie_cs_band;    /* [sw_nbands] band-average Cs */
+    const float* mie_ca_band;
+    const float* mie_g_nm;       /* g(λ) LUT, htrdr per-wavelength HG */
+    int mie_g_n;
+    float mie_g_lambda0_nm;
+    float mie_g_dlambda_nm;
+    float mie_cs_ref; /* Cs at voxel dump wavelength (550 nm) */
+    float mie_ca_ref;
+    float path_ks_scale; /* Cs_band / Cs_ref; 1 if unset */
+    float path_ka_scale;
 };
 
 #ifdef __cplusplus

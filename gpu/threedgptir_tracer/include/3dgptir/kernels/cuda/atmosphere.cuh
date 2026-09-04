@@ -265,6 +265,14 @@ ATM_FN void atm_hit_clear(struct AtmHit* h) {
     h->ka = h->ks = h->kext = h->temperature = 0.f;
 }
 
+ATM_FN float atm_path_ks_scale(const struct AtmParams* atm) {
+    return (atm && atm->path_ks_scale > 0.f) ? atm->path_ks_scale : 1.f;
+}
+
+ATM_FN float atm_path_ka_scale(const struct AtmParams* atm) {
+    return (atm && atm->path_ka_scale > 0.f) ? atm->path_ka_scale : 1.f;
+}
+
 /* Voxel Woodcock in [0, tmax]. htrdr scattering_hit_filter: Ts ~ Exp(1),
  * brick ks_max, accept ks/ks_max (walk_ks=1). LW may walk kext (walk_ks=0). */
 template <typename Rng>
@@ -276,7 +284,9 @@ ATM_FN void atm_woodcock_voxels_into(
     Rng& rng,
     float mie_omega,
     int walk_ks,
-    struct AtmHit* hit) {
+    struct AtmHit* hit,
+    float ks_scale = 1.f,
+    float ka_scale = 1.f) {
     atm_hit_clear(hit);
     if (!g || !hit || g->nx <= 0 || tmax <= 1e-8f) {
         return;
@@ -338,7 +348,8 @@ ATM_FN void atm_woodcock_voxels_into(
         if (bz < 0 || bz >= g->nbz) {
             break;
         }
-        const float kmax = atm_brick_kmax(g, bx, by, bz);
+        const float kmax0 = atm_brick_kmax(g, bx, by, bz);
+        const float kmax = kmax0 * (walk_ks ? ks_scale : fmaxf(ka_scale, ks_scale));
 
         const float bx0 = gx0 + (float)bx * bdx;
         const float by0 = gy0 + (float)by * bdy;
@@ -379,8 +390,8 @@ ATM_FN void atm_woodcock_voxels_into(
         float pos[3] = {org[0] + dir[0] * t, org[1] + dir[1] * t, org[2] + dir[2] * t};
         int cij[3];
         atm_world_to_ijk(g, pos, cij);
-        const float ka = atm_fetch_ka(g, cij[0], cij[1], cij[2]);
-        const float ks = atm_fetch_ks(g, cij[0], cij[1], cij[2]);
+        const float ka = atm_fetch_ka(g, cij[0], cij[1], cij[2]) * ka_scale;
+        const float ks = atm_fetch_ks(g, cij[0], cij[1], cij[2]) * ks_scale;
         const float kext = ka + ks;
         const float r = rng.next_1d();
         /* htrdr SW: accept ks/ks_max (scatter only). LW: accept kext then ω. */
@@ -418,7 +429,7 @@ ATM_FN struct AtmHit atm_woodcock_voxels(
     float mie_omega = -1.f,
     int walk_ks = 1) {
     struct AtmHit hit;
-    atm_woodcock_voxels_into(g, org, dir, tmax, rng, mie_omega, walk_ks, &hit);
+    atm_woodcock_voxels_into(g, org, dir, tmax, rng, mie_omega, walk_ks, &hit, 1.f, 1.f);
     return hit;
 }
 
@@ -1072,7 +1083,17 @@ ATM_FN void atm_next_volume_event_into(
     struct AtmHit gas;
     struct AtmHit vox;
     atm_gas_free_path_into(&atm->gas, org, dir, tmax, rng, walk_ks, &gas);
-    atm_woodcock_voxels_into(&atm->voxels, org, dir, tmax, rng, omega_arg, walk_ks, &vox);
+    atm_woodcock_voxels_into(
+        &atm->voxels,
+        org,
+        dir,
+        tmax,
+        rng,
+        omega_arg,
+        walk_ks,
+        &vox,
+        atm_path_ks_scale(atm),
+        atm_path_ka_scale(atm));
     if (gas.event != ATM_EVENT_NONE && gas.t <= vox.t && gas.t < tmax) {
         *out = gas;
         return;
@@ -1130,7 +1151,9 @@ ATM_FN float atm_voxel_optical_depth(
     const float org[3],
     const float dir[3],
     float tmax,
-    int kind = ATM_K_EXT) {
+    int kind = ATM_K_EXT,
+    float ks_scale = 1.f,
+    float ka_scale = 1.f) {
     if (!g || g->nx <= 0 || tmax <= 1e-8f) {
         return 0.f;
     }
@@ -1210,7 +1233,15 @@ ATM_FN float atm_voxel_optical_depth(
         const int fx = atm_imod(ijk[0], n[0]);
         const int fy = atm_imod(ijk[1], n[1]);
         const float tNext = fminf(t1, fminf(tMax[0], fminf(tMax[1], tMax[2])));
-        tau += atm_cell_k(g, fx, fy, ijk[2], kind) * fmaxf(tNext - t, 0.f);
+        const float ka = atm_fetch_ka(g, fx, fy, ijk[2]) * ka_scale;
+        const float ks = atm_fetch_ks(g, fx, fy, ijk[2]) * ks_scale;
+        float kv = ka + ks;
+        if (kind == ATM_K_KA) {
+            kv = ka;
+        } else if (kind == ATM_K_KS) {
+            kv = ks;
+        }
+        tau += kv * fmaxf(tNext - t, 0.f);
         if (tNext >= t1 - 1e-6f) {
             break;
         }
@@ -1300,7 +1331,14 @@ ATM_FN float atm_optical_depth(
     const float dir[3],
     float tmax,
     int kind) {
-    return atm_voxel_optical_depth(&atm->voxels, org, dir, tmax, kind) +
+    return atm_voxel_optical_depth(
+               &atm->voxels,
+               org,
+               dir,
+               tmax,
+               kind,
+               atm_path_ks_scale(atm),
+               atm_path_ka_scale(atm)) +
            atm_gas_optical_depth(&atm->gas, org, dir, tmax, kind);
 }
 
@@ -1347,4 +1385,201 @@ ATM_FN int atm_volume_occluded(
     struct AtmHit h;
     atm_next_volume_event_into(atm, org, dir, tmax, rng, &h);
     return h.event != ATM_EVENT_NONE && h.t < tmax;
+}
+
+/* CIE 1931 analytic CMFs: Wyman, Sloan, Shirley JCGT 2013. Same as htrdr. */
+ATM_FN float atm_cie_xbar(float lambda) {
+    const float a = (lambda - 442.0f) * (lambda < 442.0f ? 0.0624f : 0.0374f);
+    const float b = (lambda - 599.8f) * (lambda < 599.8f ? 0.0264f : 0.0323f);
+    const float c = (lambda - 501.1f) * (lambda < 501.1f ? 0.0490f : 0.0382f);
+    return 0.362f * expf(-0.5f * a * a) + 1.056f * expf(-0.5f * b * b) - 0.065f * expf(-0.5f * c * c);
+}
+
+ATM_FN float atm_cie_ybar(float lambda) {
+    const float a = (lambda - 568.8f) * (lambda < 568.8f ? 0.0213f : 0.0247f);
+    const float b = (lambda - 530.9f) * (lambda < 530.9f ? 0.0613f : 0.0322f);
+    return 0.821f * expf(-0.5f * a * a) + 0.286f * expf(-0.5f * b * b);
+}
+
+ATM_FN float atm_cie_zbar(float lambda) {
+    const float a = (lambda - 437.0f) * (lambda < 437.0f ? 0.0845f : 0.0278f);
+    const float b = (lambda - 459.0f) * (lambda < 459.0f ? 0.0385f : 0.0725f);
+    return 1.217f * expf(-0.5f * a * a) + 0.681f * expf(-0.5f * b * b);
+}
+
+ATM_FN float atm_cie_cmf(int ch, float lambda) {
+    if (ch == 0) {
+        return atm_cie_xbar(lambda);
+    }
+    if (ch == 1) {
+        return atm_cie_ybar(lambda);
+    }
+    return atm_cie_zbar(lambda);
+}
+
+ATM_FN int atm_sw_find_band(const struct AtmParams* atm, float wlen_nm) {
+    if (!atm || atm->sw_nbands <= 0 || !atm->sw_lambda_lo_nm || !atm->sw_lambda_hi_nm) {
+        return -1;
+    }
+    for (int i = 0; i < atm->sw_nbands; ++i) {
+        if (wlen_nm >= atm->sw_lambda_lo_nm[i] && wlen_nm < atm->sw_lambda_hi_nm[i]) {
+            return i;
+        }
+    }
+    const int last = atm->sw_nbands - 1;
+    if (wlen_nm >= atm->sw_lambda_lo_nm[last] && wlen_nm <= atm->sw_lambda_hi_nm[last]) {
+        return last;
+    }
+    return -1;
+}
+
+/* Sample λ ~ CMF (htrdr_ran_wlen_cie_xyz). pdf is constant 1/∫CMF (nm^-1). */
+ATM_FN float atm_cie_sample_wlen_nm(const struct AtmParams* atm, int ch, float r0, float r1) {
+    const int n = atm->cie_nbins;
+    const float* cdf = atm->cie_cdf + ch * n;
+    if (r0 < 0.f) {
+        r0 = 0.f;
+    }
+    if (r0 >= 1.f) {
+        r0 = 0.999999f;
+    }
+    int lo = 0;
+    int hi = n - 1;
+    while (lo < hi) {
+        const int mid = (lo + hi) >> 1;
+        if (cdf[mid] <= r0) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    const int iband = lo;
+    const float lambda_min = atm->cie_lambda0_nm + atm->cie_dlambda_nm * (float)iband;
+    const float lambda_max = lambda_min + atm->cie_dlambda_nm;
+    const float f_min = atm_cie_cmf(ch, lambda_min);
+    const float f_max = atm_cie_cmf(ch, lambda_max);
+    const float band_len = atm->cie_dlambda_nm;
+    const float a = 0.5f * (f_max - f_min) / band_len;
+    const float b = (lambda_max * f_min - lambda_min * f_max) / band_len;
+    const float c = -lambda_min * f_min + lambda_min * lambda_min * a;
+    const float d = 0.5f * (f_max + f_min) * band_len;
+    if (r1 < 0.f) {
+        r1 = 0.f;
+    }
+    if (r1 >= 1.f) {
+        r1 = 0.999999f;
+    }
+    if (fabsf(a) < 1e-12f) {
+        return lambda_min + r1 * band_len;
+    }
+    const float disc = b * b - 4.f * a * (c - d * r1);
+    if (disc < 0.f) {
+        return 0.5f * (lambda_min + lambda_max);
+    }
+    const float s = sqrtf(disc);
+    const float l1 = (-b - s) / (2.f * a);
+    const float l2 = (-b + s) / (2.f * a);
+    if (l1 >= lambda_min && l1 < lambda_max) {
+        return l1;
+    }
+    if (l2 >= lambda_min && l2 < lambda_max) {
+        return l2;
+    }
+    return 0.5f * (lambda_min + lambda_max);
+}
+
+ATM_FN int atm_sample_quad(const float* cdf, int n, float r) {
+    if (!cdf || n <= 1) {
+        return 0;
+    }
+    if (r < 0.f) {
+        r = 0.f;
+    }
+    if (r >= 1.f) {
+        r = 0.999999f;
+    }
+    int lo = 0;
+    int hi = n - 1;
+    while (lo < hi) {
+        const int mid = (lo + hi) >> 1;
+        if (cdf[mid] <= r) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
+/* Bind per-path gas quad + Planck sun + Mie band scale. pdf_m = rcp_integral * 1e9 (m^-1). */
+ATM_FN void atm_cie_bind_path(struct AtmParams* atm, int ch, float r0, float r1, float r_quad, float* pdf_m) {
+    const float wlen_nm = atm_cie_sample_wlen_nm(atm, ch, r0, r1);
+    *pdf_m = atm->cie_rcp_integral[ch] * 1.0e9f;
+    atm->wavelength_m = wlen_nm * 1.0e-9f;
+    atm->sun.radiance = atm_planck_monochromatic(atm->wavelength_m, 5778.f);
+    atm->path_ks_scale = 1.f;
+    atm->path_ka_scale = 1.f;
+    if (atm->mie_g_nm && atm->mie_g_n > 1 && atm->mie_g_dlambda_nm > 0.f) {
+        float x = (wlen_nm - atm->mie_g_lambda0_nm) / atm->mie_g_dlambda_nm;
+        if (x < 0.f) {
+            x = 0.f;
+        }
+        const float xmax = (float)(atm->mie_g_n - 1);
+        if (x > xmax) {
+            x = xmax;
+        }
+        const int i0 = (int)x;
+        const int i1 = i0 + 1 < atm->mie_g_n ? i0 + 1 : i0;
+        const float t = x - (float)i0;
+        atm->mie_g = atm->mie_g_nm[i0] * (1.f - t) + atm->mie_g_nm[i1] * t;
+    }
+    const int ib = atm_sw_find_band(atm, wlen_nm);
+    if (ib < 0 || !atm->sw_gas_ka || !atm->sw_gas_ks || atm->gas.nlayers <= 0) {
+        return;
+    }
+    int nq = 1;
+    if (atm->sw_nquad && ib < atm->sw_nbands) {
+        nq = atm->sw_nquad[ib];
+    }
+    if (nq < 1) {
+        nq = 1;
+    }
+    const int nqmax = atm->sw_nquad_max > 0 ? atm->sw_nquad_max : nq;
+    int iq = 0;
+    if (atm->sw_quad_cdf && nq > 1) {
+        iq = atm_sample_quad(atm->sw_quad_cdf + ib * nqmax, nq, r_quad);
+    }
+    const int nlayers = atm->gas.nlayers;
+    atm->gas.ka = atm->sw_gas_ka + ((ib * nqmax + iq) * nlayers);
+    atm->gas.ks = atm->sw_gas_ks + ((ib * nqmax + iq) * nlayers);
+    if (atm->mie_cs_band && atm->mie_cs_ref > 0.f) {
+        atm->path_ks_scale = atm->mie_cs_band[ib] / atm->mie_cs_ref;
+    }
+    if (atm->mie_ca_band && atm->mie_ca_ref > 0.f) {
+        atm->path_ka_scale = atm->mie_ca_band[ib] / atm->mie_ca_ref;
+    }
+}
+
+/* mrumtl_fetch_brdf: pick surrounding knot by alpha (same expectation as lerp). */
+ATM_FN float atm_mrumtl_fetch_R(const struct AtmParams* atm, float wlen_nm, float u) {
+    if (!atm || atm->brdf_n <= 0 || !atm->brdf_lambda_nm || !atm->brdf_R) {
+        return -1.f;
+    }
+    const int n = atm->brdf_n;
+    if (wlen_nm <= atm->brdf_lambda_nm[0]) {
+        return atm->brdf_R[0];
+    }
+    if (wlen_nm >= atm->brdf_lambda_nm[n - 1]) {
+        return atm->brdf_R[n - 1];
+    }
+    int i = 0;
+    while (i + 1 < n && atm->brdf_lambda_nm[i + 1] < wlen_nm) {
+        ++i;
+    }
+    const float l0 = atm->brdf_lambda_nm[i];
+    const float l1 = atm->brdf_lambda_nm[i + 1];
+    const float den = l1 - l0;
+    const float alpha = den > 1e-12f ? (l1 - wlen_nm) / den : 1.f;
+    /* htrdr: sample < alpha → lambda0, else lambda1 */
+    return u < alpha ? atm->brdf_R[i] : atm->brdf_R[i + 1];
 }

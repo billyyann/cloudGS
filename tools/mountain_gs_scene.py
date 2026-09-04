@@ -373,6 +373,206 @@ def load_ecrad_gas_1d(
     return {"z": z, "ka": ka, "ks": ks, "temp": temp}
 
 
+def load_ecrad_sw_visible(
+    ecrad_path: str = DEFAULT_ECRAD,
+    lambda0_nm: float = 380.0,
+    lambda1_nm: float = 780.0,
+    mie_path: str = DEFAULT_MIE,
+) -> dict:
+    """HTGOP SW bands overlapping CIE 380-780 nm, plus htsky Mie band averages.
+
+    Gas k is per quadrature point (htrdr `htsky_spectral_band_sample_quadrature`),
+    not the pdf-weighted mean. Averaging ka in 625–778 nm made Tr_mean/Tr_true≈0.75
+    and killed the red CIE-X wing (cyan + dark).
+    """
+    lib = _so("libhtgop.so")
+    lib.htgop_create.argtypes = [c_void_p, c_void_p, c_int, POINTER(c_void_p)]
+    lib.htgop_create.restype = c_int
+    lib.htgop_load.argtypes = [c_void_p, c_char_p]
+    lib.htgop_load.restype = c_int
+    lib.htgop_ref_put.argtypes = [c_void_p]
+    lib.htgop_ref_put.restype = c_int
+    lib.htgop_get_layers_count.argtypes = [c_void_p, POINTER(c_size_t)]
+    lib.htgop_get_layers_count.restype = c_int
+    lib.htgop_get_levels_count.argtypes = [c_void_p, POINTER(c_size_t)]
+    lib.htgop_get_levels_count.restype = c_int
+    lib.htgop_get_level.argtypes = [c_void_p, c_size_t, POINTER(HtgopLevel)]
+    lib.htgop_get_level.restype = c_int
+    lib.htgop_get_layer.argtypes = [c_void_p, c_size_t, POINTER(HtgopLayer)]
+    lib.htgop_get_layer.restype = c_int
+    lib.htgop_get_sw_spectral_intervals_count.argtypes = [c_void_p, POINTER(c_size_t)]
+    lib.htgop_get_sw_spectral_intervals_count.restype = c_int
+    lib.htgop_get_sw_spectral_interval.argtypes = [c_void_p, c_size_t, POINTER(HtgopSpectralInterval)]
+    lib.htgop_get_sw_spectral_interval.restype = c_int
+    lib.htgop_layer_get_sw_spectral_interval.argtypes = [POINTER(HtgopLayer), c_size_t, POINTER(HtgopSwSpec)]
+    lib.htgop_layer_get_sw_spectral_interval.restype = c_int
+
+    mie = _so("libhtmie.so")
+    mie.htmie_create.argtypes = [c_void_p, c_void_p, c_int, POINTER(c_void_p)]
+    mie.htmie_create.restype = c_int
+    mie.htmie_load.argtypes = [c_void_p, c_char_p]
+    mie.htmie_load.restype = c_int
+    mie.htmie_ref_put.argtypes = [c_void_p]
+    mie.htmie_ref_put.restype = c_int
+    mie.htmie_fetch_xsection_scattering.argtypes = [c_void_p, c_double, c_int]
+    mie.htmie_fetch_xsection_scattering.restype = c_double
+    mie.htmie_fetch_xsection_absorption.argtypes = [c_void_p, c_double, c_int]
+    mie.htmie_fetch_xsection_absorption.restype = c_double
+    mie.htmie_fetch_asymmetry_parameter.argtypes = [c_void_p, c_double, c_int]
+    mie.htmie_fetch_asymmetry_parameter.restype = c_double
+    mie.htmie_compute_xsection_scattering_average.argtypes = [c_void_p, POINTER(c_double), c_int]
+    mie.htmie_compute_xsection_scattering_average.restype = c_double
+    mie.htmie_compute_xsection_absorption_average.argtypes = [c_void_p, POINTER(c_double), c_int]
+    mie.htmie_compute_xsection_absorption_average.restype = c_double
+
+    gop = c_void_p()
+    if lib.htgop_create(None, None, 0, byref(gop)) != RES_OK:
+        raise RuntimeError("htgop_create failed")
+    if lib.htgop_load(gop, ecrad_path.encode()) != RES_OK:
+        lib.htgop_ref_put(gop)
+        raise RuntimeError(f"htgop_load failed: {ecrad_path}")
+
+    hmie = c_void_p()
+    if mie.htmie_create(None, None, 0, byref(hmie)) != RES_OK:
+        lib.htgop_ref_put(gop)
+        raise RuntimeError("htmie_create failed")
+    if mie.htmie_load(hmie, mie_path.encode()) != RES_OK:
+        mie.htmie_ref_put(hmie)
+        lib.htgop_ref_put(gop)
+        raise RuntimeError(f"htmie_load failed: {mie_path}")
+
+    nlayers = c_size_t()
+    nlevels = c_size_t()
+    nint = c_size_t()
+    lib.htgop_get_layers_count(gop, byref(nlayers))
+    lib.htgop_get_levels_count(gop, byref(nlevels))
+    lib.htgop_get_sw_spectral_intervals_count(gop, byref(nint))
+    nl, nv, ni = int(nlayers.value), int(nlevels.value), int(nint.value)
+
+    z = np.zeros(nv, np.float32)
+    tlev = np.zeros(nv, np.float32)
+    for i in range(nv):
+        lev = HtgopLevel()
+        lib.htgop_get_level(gop, i, byref(lev))
+        z[i] = float(lev.height)
+        tlev[i] = float(lev.temperature)
+
+    raw = []
+    for ib in range(ni):
+        spec = HtgopSpectralInterval()
+        lib.htgop_get_sw_spectral_interval(gop, ib, byref(spec))
+        wn0, wn1 = float(spec.wave_numbers[0]), float(spec.wave_numbers[1])
+        if wn0 <= 0.0 or wn1 <= 0.0:
+            continue
+        lam_hi = 1.0e7 / min(wn0, wn1)
+        lam_lo = 1.0e7 / max(wn0, wn1)
+        if lam_hi < lambda0_nm or lam_lo > lambda1_nm:
+            continue
+        nq = int(spec.quadrature_length)
+        pdf = np.array([spec.quadrature_pdf[q] for q in range(nq)], dtype=np.float64)
+        pdf = pdf / max(pdf.sum(), 1e-30)
+        cdf = np.cumsum(pdf).astype(np.float32)
+        cdf[-1] = 1.0
+        ka_q = np.zeros((nq, nl), np.float32)
+        ks_q = np.zeros((nq, nl), np.float32)
+        for i in range(nl):
+            layer = HtgopLayer()
+            lib.htgop_get_layer(gop, i, byref(layer))
+            sw = HtgopSwSpec()
+            lib.htgop_layer_get_sw_spectral_interval(byref(layer), ib, byref(sw))
+            nq_l = int(sw.quadrature_length)
+            for q in range(min(nq, nq_l)):
+                ka_q[q, i] = float(sw.ka_nominal[q])
+                ks_q[q, i] = float(sw.ks_nominal[q])
+        band = (c_double * 2)(lam_lo, lam_hi)
+        cs_avg = float(mie.htmie_compute_xsection_scattering_average(hmie, band, 0))
+        ca_avg = float(mie.htmie_compute_xsection_absorption_average(hmie, band, 0))
+        raw.append((lam_lo, lam_hi, ka_q, ks_q, cdf, cs_avg, ca_avg, ib))
+
+    cs_ref = float(mie.htmie_fetch_xsection_scattering(hmie, c_double(550.0), 0))
+    ca_ref = float(mie.htmie_fetch_xsection_absorption(hmie, c_double(550.0), 0))
+    g0, g1, gn = 380.0, 780.0, 401
+    g_lut = np.zeros(gn, np.float32)
+    for i in range(gn):
+        lam = g0 + (g1 - g0) * i / float(gn - 1)
+        g_lut[i] = float(mie.htmie_fetch_asymmetry_parameter(hmie, c_double(lam), 0))
+    mie.htmie_ref_put(hmie)
+    lib.htgop_ref_put(gop)
+    if not raw:
+        raise RuntimeError("no HTGOP SW bands in 380-780 nm")
+
+    nquad = np.array([b[2].shape[0] for b in raw], np.int32)
+    nqmax = int(nquad.max())
+    nb = len(raw)
+    lo = np.array([b[0] for b in raw], np.float32)
+    hi = np.array([b[1] for b in raw], np.float32)
+    ka_quad = np.zeros((nb, nqmax, nl), np.float32)
+    ks_quad = np.zeros((nb, nqmax, nl), np.float32)
+    cdf = np.ones((nb, nqmax), np.float32)
+    ka_mean = np.zeros((nb, nl), np.float32)
+    ks_mean = np.zeros((nb, nl), np.float32)
+    mie_cs = np.zeros(nb, np.float32)
+    mie_ca = np.zeros(nb, np.float32)
+    for i, (lam_lo, lam_hi, ka_q, ks_q, cdf_i, cs_avg, ca_avg, _ib) in enumerate(raw):
+        nq = ka_q.shape[0]
+        ka_quad[i, :nq] = ka_q
+        ks_quad[i, :nq] = ks_q
+        cdf[i, :nq] = cdf_i
+        cdf[i, nq:] = 1.0
+        w = np.diff(np.concatenate([[0.0], cdf_i.astype(np.float64)]))
+        ka_mean[i] = np.tensordot(w, ka_q.astype(np.float64), axes=(0, 0)).astype(np.float32)
+        ks_mean[i] = np.tensordot(w, ks_q.astype(np.float64), axes=(0, 0)).astype(np.float32)
+        mie_cs[i] = cs_avg
+        mie_ca[i] = ca_avg
+        print(
+            f"  HTGOP band {lam_lo:.0f}-{lam_hi:.0f} nm  nq={nq}  "
+            f"ks0_mean={ks_mean[i, 0]:.4g}  Cs/Cs550={cs_avg / max(cs_ref, 1e-30):.4f}"
+        )
+    print(
+        f"ecrad SW visible {nb} bands  λ=[{lo.min():.0f},{hi.max():.0f}] nm  "
+        f"layers={nl}  nquad_max={nqmax}  (per-quad k, not band mean)"
+    )
+    return {
+        "z": z,
+        "lambda_lo_nm": lo,
+        "lambda_hi_nm": hi,
+        "ka": ka_mean,
+        "ks": ks_mean,
+        "ka_quad": ka_quad,
+        "ks_quad": ks_quad,
+        "nquad": nquad,
+        "quad_cdf": cdf,
+        "mie_cs_band": mie_cs,
+        "mie_ca_band": mie_ca,
+        "mie_cs_ref": np.float32(cs_ref),
+        "mie_ca_ref": np.float32(ca_ref),
+        "mie_g_nm": g_lut,
+        "mie_g_lambda0_nm": np.float32(g0),
+        "mie_g_dlambda_nm": np.float32((g1 - g0) / float(gn - 1)),
+    }
+
+
+def load_sand_mrumtl(path: str | None = None) -> dict:
+    """Parse htrdr sand.mrumtl lambertian knots (wavelength nm, R)."""
+    if path is None:
+        path = os.path.join(SPK, "materials", "legacy", "sand.mrumtl")
+    lams = []
+    rs = []
+    with open(path, "r") as f:
+        for line in f:
+            parts = line.split()
+            if len(parts) >= 3 and parts[1] == "lambertian":
+                lams.append(float(parts[0]))
+                rs.append(float(parts[2]))
+    if not lams:
+        raise RuntimeError(f"no lambertian knots in {path}")
+    print(f"sand.mrumtl {len(lams)} knots  λ=[{lams[0]:.0f},{lams[-1]:.0f}] nm  R(300)={rs[0]:.3f} R(600)={rs[1] if len(rs)>1 else rs[0]:.3f}")
+    return {
+        "lambda_nm": np.asarray(lams, np.float32),
+        "R": np.asarray(rs, np.float32),
+    }
+
+
 def save_gas_npz(path: str, gas: dict) -> None:
     np.savez(path, z=gas["z"], ka=gas["ka"], ks=gas["ks"], temp=gas["temp"])
     print(f"wrote {path}")

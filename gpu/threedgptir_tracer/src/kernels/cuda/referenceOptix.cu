@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#define ATM_KERNEL_REV 34
+#define ATM_KERNEL_REV 38
 #include <3dgptir/pipelineParameters.h>
 #include <3dgptir/kernels/cuda/sampler.cuh>
 // clang-format on
@@ -25,7 +25,7 @@ __constant__ PipelineParameters params;
 #include <3dgptir/kernels/cuda/environment.cuh>
 #include <3dgptir/kernels/cuda/pathTracer.cuh>
 #include <3dgptir/kernels/cuda/atmospherePathTracer.cuh>
-/* NVRTC: ATM_KERNEL_REV 34 gas scatter keeps Rayleigh NEE (no ks_tot break). */
+/* NVRTC: ATM_KERNEL_REV 38 CIE iquad + Mie band k + lambert. */
 
 // Ablation early-return stages (only with ENABLE_RAYGEN_SETUP_PROFILING).
 // Official release: do not define ENABLE_RAYGEN_SETUP_PROFILING.
@@ -309,7 +309,7 @@ extern "C" __global__ void __intersection__vol() {
     AtmHit vox;
     AtmHit gas;
     atm_woodcock_voxels_into(
-        &params.atmosphere.voxels, org, dir, tmax, rng, omega_arg, walk_ks, &vox);
+        &params.atmosphere.voxels, org, dir, tmax, rng, omega_arg, walk_ks, &vox, 1.f, 1.f);
     atm_gas_free_path_into(
         &params.atmosphere.gas, org, dir, tmax, rng, walk_ks, &gas);
     AtmHit hit;

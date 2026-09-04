@@ -390,7 +390,13 @@ def main():
         spacing = np.array([50.0, 50.0, 35.0], np.float32)
         ka, ks, temp = fbm_cumulus(nx, ny, nz, origin, spacing)
 
-    from threedgptir_tracer.atmosphere import AtmosphereBuffers, SPECTRAL_SW
+    from threedgptir_tracer.atmosphere import (
+        AtmosphereBuffers,
+        SPECTRAL_SW,
+        SPECTRAL_SW_CIE_XYZ,
+        build_cie_xyz_tables,
+        htpp_xyz_to_srgb,
+    )
 
     az = math.radians(225.0)
     el = math.radians(30.0)
@@ -417,13 +423,48 @@ def main():
         gas_temp=gas["temp"],
         sun_dir=sun,
         sun_radiance=24.0,
-        sun_cos_half=1.0,
-        spectral_mode=SPECTRAL_SW,
+        sun_cos_half=math.cos(4.6524e-3),
+        spectral_mode=SPECTRAL_SW_CIE_XYZ,
         wavelength_m=5.5e-7,
         mie_omega=1.0,
         mie_g=args.mie_g,
         path_tmax=1.2e5,
         max_bounces=args.max_bounces,
+    )
+    cie = build_cie_xyz_tables()
+    buffers.cie_cdf = torch.as_tensor(cie["cdf"], dtype=torch.float32, device=device)
+    buffers.cie_rcp_integral = torch.as_tensor(cie["rcp_integral"], dtype=torch.float32, device=device)
+    buffers.cie_lambda0_nm = float(cie["lambda0_nm"])
+    buffers.cie_dlambda_nm = float(cie["dlambda_nm"])
+    sw = mgs.load_ecrad_sw_visible()
+    if args.no_clouds:
+        sw_ka = np.zeros_like(sw["ka_quad"])
+        sw_ks = np.zeros_like(sw["ks_quad"])
+    else:
+        sw_ka, sw_ks = sw["ka_quad"], sw["ks_quad"]
+    buffers.sw_lambda_lo = torch.as_tensor(sw["lambda_lo_nm"], dtype=torch.float32, device=device)
+    buffers.sw_lambda_hi = torch.as_tensor(sw["lambda_hi_nm"], dtype=torch.float32, device=device)
+    buffers.sw_gas_ka = torch.as_tensor(sw_ka, dtype=torch.float32, device=device).contiguous()
+    buffers.sw_gas_ks = torch.as_tensor(sw_ks, dtype=torch.float32, device=device).contiguous()
+    buffers.sw_nquad = torch.as_tensor(sw["nquad"], dtype=torch.int32, device=device).contiguous()
+    buffers.sw_quad_cdf = torch.as_tensor(sw["quad_cdf"], dtype=torch.float32, device=device).contiguous()
+    buffers.mie_cs_band = torch.as_tensor(sw["mie_cs_band"], dtype=torch.float32, device=device)
+    buffers.mie_ca_band = torch.as_tensor(sw["mie_ca_band"], dtype=torch.float32, device=device)
+    buffers.mie_g_nm = torch.as_tensor(sw["mie_g_nm"], dtype=torch.float32, device=device)
+    buffers.mie_cs_ref = float(sw["mie_cs_ref"])
+    buffers.mie_ca_ref = float(sw["mie_ca_ref"])
+    sand = mgs.load_sand_mrumtl()
+    buffers.brdf_lambda_nm = torch.as_tensor(sand["lambda_nm"], dtype=torch.float32, device=device)
+    buffers.brdf_R = torch.as_tensor(sand["R"], dtype=torch.float32, device=device)
+    print(
+        "CIE XYZ",
+        cie["nbins"],
+        "bins  HTGOP SW bands",
+        int(sw_ka.shape[0]),
+        "nquad_max",
+        int(sw_ka.shape[1]),
+        "nlayers",
+        int(sw_ka.shape[2]),
     )
     if use_mesh_ground:
         buffers.particle_density = torch.zeros((0, 12), dtype=torch.float32, device=device)
@@ -588,7 +629,55 @@ def main():
         del ori, drc, out, rgb
         torch.cuda.empty_cache()
     img = acc / float(nchunk)
-    rgb8 = tonemap(img)
+    if buffers.spectral_mode == SPECTRAL_SW_CIE_XYZ and buffers.cie_cdf is not None and buffers.cie_cdf.numel() > 0:
+        X, Y, Z = img[..., 0], img[..., 1], img[..., 2]
+        y995 = float(np.percentile(Y, 99.5))
+        print(
+            "  XYZ mean",
+            float(X.mean()),
+            float(Y.mean()),
+            float(Z.mean()),
+            "Y/X",
+            float(Y.mean() / max(X.mean(), 1e-12)),
+            "Z/X",
+            float(Z.mean() / max(X.mean(), 1e-12)),
+            "Y p50/p995",
+            float(np.median(Y)),
+            y995,
+        )
+        htrdr_txt = (
+            os.path.join(args.outdir, "htrdr_ref_mountain_1280x720x256.txt")
+            if args.camera == "mountain"
+            else os.path.join(args.outdir, "htrdr_ref_ortho_512x512x256.txt")
+        )
+        white = None
+        if os.path.isfile(htrdr_txt):
+            href = np.loadtxt(htrdr_txt, skiprows=1, dtype=np.float64)
+            href = href.reshape(-1, 8)
+            href_y995 = float(np.percentile(href[:, 2], 99.5))
+            href_yx = float(href[:, 2].mean() / max(href[:, 0].mean(), 1e-12))
+            href_zx = float(href[:, 4].mean() / max(href[:, 0].mean(), 1e-12))
+            print(
+                "  htrdr XYZ mean",
+                float(href[:, 0].mean()),
+                float(href[:, 2].mean()),
+                float(href[:, 4].mean()),
+                "Y/X",
+                href_yx,
+                "Z/X",
+                href_zx,
+                "Y p50/p995",
+                float(np.median(href[:, 2])),
+                href_y995,
+            )
+            # Same htpp operator as the frozen left png (its Y 99.5%). GPU's own
+            # p995 is fireflies at low spp; using it is a different tone map.
+            white = href_y995
+            print("  htpp white = left png Y p995", white, "  GPU auto p995", y995)
+        rgb8 = (htpp_xyz_to_srgb(img, exposure=0.2, white=white) * 255.0 + 0.5).astype(np.uint8)
+        print("display: htpp filmic XYZ→sRGB exposure=0.2 white=left png")
+    else:
+        rgb8 = tonemap(img)
     from PIL import Image
     import datetime
 
@@ -600,6 +689,9 @@ def main():
         tag += "_mesh"
     if args.no_clouds:
         tag += "_nocloud"
+    if buffers.spectral_mode == SPECTRAL_SW_CIE_XYZ:
+        np.save(os.path.join(args.outdir, f"gpu_xyz{tag}.npy"), img.astype(np.float32))
+        print("wrote", os.path.join(args.outdir, f"gpu_xyz{tag}.npy"))
     gpu_path = os.path.join(args.outdir, f"render_ortho_gpu{tag}_{stamp}.png")
     Image.fromarray(rgb8).save(gpu_path)
     print("wrote", gpu_path)
@@ -613,12 +705,12 @@ def main():
         orig = os.path.join(args.outdir, "htrdr_ref_mountain_1280x720x256.png")
         if not os.path.isfile(orig):
             orig = os.path.join(spk, "test_320x240x16.ppm")
-        left_label = "htrdr mountain.sh 1280x720 spp256  (mountain.obj)"
+        left_label = "htrdr mountain.sh 1280x720 spp256  (frozen png)"
     else:
         orig = os.path.join(args.outdir, "htrdr_ref_ortho_512x512x256.png")
         if not os.path.isfile(orig):
             orig = os.path.join(spk, "ortho_512x512x32.ppm")
-        left_label = "htrdr ortho 512x512 spp256  (mountain.obj)"
+        left_label = "htrdr ortho 512x512 spp256  (frozen png)"
     if os.path.isfile(orig):
         oim = Image.open(orig).convert("RGB").resize((w, h), Image.NEAREST)
         canvas = Image.new("RGB", (w * 2 + 24, h + 48), (18, 18, 18))

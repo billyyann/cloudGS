@@ -2068,7 +2068,24 @@ OptixTracer::traceAtmosphere(
     float mieOmega,
     float mieG,
     float pathTmax,
-    uint32_t maxBounces) {
+    uint32_t maxBounces,
+    torch::Tensor cieCdf,
+    torch::Tensor cieRcpIntegral,
+    float cieLambda0Nm,
+    float cieDlambdaNm,
+    torch::Tensor swLambdaLo,
+    torch::Tensor swLambdaHi,
+    torch::Tensor swGasKa,
+    torch::Tensor swGasKs,
+    torch::Tensor brdfLambdaNm,
+    torch::Tensor brdfR,
+    torch::Tensor swNquad,
+    torch::Tensor swQuadCdf,
+    torch::Tensor mieCsBand,
+    torch::Tensor mieCaBand,
+    torch::Tensor mieGnm,
+    float mieCsRef,
+    float mieCaRef) {
 
     const torch::TensorOptions opts = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
 
@@ -2209,6 +2226,82 @@ OptixTracer::traceAtmosphere(
     }
     atm.sun.radiance = sunRadiance;
     atm.sun.cos_half_angle = sunCosHalf;
+
+    atm.cie_enabled = 0;
+    atm.cie_nbins = 0;
+    atm.cie_lambda0_nm = cieLambda0Nm;
+    atm.cie_dlambda_nm = cieDlambdaNm;
+    atm.cie_rcp_integral[0] = atm.cie_rcp_integral[1] = atm.cie_rcp_integral[2] = 0.f;
+    atm.cie_cdf = nullptr;
+    atm.sw_nbands = 0;
+    atm.sw_nquad_max = 0;
+    atm.sw_lambda_lo_nm = nullptr;
+    atm.sw_lambda_hi_nm = nullptr;
+    atm.sw_gas_ka = nullptr;
+    atm.sw_gas_ks = nullptr;
+    if (cieCdf.defined() && cieCdf.numel() >= 3 && cieRcpIntegral.defined() && cieRcpIntegral.numel() >= 3) {
+        const int ncdf = static_cast<int>(cieCdf.numel());
+        atm.cie_nbins = ncdf / 3;
+        atm.cie_cdf = atmFloatPtr(cieCdf);
+        const auto rcpCpu = cieRcpIntegral.contiguous().cpu();
+        const float* rcp = rcpCpu.data_ptr<float>();
+        atm.cie_rcp_integral[0] = rcp[0];
+        atm.cie_rcp_integral[1] = rcp[1];
+        atm.cie_rcp_integral[2] = rcp[2];
+        atm.cie_enabled = (atm.cie_nbins > 0 && atm.cie_cdf != nullptr) ? 1 : 0;
+    }
+    if (swLambdaLo.defined() && swGasKa.defined() && swGasKa.numel() > 0) {
+        if (swGasKa.dim() == 3) {
+            atm.sw_nbands = static_cast<int>(swGasKa.size(0));
+            atm.sw_nquad_max = static_cast<int>(swGasKa.size(1));
+        } else {
+            atm.sw_nbands = static_cast<int>(swGasKa.size(0));
+            atm.sw_nquad_max = 1;
+        }
+        atm.sw_lambda_lo_nm = atmFloatPtr(swLambdaLo);
+        atm.sw_lambda_hi_nm = atmFloatPtr(swLambdaHi);
+        atm.sw_gas_ka = atmFloatPtr(swGasKa);
+        atm.sw_gas_ks = atmFloatPtr(swGasKs);
+    }
+    atm.sw_nquad = nullptr;
+    atm.sw_quad_cdf = nullptr;
+    atm.mie_cs_band = nullptr;
+    atm.mie_ca_band = nullptr;
+    atm.mie_g_nm = nullptr;
+    atm.mie_g_n = 0;
+    atm.mie_g_lambda0_nm = 380.f;
+    atm.mie_g_dlambda_nm = 1.f;
+    atm.mie_cs_ref = mieCsRef > 0.f ? mieCsRef : 1.f;
+    atm.mie_ca_ref = mieCaRef > 0.f ? mieCaRef : 1.f;
+    atm.path_ks_scale = 1.f;
+    atm.path_ka_scale = 1.f;
+    if (swNquad.defined() && swNquad.numel() > 0) {
+        atm.sw_nquad = atmIntPtr(swNquad);
+    }
+    if (swQuadCdf.defined() && swQuadCdf.numel() > 0) {
+        atm.sw_quad_cdf = atmFloatPtr(swQuadCdf);
+    }
+    if (mieCsBand.defined() && mieCsBand.numel() > 0) {
+        atm.mie_cs_band = atmFloatPtr(mieCsBand);
+    }
+    if (mieCaBand.defined() && mieCaBand.numel() > 0) {
+        atm.mie_ca_band = atmFloatPtr(mieCaBand);
+    }
+    if (mieGnm.defined() && mieGnm.numel() > 1) {
+        atm.mie_g_nm = atmFloatPtr(mieGnm);
+        atm.mie_g_n = static_cast<int>(mieGnm.numel());
+        atm.mie_g_lambda0_nm = 380.f;
+        atm.mie_g_dlambda_nm = 400.f / float(atm.mie_g_n - 1);
+    }
+    atm.brdf_n = 0;
+    atm.brdf_lambda_nm = nullptr;
+    atm.brdf_R = nullptr;
+    atm.path_albedo = -1.f;
+    if (brdfLambdaNm.defined() && brdfR.defined() && brdfLambdaNm.numel() > 0 && brdfR.numel() == brdfLambdaNm.numel()) {
+        atm.brdf_n = static_cast<int>(brdfLambdaNm.numel());
+        atm.brdf_lambda_nm = atmFloatPtr(brdfLambdaNm);
+        atm.brdf_R = atmFloatPtr(brdfR);
+    }
 
     cudaStream_t cudaStream = at::cuda::getCurrentCUDAStream();
     buildAtmosphereAccel(

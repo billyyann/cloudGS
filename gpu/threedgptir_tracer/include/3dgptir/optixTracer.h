@@ -319,7 +319,24 @@ public:
         float mieOmega,
         float mieG,
         float pathTmax,
-        uint32_t maxBounces);
+        uint32_t maxBounces,
+        torch::Tensor cieCdf = torch::Tensor(),
+        torch::Tensor cieRcpIntegral = torch::Tensor(),
+        float cieLambda0Nm = 380.f,
+        float cieDlambdaNm = 1.f,
+        torch::Tensor swLambdaLo = torch::Tensor(),
+        torch::Tensor swLambdaHi = torch::Tensor(),
+        torch::Tensor swGasKa = torch::Tensor(),
+        torch::Tensor swGasKs = torch::Tensor(),
+        torch::Tensor brdfLambdaNm = torch::Tensor(),
+        torch::Tensor brdfR = torch::Tensor(),
+        torch::Tensor swNquad = torch::Tensor(),
+        torch::Tensor swQuadCdf = torch::Tensor(),
+        torch::Tensor mieCsBand = torch::Tensor(),
+        torch::Tensor mieCaBand = torch::Tensor(),
+        torch::Tensor mieGnm = torch::Tensor(),
+        float mieCsRef = 1.f,
+        float mieCaRef = 1.f);
 
     /// Last forward optixLaunch wall time in ms (__raygen__rg + nested OptiX programs).
 
