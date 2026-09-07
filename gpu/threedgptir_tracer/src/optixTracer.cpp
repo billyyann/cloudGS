@@ -2085,7 +2085,8 @@ OptixTracer::traceAtmosphere(
     torch::Tensor mieCaBand,
     torch::Tensor mieGnm,
     float mieCsRef,
-    float mieCaRef) {
+    float mieCaRef,
+    torch::Tensor voxelZIface) {
 
     const torch::TensorOptions opts = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
 
@@ -2275,6 +2276,10 @@ OptixTracer::traceAtmosphere(
     atm.mie_ca_ref = mieCaRef > 0.f ? mieCaRef : 1.f;
     atm.path_ks_scale = 1.f;
     atm.path_ka_scale = 1.f;
+    atm.voxel_z_iface = nullptr;
+    if (voxelZIface.defined() && voxelZIface.numel() >= static_cast<int64_t>(atm.voxels.nz) + 1) {
+        atm.voxel_z_iface = atmFloatPtr(voxelZIface);
+    }
     if (swNquad.defined() && swNquad.numel() > 0) {
         atm.sw_nquad = atmIntPtr(swNquad);
     }
@@ -2349,11 +2354,12 @@ OptixTracer::traceAtmosphere(
 
     std::fprintf(stderr,
                  "[atm] sizeof PipelineParameters=%zu AtmParams=%zu sunL=%g mesh_ntri=%d voxels=%dx%dx%d gs=%d "
-                 "meshGAS=%d volGAS=%d ias=%d volPrims=%d gas_nlayers=%d gas_ks=%d path_tmax=%g\n",
+                 "meshGAS=%d volGAS=%d ias=%d volPrims=%d gas_nlayers=%d gas_ks=%d path_tmax=%g z_iface=%d\n",
                  sizeof(PipelineParameters), sizeof(AtmParams), (double)atm.sun.radiance,
                  atm.mesh.ntri, atm.voxels.nx, atm.voxels.ny, atm.voxels.nz, atm.gs_enabled,
                  paramsHost.meshHandle != 0, paramsHost.volHandle != 0, paramsHost.meshVolIas != 0,
-                 paramsHost.volPrimCount, atm.gas.nlayers, atm.gas.ks != nullptr, (double)atm.path_tmax);
+                 paramsHost.volPrimCount, atm.gas.nlayers, atm.gas.ks != nullptr, (double)atm.path_tmax,
+                 atm.voxel_z_iface != nullptr);
 
     reallocateParamsDevice(sizeof(paramsHost), cudaStream);
     CUDA_CHECK(cudaMemcpyAsync(

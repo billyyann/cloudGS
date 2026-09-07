@@ -196,15 +196,21 @@ def load_htcp_bin(path: str):
         ks = np.fromfile(f, dtype=np.float32, count=n).reshape(nz, ny, nx)
         ka = np.fromfile(f, dtype=np.float32, count=n).reshape(nz, ny, nx)
         temp = np.fromfile(f, dtype=np.float32, count=n).reshape(nz, ny, nx)
-    return ka, ks, temp, origin, spacing
+        z_iface = None
+        if int(hdr[3]) >= 2:
+            z = np.fromfile(f, dtype=np.float32, count=nz + 1)
+            if z.size == nz + 1:
+                z_iface = z
+    return ka, ks, temp, origin, spacing, z_iface
 
 
-def analog_kext_tr(ka, ks, origin, spacing, org, direction, tmax=2.0e4):
+def analog_kext_tr(ka, ks, origin, spacing, org, direction, tmax=2.0e4, z_iface=None):
     """Host analog exp(-∫Kext) along a ray (same cell-step idea as GPU DDA)."""
     kext = np.asarray(ka, dtype=np.float32) + np.asarray(ks, dtype=np.float32)
     nz, ny, nx = kext.shape
     dx, dy, dz = [float(spacing[i]) for i in range(3)]
     ox, oy, oz = [float(origin[i]) for i in range(3)]
+    zf = np.asarray(z_iface, dtype=np.float64) if z_iface is not None else None
     d = np.asarray(direction, dtype=np.float64)
     nrm = np.linalg.norm(d)
     if nrm < 1e-12:
@@ -217,7 +223,10 @@ def analog_kext_tr(ka, ks, origin, spacing, org, direction, tmax=2.0e4):
     while t < tmax:
         ix = int(np.floor((p[0] - ox) / dx))
         iy = int(np.floor((p[1] - oy) / dy))
-        iz = int(np.floor((p[2] - oz) / dz))
+        if zf is not None:
+            iz = int(np.searchsorted(zf, p[2], side="right") - 1)
+        else:
+            iz = int(np.floor((p[2] - oz) / dz))
         if 0 <= ix < nx and 0 <= iy < ny and 0 <= iz < nz:
             tau += float(kext[iz, iy, ix]) * ds
         p = p + d * ds
@@ -227,19 +236,23 @@ def analog_kext_tr(ka, ks, origin, spacing, org, direction, tmax=2.0e4):
     return float(np.exp(-tau))
 
 
-def diagnose_cloud_sun_tr(ka, ks, origin, spacing, sun):
+def diagnose_cloud_sun_tr(ka, ks, origin, spacing, sun, z_iface=None):
     """Cloud-top point toward the sun: Tr should be in (0, 1), not identically 0."""
     kext = np.asarray(ka, dtype=np.float32) + np.asarray(ks, dtype=np.float32)
     iz, iy, ix = np.unravel_index(int(np.argmax(kext)), kext.shape)
+    if z_iface is not None and len(z_iface) == kext.shape[0] + 1:
+        zc = 0.5 * (float(z_iface[iz]) + float(z_iface[iz + 1]))
+    else:
+        zc = float(origin[2]) + (iz + 0.5) * float(spacing[2])
     org = np.array(
         [
             float(origin[0]) + (ix + 0.5) * float(spacing[0]),
             float(origin[1]) + (iy + 0.5) * float(spacing[1]),
-            float(origin[2]) + (iz + 0.5) * float(spacing[2]),
+            zc,
         ],
         dtype=np.float64,
     )
-    tr = analog_kext_tr(ka, ks, origin, spacing, org, sun)
+    tr = analog_kext_tr(ka, ks, origin, spacing, org, sun, z_iface=z_iface)
     print(
         f"diag analog Tr(Kext) at cloud cell ({ix},{iy},{iz}) z={org[2]:.1f} toward sun: {tr:.4g}"
     )
@@ -311,7 +324,12 @@ def main():
     p.add_argument("--spp", type=int, default=16)
     p.add_argument("--htcp-bin", default=os.path.join(ROOT, "scenes/mountain_gs/dzvar_voxels.bin"))
     p.add_argument("--height", type=float, default=6400.0, help="ortho sensor height meters (htrdr DZVAR_ortho)")
-    p.add_argument("--max-bounces", type=int, default=1024, help="volume walk budget (htrdr is unbounded)")
+    p.add_argument(
+        "--max-bounces",
+        type=int,
+        default=256,
+        help="volume walk cap (htrdr is unbounded; 256 saturates this scene, 64 is ~9% dark)",
+    )
     p.add_argument("--mie-g", type=float, default=0.865, help="HG asymmetry (Mie LUT ~0.865 at 550 nm)")
     p.add_argument("--rebuild-scene", action="store_true", help="rebuild ply/voxels/gas in Python")
     p.add_argument(
@@ -388,9 +406,13 @@ def main():
         print(f"GS particles: {gs['pos'].shape[0]}")
         tracer.build_bvh(gs["pos"], gs["rot"], gs["scl"], gs["dns"], 1, False)
 
+    z_iface = None
     if os.path.isfile(args.htcp_bin):
-        ka, ks, temp, origin, spacing = load_htcp_bin(args.htcp_bin)
-        print(f"voxels from htcp dump {ks.shape} origin={origin} dx={spacing}")
+        ka, ks, temp, origin, spacing, z_iface = load_htcp_bin(args.htcp_bin)
+        print(
+            f"voxels from htcp dump {ks.shape} origin={origin} dx={spacing} "
+            f"z_iface={'yes' if z_iface is not None else 'no'}"
+        )
     else:
         print("no htcp dump, using procedural Cu")
         nx, ny, nz = 128, 128, 40
@@ -416,7 +438,7 @@ def main():
         gas_ka = np.zeros_like(gas_ka)
         gas_ks = np.zeros_like(gas_ks)
         print("no-clouds: voxel ka/ks and gas ka/ks zeroed")
-    diagnose_cloud_sun_tr(ka, ks, origin, spacing, sun)
+    diagnose_cloud_sun_tr(ka, ks, origin, spacing, sun, z_iface=z_iface)
     buffers = AtmosphereBuffers.from_numpy(
         device=device,
         voxel_ka=ka,
@@ -438,6 +460,7 @@ def main():
         mie_g=args.mie_g,
         path_tmax=1.2e5,
         max_bounces=args.max_bounces,
+        voxel_z_iface=z_iface,
     )
     cie = build_cie_xyz_tables()
     buffers.cie_cdf = torch.as_tensor(cie["cdf"], dtype=torch.float32, device=device)
@@ -511,6 +534,7 @@ def main():
     )
 
     acc = None
+    acc_first = None
     chunk = min(args.spp, 4)
     nchunk = (args.spp + chunk - 1) // chunk
     from threedgptir_tracer.atmosphere import trace_atmosphere
@@ -539,9 +563,12 @@ def main():
             ori = ori[:, y0:y1, x0:x1].contiguous()
             drc = drc[:, y0:y1, x0:x1].contiguous()
         out = trace_atmosphere(tracer, ori, drc, buffers, frame_number=c)
-        rgb = out[10]  # ray_pbr
+        rgb = out[10]  # ray_pbr (full CIE XYZ)
+        first = out[11]  # ray_light: first volume NEE only
         part = rgb.float().mean(dim=0).cpu().numpy()
+        part_first = first.float().mean(dim=0).cpu().numpy()
         acc = part if acc is None else acc + part
+        acc_first = part_first if acc_first is None else acc_first + part_first
         print(f"  chunk {c+1}/{nchunk} mean={part.mean():.4f}")
         if c == 0:
             hit = out[2][..., 0].float().cpu().numpy().reshape(-1)
@@ -641,6 +668,7 @@ def main():
         del ori, drc, out, rgb
         torch.cuda.empty_cache()
     img = acc / float(nchunk)
+    img_first = None if acc_first is None else acc_first / float(nchunk)
     if args.crop is not None:
         x0, y0, x1, y1 = args.crop
         print(
@@ -656,16 +684,23 @@ def main():
             href = np.loadtxt(htrdr_txt, skiprows=1, dtype=np.float64).reshape(-1, 8)
             hy = href[:, 2].reshape(h, w)[y0:y1, x0:x1]
             hx = href[:, 0].reshape(h, w)[y0:y1, x0:x1]
-            hz = href[:, 4].reshape(h, w)[y0:y1, x0:x1]
             gy = img[..., 1]
+            fy = img_first[..., 1] if img_first is not None else np.zeros_like(gy)
+            ry = gy - fy
             print(
                 f"  htrdr crop Y mean/p50={float(hy.mean()):.3f}/{float(np.median(hy)):.3f}  "
                 f"GPU/htrdr mean={float(gy.mean()/max(hy.mean(),1e-12)):.3f}  "
                 f"p50={float(np.median(gy)/max(np.median(hy),1e-12)):.3f}  "
                 f"Y/X htrdr={float(hy.mean()/max(hx.mean(),1e-12)):.3f} GPU={float(gy.mean()/max(img[...,0].mean(),1e-12)):.3f}"
             )
+            print(
+                f"  GPU first-vol-NEE Y mean={float(fy.mean()):.3f}  "
+                f"later Y mean={float(ry.mean()):.3f}  "
+                f"first/total={float(fy.mean()/max(gy.mean(),1e-12)):.3f}"
+            )
             thr = float(np.percentile(hy, 70))
             bright = hy > thr
+            dark = ~bright
             if bright.any():
                 print(
                     f"  bright Y>p70 n={int(bright.sum())}  "
@@ -674,6 +709,21 @@ def main():
                     f"ratio mean={float(gy[bright].mean()/hy[bright].mean()):.3f}  "
                     f"p50={float(np.median(gy[bright])/max(np.median(hy[bright]),1e-12)):.3f}"
                 )
+                print(
+                    f"  bright first-vol-NEE/htrdr={float(fy[bright].mean()/hy[bright].mean()):.3f}  "
+                    f"later/htrdr={float(ry[bright].mean()/hy[bright].mean()):.3f}  "
+                    f"first/GPU={float(fy[bright].mean()/max(gy[bright].mean(),1e-12)):.3f}"
+                )
+                print(
+                    f"  surround first-vol-NEE/htrdr={float(fy[dark].mean()/max(hy[dark].mean(),1e-12)):.3f}  "
+                    f"later/htrdr={float(ry[dark].mean()/max(hy[dark].mean(),1e-12)):.3f}  "
+                    f"first/GPU={float(fy[dark].mean()/max(gy[dark].mean(),1e-12)):.3f}"
+                )
+            crop_tag = f"crop_{x0}_{y0}_{x1}_{y1}"
+            np.save(os.path.join(args.outdir, f"gpu_xyz_{crop_tag}.npy"), img.astype(np.float32))
+            if img_first is not None:
+                np.save(os.path.join(args.outdir, f"gpu_xyz_first_{crop_tag}.npy"), img_first.astype(np.float32))
+                print("wrote", os.path.join(args.outdir, f"gpu_xyz_{crop_tag}.npy"), "and first-vol-NEE npy")
         return
     if buffers.spectral_mode == SPECTRAL_SW_CIE_XYZ and buffers.cie_cdf is not None and buffers.cie_cdf.numel() > 0:
         X, Y, Z = img[..., 0], img[..., 1], img[..., 2]

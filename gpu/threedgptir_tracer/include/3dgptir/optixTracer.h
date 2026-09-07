@@ -336,7 +336,8 @@ public:
         torch::Tensor mieCaBand = torch::Tensor(),
         torch::Tensor mieGnm = torch::Tensor(),
         float mieCsRef = 1.f,
-        float mieCaRef = 1.f);
+        float mieCaRef = 1.f,
+        torch::Tensor voxelZIface = torch::Tensor());
 
     /// Last forward optixLaunch wall time in ms (__raygen__rg + nested OptiX programs).
 

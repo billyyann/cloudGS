@@ -134,7 +134,7 @@ static void probe_ray(
             float ka_g = 0.f, ks_g = 0.f;
             atm_gas_k_at_z(&atm->gas, h.pos[2], &ka_g, &ks_g);
             int ijk[3];
-            atm_world_to_ijk(&atm->voxels, h.pos, ijk);
+            atm_world_to_ijk(&atm->voxels, h.pos, ijk, atm->voxel_z_iface);
             const float ks_p = atm_fetch_ks(&atm->voxels, ijk[0], ijk[1], ijk[2]);
             const float ks_tot = ks_g + ks_p;
             sum_ksp += ks_p;

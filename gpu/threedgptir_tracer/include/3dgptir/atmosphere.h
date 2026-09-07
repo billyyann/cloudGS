@@ -112,6 +112,9 @@ struct AtmParams {
     float mie_ca_ref;
     float path_ks_scale; /* Cs_band / Cs_ref; 1 if unset */
     float path_ka_scale;
+    /* Native HTCP Z faces [nz+1]. Null = uniform g->dz. Do not put this on
+     * AtmVoxelGrid (would shift gas/mesh/sun). */
+    const float* voxel_z_iface;
 };
 
 #ifdef __cplusplus

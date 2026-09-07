@@ -323,7 +323,7 @@ static __device__ void atm_vol_from_accel(
     hit->pos[1] = org[1] + dir[1] * a.t;
     hit->pos[2] = org[2] + dir[2] * a.t;
     int ijk[3];
-    atm_world_to_ijk(&atm->voxels, hit->pos, ijk);
+    atm_world_to_ijk(&atm->voxels, hit->pos, ijk, atm->voxel_z_iface);
     hit->ka = atm_fetch_ka(&atm->voxels, ijk[0], ijk[1], ijk[2]);
     hit->ks = atm_fetch_ks(&atm->voxels, ijk[0], ijk[1], ijk[2]);
     hit->kext = hit->ka + hit->ks;
@@ -716,6 +716,7 @@ static __device__ void traceAtmospherePath(const uint3& idx, Sampler& sampler) {
     float firstHitTKeep = 0.f;
     int firstEventKeep = ATM_EVENT_ESCAPE;
     int escapedKeep = 1;
+    float xyzFirst[3] = {0.f, 0.f, 0.f};
 
     const int maxB = atm_base->max_bounces > 0 ? atm_base->max_bounces : (int)params.maxBounces;
     const float tmax0 = atm_base->path_tmax > 0.f ? atm_base->path_tmax : 1.0e5f;
@@ -746,6 +747,7 @@ static __device__ void traceAtmospherePath(const uint3& idx, Sampler& sampler) {
     float3 radiance = make_float3(0.f, 0.f, 0.f);
     float3 direct = make_float3(0.f, 0.f, 0.f);
     float3 indirect = make_float3(0.f, 0.f, 0.f);
+    float3 firstVolNee = make_float3(0.f, 0.f, 0.f);
     float firstHitT = 0.f;
     int recordedHit = 0;
     int firstEvent = ATM_EVENT_ESCAPE;
@@ -875,7 +877,14 @@ static __device__ void traceAtmospherePath(const uint3& idx, Sampler& sampler) {
              * P(HG)=(ks_p/ks_tot)^2. In this cloud that flip is ~0.05% of events
              * — not the 12% core gap; still wrong, so do not re-Bernoulli. */
             const int voxelScatter = (vol.event == ATM_EVENT_SCATTER_GAS) ? 0 : 1;
-            atm_add_sun_nee_volume(atm, vol.pos, dir, voxelScatter, throughput, sampler, radiance, bounce == 0 ? direct : indirect);
+            float3 volNee = make_float3(0.f, 0.f, 0.f);
+            atm_add_sun_nee_volume(atm, vol.pos, dir, voxelScatter, throughput, sampler, radiance, volNee);
+            if (bounce == 0) {
+                firstVolNee += volNee;
+                direct += volNee;
+            } else {
+                indirect += volNee;
+            }
 
             float wo[3];
             if (voxelScatter) {
@@ -1017,6 +1026,8 @@ static __device__ void traceAtmospherePath(const uint3& idx, Sampler& sampler) {
     if (cieOn) {
         const float L = (radiance.x + radiance.y + radiance.z) * (1.f / 3.f);
         xyz[cie_ch] = L / fmaxf(wlen_pdf, 1e-20f);
+        const float L0 = (firstVolNee.x + firstVolNee.y + firstVolNee.z) * (1.f / 3.f);
+        xyzFirst[cie_ch] = L0 / fmaxf(wlen_pdf, 1e-20f);
         if (cie_ch == 0) {
             firstHitTKeep = firstHitT;
             firstEventKeep = firstEvent;
@@ -1024,8 +1035,8 @@ static __device__ void traceAtmospherePath(const uint3& idx, Sampler& sampler) {
         }
     } else {
         radianceOut = radiance;
-        directOut = direct;
-        indirectOut = indirect;
+        directOut = firstVolNee;
+        indirectOut = radiance - firstVolNee;
         firstHitTKeep = firstHitT;
         firstEventKeep = firstEvent;
         escapedKeep = escaped;
@@ -1034,8 +1045,8 @@ static __device__ void traceAtmospherePath(const uint3& idx, Sampler& sampler) {
 
     if (cieOn) {
         radianceOut = make_float3(xyz[0], xyz[1], xyz[2]);
-        directOut = radianceOut;
-        indirectOut = make_float3(0.f, 0.f, 0.f);
+        directOut = make_float3(xyzFirst[0], xyzFirst[1], xyzFirst[2]);
+        indirectOut = radianceOut - directOut;
     }
     writeAtmosphereOutputs(idx, radianceOut, directOut, indirectOut, firstHitTKeep, escapedKeep, firstEventKeep);
 }

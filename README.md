@@ -14,5 +14,5 @@ GPU 上用拷贝版 PTIR 做大气短波路径追踪：体素云（Woodcock）�
 ## 渲染
 
 ```bash
-python tools/render_mountain_gs_gpu.py --res 512 --spp 16 --max-bounces 1024
+python tools/render_mountain_gs_gpu.py --res 512 --spp 16 --max-bounces 256
 ```

@@ -211,6 +211,79 @@ int main() {
         std::printf("ok   brick_kmax %g\n", grid.kext_max[0]);
     }
 
+    /* Irregular Z analog τ: thin lower layer must not be stretched to mean dz. */
+    {
+        const int nz = 2, ny = 1, nx = 1;
+        std::vector<float> ka_i(nz, 0.f);
+        std::vector<float> ks_i(nz, 0.f);
+        ks_i[0] = 1.f;
+        std::vector<float> tmp_i(nz, 280.f);
+        std::vector<float> kmax_i(1, 1.f);
+        float zifv[3] = {0.f, 5.f, 20.f};
+        AtmVoxelGrid gi{};
+        gi.nx = nx;
+        gi.ny = ny;
+        gi.nz = nz;
+        gi.brick = 8;
+        gi.nbx = gi.nby = gi.nbz = 1;
+        gi.origin[0] = gi.origin[1] = gi.origin[2] = 0.f;
+        gi.dx = gi.dy = 1.f;
+        gi.dz = 10.f; /* mean dz, must not be used when z_iface is set */
+        gi.ka = ka_i.data();
+        gi.ks = ks_i.data();
+        gi.temperature = tmp_i.data();
+        gi.kext_max = kmax_i.data();
+        float orgz[3] = {0.5f, 0.5f, -1.f};
+        float dirz[3] = {0.f, 0.f, 1.f};
+        const float tau_nat = atm_voxel_optical_depth(&gi, orgz, dirz, 40.f, ATM_K_KS, 1.f, 1.f, zifv);
+        const float tau_mean = atm_voxel_optical_depth(&gi, orgz, dirz, 40.f, ATM_K_KS, 1.f, 1.f, nullptr);
+        expect_near("irreg_z_tau_native", tau_nat, 5.0, 2e-3);
+        expect_near("irreg_z_tau_mean_dz", tau_mean, 10.0, 2e-3);
+        int ijk[3];
+        float pmid[3] = {0.5f, 0.5f, 4.f};
+        atm_world_to_ijk(&gi, pmid, ijk, zifv);
+        if (ijk[2] != 0) {
+            std::fprintf(stderr, "FAIL z_to_iz mid-layer got %d\n", ijk[2]);
+            ++g_fail;
+        } else {
+            std::printf("ok   z_to_iz native layer 0\n");
+        }
+        pmid[2] = 12.f;
+        atm_world_to_ijk(&gi, pmid, ijk, zifv);
+        if (ijk[2] != 1) {
+            std::fprintf(stderr, "FAIL z_to_iz upper layer got %d\n", ijk[2]);
+            ++g_fail;
+        } else {
+            std::printf("ok   z_to_iz native layer 1\n");
+        }
+    }
+
+    /* Periodic XY analog must integrate past one domain (old cap 2*(nx+ny)+nz). */
+    {
+        const int n = 16;
+        const float k = 0.05f;
+        std::vector<float> ka_w(static_cast<size_t>(n * n * 4), 0.f);
+        std::vector<float> ks_w(static_cast<size_t>(n * n * 4), k);
+        std::vector<float> tmp_w(static_cast<size_t>(n * n * 4), 280.f);
+        std::vector<float> kmax_w;
+        AtmVoxelGrid gw{};
+        gw.nx = gw.ny = n;
+        gw.nz = 4;
+        gw.origin[0] = gw.origin[1] = gw.origin[2] = 0.f;
+        gw.dx = gw.dy = gw.dz = 1.f;
+        gw.ka = ka_w.data();
+        gw.ks = ks_w.data();
+        gw.temperature = tmp_w.data();
+        gw.brick = 8;
+        kmax_w.resize(1);
+        atm_build_brick_majorants(&gw, kmax_w.data());
+        float orgw[3] = {0.5f, 8.f, 2.f};
+        float dirw[3] = {1.f, 0.f, 0.f};
+        const float tmax_w = 100.f;
+        const float tau_w = atm_voxel_optical_depth(&gw, orgw, dirw, tmax_w, ATM_K_KS);
+        expect_near("analog_xy_wrap_tau", tau_w, k * tmax_w, 0.05);
+    }
+
     if (g_fail) {
         std::fprintf(stderr, "%d checks failed\n", g_fail);
         return 1;

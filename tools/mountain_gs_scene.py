@@ -3,7 +3,7 @@
 
 Builds:
   - mountain.obj heightfield → 3DGS ply + scene.json
-  - DZVAR .htcp → regular voxel ka/ks (ctypes libhtcp)
+  - DZVAR .htcp → native-layer voxel ka/ks + z_iface (ctypes libhtcp)
   - ecrad_opt_prop.txt → 1D SW gas layers (ctypes libhtgop)
 
 Cloud optical truth stays voxels. GS/mesh are surfaces only.
@@ -133,11 +133,10 @@ def load_htcp_voxels(
     wavelength_nm: float = 550.0,
     mie_path: str = DEFAULT_MIE,
 ) -> dict:
-    """RCT → regular (nz, ny, nx) ks/ka/T. k = ρ_da · RCT · C_{s,a} (same as htsky).
+    """Native HTCP layers (nz, ny, nx). k = ρ_da · RCT · C_{s,a} (same as htsky).
 
-    Default Z grid is native layer count over native [lower_z, upper_z].
-    nreg=80 / z1=4000 smeared 5–50 m HTCP cells into 50 m bins and dropped the
-    top ~200 m; sun-path Tr at camera first-hits was ~0.89 vs nreg=160.
+    Irregular Z is kept: one cell per HTCP layer, z_iface[nz+1] for GPU query.
+    nreg/z0/z1 are ignored (overlap bake onto uniform dz thinned cloud skins).
     """
     mie = fetch_mie(wavelength_nm, mie_path)
     Cs, Ca = mie["Cs"], mie["Ca"]
@@ -163,13 +162,8 @@ def load_htcp_voxels(
         raise RuntimeError("htcp_get_desc failed")
 
     nx, ny, nz = (int(d.spatial_definition[0]), int(d.spatial_definition[1]), int(d.spatial_definition[2]))
-    if z0 is None:
-        z0 = float(d.lower[2])
-    if z1 is None:
-        z1 = float(d.upper[2])
-    if nreg is None:
-        nreg = nz
-    nreg = int(nreg)
+    if nreg is not None or z0 is not None or z1 is not None:
+        print("note: nreg/z0/z1 ignored; dumping native irregular-Z HTCP layers")
     nt = max(int(d.time_definition), 1)
     ncell = nx * ny * nz * nt
     rct = _np_from_c_double(d.RCT, ncell).reshape(nt, nz, ny, nx)
@@ -181,64 +175,61 @@ def load_htcp_voxels(
     else:
         zlo = d.lower[2] + np.arange(nz, dtype=np.float64) * ((d.upper[2] - d.lower[2]) / max(nz, 1))
     zhi = zlo + vxsz_z
+    z_iface = np.concatenate([zlo.astype(np.float32), np.float32([zhi[-1]])])
 
-    dzr = (z1 - z0) / float(nreg)
-    ks = np.zeros((nreg, ny, nx), np.float32)
+    ks = np.zeros((nz, ny, nx), np.float32)
     ka = np.zeros_like(ks)
     temp = np.full_like(ks, 280.0)
     rct0 = rct[0]
     for iz in range(nz):
-        lo, hi = float(zlo[iz]), float(zhi[iz])
-        iz0 = int(math.floor((lo - z0) / dzr))
-        iz1 = int(math.floor((hi - z0) / dzr))
-        iz0 = max(iz0, 0)
-        iz1 = min(iz1, nreg - 1)
         slab = rct0[iz]
-        if float(slab.max()) < 1e-8:
-            continue
         tk = temp_src[0, iz] if temp_src is not None else np.full_like(slab, 280.0)
         if pabst is not None:
             rho = (pabst[0, iz] * DRY_AIR_MOLAR_MASS) / np.maximum(tk * GAS_CONSTANT, 1e-6)
         else:
             rho = np.full_like(slab, 1.0)
         ql = rho * slab
-        k_s = (ql * Cs).astype(np.float32)
-        k_a = (ql * Ca).astype(np.float32)
-        tk_f = tk.astype(np.float32)
-        for rz in range(iz0, iz1 + 1):
-            clo = z0 + rz * dzr
-            chi = clo + dzr
-            ov = min(hi, chi) - max(lo, clo)
-            if ov <= 0.0:
-                continue
-            w = np.float32(ov / dzr)
-            ks[rz] += k_s * w
-            ka[rz] += k_a * w
-            mask = k_s > 0
-            temp[rz] = np.where(mask, tk_f, temp[rz])
+        ks[iz] = (ql * Cs).astype(np.float32)
+        ka[iz] = (ql * Ca).astype(np.float32)
+        temp[iz] = tk.astype(np.float32)
 
-    origin = np.array([float(d.lower[0]), float(d.lower[1]), z0], np.float32)
-    spacing = np.array([float(d.vxsz_x), float(d.vxsz_y), dzr], np.float32)
+    z0_out = float(zlo[0])
+    z1_out = float(zhi[-1])
+    origin = np.array([float(d.lower[0]), float(d.lower[1]), z0_out], np.float32)
+    mean_dz = (z1_out - z0_out) / float(max(nz, 1))
+    spacing = np.array([float(d.vxsz_x), float(d.vxsz_y), mean_dz], np.float32)
     lib.htcp_ref_put(cloud)
     print(
-        f"htcp {nx}x{ny}x{nz} → regular {ks.shape} origin={origin} dx={spacing} "
-        f"ks>0={(ks > 1e-6).mean():.3f} max_ks={ks.max():.4g} Cs={Cs:.4g}"
+        f"htcp {nx}x{ny}x{nz} native irregular Z origin={origin} dx={spacing} "
+        f"z=[{z0_out:.1f},{z1_out:.1f}] ks>0={(ks > 1e-6).mean():.3f} max_ks={ks.max():.4g} Cs={Cs:.4g}"
     )
-    return {"ka": ka, "ks": ks, "temp": temp, "origin": origin, "spacing": spacing, "mie_g": mie["g"]}
+    return {
+        "ka": ka,
+        "ks": ks,
+        "temp": temp,
+        "origin": origin,
+        "spacing": spacing,
+        "z_iface": z_iface,
+        "mie_g": mie["g"],
+    }
 
 
 def save_voxel_bin(path: str, voxels: dict) -> None:
     ka, ks, temp = voxels["ka"], voxels["ks"], voxels["temp"]
     nz, ny, nx = ks.shape
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    z_iface = np.asarray(voxels["z_iface"], dtype=np.float32).reshape(-1)
+    if z_iface.size != nz + 1:
+        raise ValueError(f"z_iface length {z_iface.size} != nz+1={nz + 1}")
     with open(path, "wb") as f:
-        np.array([nx, ny, nz, 1], dtype=np.int32).tofile(f)
+        np.array([nx, ny, nz, 2], dtype=np.int32).tofile(f)
         np.asarray(voxels["origin"], dtype=np.float32).tofile(f)
         np.asarray(voxels["spacing"], dtype=np.float32).tofile(f)
         ks.astype(np.float32).ravel().tofile(f)
         ka.astype(np.float32).ravel().tofile(f)
         temp.astype(np.float32).ravel().tofile(f)
-    print(f"wrote {path}")
+        z_iface.tofile(f)
+    print(f"wrote {path} (native z_iface {nz + 1})")
 
 
 def load_voxel_bin(path: str) -> dict:
@@ -251,7 +242,12 @@ def load_voxel_bin(path: str) -> dict:
         ks = np.fromfile(f, dtype=np.float32, count=n).reshape(nz, ny, nx)
         ka = np.fromfile(f, dtype=np.float32, count=n).reshape(nz, ny, nx)
         temp = np.fromfile(f, dtype=np.float32, count=n).reshape(nz, ny, nx)
-    return {"ka": ka, "ks": ks, "temp": temp, "origin": origin, "spacing": spacing}
+        out = {"ka": ka, "ks": ks, "temp": temp, "origin": origin, "spacing": spacing}
+        if int(hdr[3]) >= 2:
+            z_iface = np.fromfile(f, dtype=np.float32, count=nz + 1)
+            if z_iface.size == nz + 1:
+                out["z_iface"] = z_iface
+    return out
 
 
 # --- libhtgop / ecrad 1D gas -------------------------------------------------
@@ -794,8 +790,8 @@ def ensure_assets(
     )
     if not need_vox:
         voxels = load_voxel_bin(voxels_bin)
-        # 80×50 m bins smear sunlit tops (~11% Tr) and clip native z≈4201.
-        if int(voxels["ks"].shape[0]) < 160:
+        # overlap bake (hdr ver<2) smeared native skins; rebuild native z_iface.
+        if voxels.get("z_iface") is None or int(voxels["ks"].shape[0]) < 160:
             need_vox = True
     if need_vox:
         voxels = load_htcp_voxels(htcp_path)

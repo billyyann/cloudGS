@@ -23,10 +23,14 @@
 
 #if defined(__CUDACC__) || defined(__OPTIX__)
 #define ATM_FN __device__ __forceinline__
+/* Heavy walks: do not dump into raygen. OptiX O3 + forceinline of irregular-Z
+ * DDA (and Woodcock) together segfaults libnvidia-rtcore at module create. */
+#define ATM_HEAVY_FN __device__ __noinline__
 #else
 #ifndef ATM_FN
 #define ATM_FN static inline
 #endif
+#define ATM_HEAVY_FN static inline
 #endif
 
 ATM_FN float atm_clampf(float v, float lo, float hi) {
@@ -146,10 +150,58 @@ ATM_FN int atm_ray_aabb(
     return 1;
 }
 
-ATM_FN void atm_world_to_ijk(const struct AtmVoxelGrid* g, const float p[3], int ijk[3]) {
+ATM_FN float atm_grid_z_lo(const struct AtmVoxelGrid* g, const float* z_iface, int iz) {
+    if (z_iface && g && iz >= 0 && iz <= g->nz) {
+        return z_iface[iz];
+    }
+    if (!g) {
+        return 0.f;
+    }
+    return g->origin[2] + g->dz * (float)iz;
+}
+
+ATM_FN float atm_grid_z0(const struct AtmVoxelGrid* g, const float* z_iface) {
+    return atm_grid_z_lo(g, z_iface, 0);
+}
+
+ATM_FN float atm_grid_z1(const struct AtmVoxelGrid* g, const float* z_iface) {
+    return atm_grid_z_lo(g, z_iface, g ? g->nz : 0);
+}
+
+/* Native HTCP layer or uniform dz. Out of slab: -1 or nz.
+ * Linear scan like gas layers (bounded for OptiX, nz≈160). */
+ATM_FN int atm_z_to_iz(const struct AtmVoxelGrid* g, const float* z_iface, float z) {
+    if (!g || g->nz <= 0) {
+        return -1;
+    }
+    if (!z_iface) {
+        return (int)floorf((z - g->origin[2]) / fmaxf(g->dz, 1e-20f));
+    }
+    if (z < z_iface[0]) {
+        return -1;
+    }
+    if (z >= z_iface[g->nz]) {
+        return g->nz;
+    }
+#if defined(__CUDACC__) || defined(__OPTIX__)
+#pragma unroll 1
+#endif
+    for (int i = 0; i < g->nz; ++i) {
+        if (z >= z_iface[i] && z < z_iface[i + 1]) {
+            return i;
+        }
+    }
+    return g->nz - 1;
+}
+
+ATM_FN void atm_world_to_ijk(
+    const struct AtmVoxelGrid* g,
+    const float p[3],
+    int ijk[3],
+    const float* z_iface) {
     ijk[0] = (int)floorf((p[0] - g->origin[0]) / g->dx);
     ijk[1] = (int)floorf((p[1] - g->origin[1]) / g->dy);
-    ijk[2] = (int)floorf((p[2] - g->origin[2]) / g->dz);
+    ijk[2] = atm_z_to_iz(g, z_iface, p[2]);
 }
 
 /* htrdr -r: XY is periodic; Z is a finite slab. */
@@ -276,7 +328,7 @@ ATM_FN float atm_path_ka_scale(const struct AtmParams* atm) {
 /* Voxel Woodcock in [0, tmax]. htrdr scattering_hit_filter: Ts ~ Exp(1),
  * brick ks_max, accept ks/ks_max (walk_ks=1). LW may walk kext (walk_ks=0). */
 template <typename Rng>
-ATM_FN void atm_woodcock_voxels_into(
+ATM_HEAVY_FN void atm_woodcock_voxels_into(
     const struct AtmVoxelGrid* g,
     const float org[3],
     const float dir[3],
@@ -286,7 +338,8 @@ ATM_FN void atm_woodcock_voxels_into(
     int walk_ks,
     struct AtmHit* hit,
     float ks_scale = 1.f,
-    float ka_scale = 1.f) {
+    float ka_scale = 1.f,
+    const float* z_iface = nullptr) {
     atm_hit_clear(hit);
     if (!g || !hit || g->nx <= 0 || tmax <= 1e-8f) {
         return;
@@ -294,8 +347,8 @@ ATM_FN void atm_woodcock_voxels_into(
 
     const float gx0 = g->origin[0];
     const float gy0 = g->origin[1];
-    const float gz0 = g->origin[2];
-    const float gz1 = gz0 + g->dz * (float)g->nz;
+    const float gz0 = atm_grid_z0(g, z_iface);
+    const float gz1 = atm_grid_z1(g, z_iface);
 
     /* htrdr -r / analog τ: clip Z only. XY is periodic. Do not set t1=path_tmax
      * without a Z exit — nadir would never leave the cloud slab. */
@@ -325,9 +378,11 @@ ATM_FN void atm_woodcock_voxels_into(
     const int b = g->brick > 0 ? g->brick : 8;
     const float bdx = g->dx * (float)b;
     const float bdy = g->dy * (float)b;
-    const float bdz = g->dz * (float)b;
 
     /* Safety cap on null collisions */
+#if defined(__CUDACC__) || defined(__OPTIX__)
+#pragma unroll 1
+#endif
     for (int step = 0; step < 100000; ++step) {
         if (t >= t1 - 1e-6f) {
             break;
@@ -335,16 +390,19 @@ ATM_FN void atm_woodcock_voxels_into(
         float p[3] = {org[0] + dir[0] * (t + atm_ray_eps(t)),
                       org[1] + dir[1] * (t + atm_ray_eps(t)),
                       org[2] + dir[2] * (t + atm_ray_eps(t))};
-        /* World brick indices (XY may be any tile; Z must stay in the slab). */
         const int bx = (int)floorf((p[0] - gx0) / bdx);
         const int by = (int)floorf((p[1] - gy0) / bdy);
-        int bz = (int)floorf((p[2] - gz0) / bdz);
-        if (bz >= g->nbz && dir[2] < 0.f) {
-            bz = g->nbz - 1;
+        int iz = atm_z_to_iz(g, z_iface, p[2]);
+        if (iz >= g->nz && dir[2] < 0.f) {
+            iz = g->nz - 1;
         }
-        if (bz < 0 && dir[2] > 0.f) {
-            bz = 0;
+        if (iz < 0 && dir[2] > 0.f) {
+            iz = 0;
         }
+        if (iz < 0 || iz >= g->nz) {
+            break;
+        }
+        const int bz = iz / b;
         if (bz < 0 || bz >= g->nbz) {
             break;
         }
@@ -353,13 +411,19 @@ ATM_FN void atm_woodcock_voxels_into(
 
         const float bx0 = gx0 + (float)bx * bdx;
         const float by0 = gy0 + (float)by * bdy;
-        const float bz0 = gz0 + (float)bz * bdz;
+        const int iz_lo = bz * b;
+        int iz_hi = iz_lo + b;
+        if (iz_hi > g->nz) {
+            iz_hi = g->nz;
+        }
+        const float bz0 = atm_grid_z_lo(g, z_iface, iz_lo);
+        const float bz1 = atm_grid_z_lo(g, z_iface, iz_hi);
         float t_exit = t1;
         for (int a = 0; a < 3; ++a) {
             const float o = org[a];
             const float d = dir[a];
             const float lo = a == 0 ? bx0 : (a == 1 ? by0 : bz0);
-            const float hi = lo + (a == 0 ? bdx : (a == 1 ? bdy : bdz));
+            const float hi = a == 0 ? (bx0 + bdx) : (a == 1 ? (by0 + bdy) : bz1);
             if (fabsf(d) < 1e-20f) {
                 continue;
             }
@@ -389,7 +453,7 @@ ATM_FN void atm_woodcock_voxels_into(
         }
         float pos[3] = {org[0] + dir[0] * t, org[1] + dir[1] * t, org[2] + dir[2] * t};
         int cij[3];
-        atm_world_to_ijk(g, pos, cij);
+        atm_world_to_ijk(g, pos, cij, z_iface);
         const float ka = atm_fetch_ka(g, cij[0], cij[1], cij[2]) * ka_scale;
         const float ks = atm_fetch_ks(g, cij[0], cij[1], cij[2]) * ks_scale;
         const float kext = ka + ks;
@@ -448,7 +512,8 @@ ATM_FN void atm_woodcock_brick(
     Rng& rng,
     float mie_omega,
     int walk_ks,
-    struct AtmHit* out) {
+    struct AtmHit* out,
+    const float* z_iface = nullptr) {
     atm_hit_clear(out);
     if (!g || !out || t_exit <= t_enter + 1e-8f) {
         return;
@@ -476,7 +541,7 @@ ATM_FN void atm_woodcock_brick(
         }
         float pos[3] = {org[0] + dir[0] * t, org[1] + dir[1] * t, org[2] + dir[2] * t};
         int cij[3];
-        atm_world_to_ijk(g, pos, cij);
+        atm_world_to_ijk(g, pos, cij, z_iface);
         const float ka = atm_fetch_ka(g, cij[0], cij[1], cij[2]);
         const float ks = atm_fetch_ks(g, cij[0], cij[1], cij[2]);
         const float kext = ka + ks;
@@ -1093,7 +1158,8 @@ ATM_FN void atm_next_volume_event_into(
         walk_ks,
         &vox,
         atm_path_ks_scale(atm),
-        atm_path_ka_scale(atm));
+        atm_path_ka_scale(atm),
+        atm->voxel_z_iface);
     if (gas.event != ATM_EVENT_NONE && gas.t <= vox.t && gas.t < tmax) {
         *out = gas;
         return;
@@ -1143,27 +1209,27 @@ ATM_FN void atm_gas_k_at_z(const struct AtmGasLayers* gas, float z, float* ka, f
     }
 }
 
-/* Analog optical depth through the regular voxel grid (Amanatides–Woo DDA).
- * Homogeneous cells ⇒ exp(-Tmin) matches htrdr transmissivity residual.
- * kind: ATM_K_KA / ATM_K_KS / ATM_K_EXT (gas+particle via caller sum). */
-ATM_FN float atm_voxel_optical_depth(
+/* Analog optical depth. XY is regular DDA; Z uses native faces when z_iface
+ * is set (HTCP irregular layers), else uniform g->dz. */
+ATM_HEAVY_FN float atm_voxel_optical_depth(
     const struct AtmVoxelGrid* g,
     const float org[3],
     const float dir[3],
     float tmax,
     int kind = ATM_K_EXT,
     float ks_scale = 1.f,
-    float ka_scale = 1.f) {
+    float ka_scale = 1.f,
+    const float* z_iface = nullptr) {
     if (!g || g->nx <= 0 || tmax <= 1e-8f) {
         return 0.f;
     }
     const float gx0 = g->origin[0];
     const float gy0 = g->origin[1];
-    const float gz0 = g->origin[2];
+    const float gz0 = atm_grid_z0(g, z_iface);
     const float dx[3] = {g->dx, g->dy, g->dz};
-    const float origin[3] = {gx0, gy0, gz0};
+    const float origin[3] = {gx0, gy0, g->origin[2]};
     const int n[3] = {g->nx, g->ny, g->nz};
-    const float gz1 = gz0 + dx[2] * (float)n[2];
+    const float gz1 = atm_grid_z1(g, z_iface);
     /* NEE analog τ: clip Z only (htrdr -r). XY is periodic. Camera Woodcock
      * uses the same Z-slab clip so nadir still exits at z=0 and hits mesh. */
     float t0 = 0.f;
@@ -1193,7 +1259,7 @@ ATM_FN float atm_voxel_optical_depth(
     }
     float p[3] = {org[0] + dir[0] * t, org[1] + dir[1] * t, org[2] + dir[2] * t};
     int ijk[3];
-    atm_world_to_ijk(g, p, ijk);
+    atm_world_to_ijk(g, p, ijk, z_iface);
     if (ijk[2] >= n[2] && dir[2] < 0.f) {
         ijk[2] = n[2] - 1;
     }
@@ -1206,7 +1272,7 @@ ATM_FN float atm_voxel_optical_depth(
     int step[3];
     float tDelta[3];
     float tMax[3];
-    for (int a = 0; a < 3; ++a) {
+    for (int a = 0; a < 2; ++a) {
         if (dir[a] > 1e-20f) {
             step[a] = 1;
             tDelta[a] = dx[a] / dir[a];
@@ -1221,8 +1287,24 @@ ATM_FN float atm_voxel_optical_depth(
             tMax[a] = ATM_INF;
         }
     }
+    tDelta[2] = ATM_INF;
+    if (dir[2] > 1e-20f) {
+        step[2] = 1;
+        tMax[2] = (atm_grid_z_lo(g, z_iface, ijk[2] + 1) - org[2]) / dir[2];
+    } else if (dir[2] < -1e-20f) {
+        step[2] = -1;
+        tMax[2] = (atm_grid_z_lo(g, z_iface, ijk[2]) - org[2]) / dir[2];
+    } else {
+        step[2] = 0;
+        tMax[2] = ATM_INF;
+    }
     float tau = 0.f;
-    const int nsteps = 2 * (n[0] + n[1]) + n[2] + 8;
+    /* Periodic XY can wrap many tiles before Z-slab / path_tmax. Do not cap at
+     * one domain (2*(nx+ny)+nz): that stopped analog at ~30 km on mountain rays. */
+    const int nsteps = 100000;
+#if defined(__CUDACC__) || defined(__OPTIX__)
+#pragma unroll 1
+#endif
     for (int s = 0; s < nsteps; ++s) {
         if (t >= t1 - 1e-6f) {
             break;
@@ -1245,7 +1327,9 @@ ATM_FN float atm_voxel_optical_depth(
         if (tNext >= t1 - 1e-6f) {
             break;
         }
-        t = tNext;
+        if (tNext > t) {
+            t = tNext;
+        }
         if (tMax[0] <= tMax[1] && tMax[0] <= tMax[2]) {
             ijk[0] += step[0];
             tMax[0] += tDelta[0];
@@ -1254,7 +1338,11 @@ ATM_FN float atm_voxel_optical_depth(
             tMax[1] += tDelta[1];
         } else {
             ijk[2] += step[2];
-            tMax[2] += tDelta[2];
+            if (step[2] > 0) {
+                tMax[2] = (atm_grid_z_lo(g, z_iface, ijk[2] + 1) - org[2]) / dir[2];
+            } else if (step[2] < 0) {
+                tMax[2] = (atm_grid_z_lo(g, z_iface, ijk[2]) - org[2]) / dir[2];
+            }
         }
     }
     return tau;
@@ -1338,7 +1426,8 @@ ATM_FN float atm_optical_depth(
                tmax,
                kind,
                atm_path_ks_scale(atm),
-               atm_path_ka_scale(atm)) +
+               atm_path_ka_scale(atm),
+               atm->voxel_z_iface) +
            atm_gas_optical_depth(&atm->gas, org, dir, tmax, kind);
 }
 

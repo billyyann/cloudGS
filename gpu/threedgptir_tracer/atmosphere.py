@@ -197,6 +197,7 @@ class AtmosphereBuffers:
     mie_g_nm: torch.Tensor = field(default=None)  # type: ignore
     mie_cs_ref: float = 1.0
     mie_ca_ref: float = 1.0
+    voxel_z_iface: torch.Tensor = field(default=None)  # type: ignore
 
     @classmethod
     def from_numpy(
@@ -225,6 +226,7 @@ class AtmosphereBuffers:
         mie_g: float = 0.85,
         path_tmax: float = 1.0e5,
         max_bounces: int = 8,
+        voxel_z_iface: Optional[np.ndarray] = None,
     ) -> "AtmosphereBuffers":
         if voxel_ka is not None:
             ka = np.asarray(voxel_ka, dtype=np.float32)
@@ -287,6 +289,7 @@ class AtmosphereBuffers:
             mie_g_nm=torch.empty(0, dtype=torch.float32, device=device),
             mie_cs_ref=1.0,
             mie_ca_ref=1.0,
+            voxel_z_iface=_to_cuda_f32(voxel_z_iface, (0,), device),
         )
 
 
@@ -347,4 +350,5 @@ def trace_atmosphere(tracer_wrapper, ray_ori: torch.Tensor, ray_dir: torch.Tenso
         buffers.mie_g_nm if buffers.mie_g_nm is not None else torch.empty(0, dtype=torch.float32, device=device),
         float(buffers.mie_cs_ref),
         float(buffers.mie_ca_ref),
+        buffers.voxel_z_iface if buffers.voxel_z_iface is not None else torch.empty(0, dtype=torch.float32, device=device),
     )
