@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021 NVIDIA Corporation.  All rights reserved.
+ * Copyright (c) 2023 NVIDIA Corporation.  All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -30,8 +30,8 @@
 /// @author NVIDIA Corporation
 /// @brief  OptiX public API header
 
-#ifndef optix_denoiser_tiling_h
-#define optix_denoiser_tiling_h
+#ifndef OPTIX_DENOISER_TILING_H
+#define OPTIX_DENOISER_TILING_H
 
 #include <optix.h>
 
@@ -67,7 +67,8 @@ struct OptixUtilDenoiserImageTile
 /// if the pixelStrideInBytes member of the image is zero.
 /// Otherwise return pixelStrideInBytes from the image.
 ///
-/// \param[in]                  image Image containing the pixel stride
+/// \param[in] image              Image containing the pixel stride
+/// \param[in] pixelStrideInBytes Pixel stride in bytes
 ///
 inline OptixResult optixUtilGetPixelStride( const OptixImage2D& image, unsigned int& pixelStrideInBytes )
 {
@@ -76,6 +77,9 @@ inline OptixResult optixUtilGetPixelStride( const OptixImage2D& image, unsigned 
     {
         switch( image.format )
         {
+            case OPTIX_PIXEL_FORMAT_HALF1:
+                pixelStrideInBytes = 1 * sizeof( short );
+                break;
             case OPTIX_PIXEL_FORMAT_HALF2:
                 pixelStrideInBytes = 2 * sizeof( short );
                 break;
@@ -84,6 +88,9 @@ inline OptixResult optixUtilGetPixelStride( const OptixImage2D& image, unsigned 
                 break;
             case OPTIX_PIXEL_FORMAT_HALF4:
                 pixelStrideInBytes = 4 * sizeof( short );
+                break;
+            case OPTIX_PIXEL_FORMAT_FLOAT1:
+                pixelStrideInBytes = 1 * sizeof( float );
                 break;
             case OPTIX_PIXEL_FORMAT_FLOAT2:
                 pixelStrideInBytes = 2 * sizeof( float );
@@ -271,6 +278,7 @@ inline OptixResult optixUtilDenoiserInvokeTiled(
                                                                  tileWidth, tileHeight, normalTiles ) )
             return res;
     }
+
     std::vector<OptixUtilDenoiserImageTile> flowTiles;
     if( guideLayer->flow.data )
     {
@@ -278,6 +286,16 @@ inline OptixResult optixUtilDenoiserInvokeTiled(
         if( const OptixResult res = optixUtilDenoiserSplitImage( guideLayer->flow, dummyOutput,
                                                                  overlapWindowSizeInPixels,
                                                                  tileWidth, tileHeight, flowTiles ) )
+            return res;
+    }
+
+    std::vector<OptixUtilDenoiserImageTile> flowTrustTiles;
+    if( guideLayer->flowTrustworthiness.data )
+    {
+        OptixImage2D dummyOutput = guideLayer->flowTrustworthiness;
+        if( const OptixResult res = optixUtilDenoiserSplitImage( guideLayer->flowTrustworthiness, dummyOutput,
+                                                                 overlapWindowSizeInPixels,
+                                                                 tileWidth, tileHeight, flowTrustTiles ) )
             return res;
     }
 
@@ -301,6 +319,7 @@ inline OptixResult optixUtilDenoiserInvokeTiled(
             layer.output = ( tiles[l] )[t].output;
             if( layers[l].previousOutput.data )
                 layer.previousOutput = ( prevTiles[l] )[t].input;
+            layer.type = layers[l].type;
             tlayers.push_back( layer );
         }
 
@@ -313,6 +332,9 @@ inline OptixResult optixUtilDenoiserInvokeTiled(
 
         if( guideLayer->flow.data )
             gl.flow = flowTiles[t].input;
+
+        if( guideLayer->flowTrustworthiness.data )
+            gl.flowTrustworthiness = flowTrustTiles[t].input;
 
         if( guideLayer->previousOutputInternalGuideLayer.data )
             gl.previousOutputInternalGuideLayer = internalGuideLayerTiles[t].input;
@@ -330,10 +352,10 @@ inline OptixResult optixUtilDenoiserInvokeTiled(
     return OPTIX_SUCCESS;
 }
 
-/*@}*/  // end group optix_utilities
+/**@}*/  // end group optix_utilities
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif  // __optix_optix_stack_size_h__
+#endif  // OPTIX_DENOISER_TILING_H 

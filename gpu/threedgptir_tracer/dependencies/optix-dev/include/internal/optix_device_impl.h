@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2021 NVIDIA Corporation.  All rights reserved.
+* Copyright (c) 2023 NVIDIA Corporation.  All rights reserved.
 *
 * NVIDIA Corporation and its licensors retain all intellectual property and proprietary
 * rights in and to this software, related documentation and any modifications thereto.
@@ -19,7 +19,7 @@
 */
 
 /**
-* @file   optix_7_device_impl.h
+* @file   optix_device_impl.h
 * @author NVIDIA Corporation
 * @brief  OptiX public API
 *
@@ -27,14 +27,13 @@
 */
 
 #if !defined( __OPTIX_INCLUDE_INTERNAL_HEADERS__ )
-#error("optix_7_device_impl.h is an internal header file and must not be used directly.  Please use optix_device.h or optix.h instead.")
+#error("optix_device_impl.h is an internal header file and must not be used directly.  Please use optix_device.h or optix.h instead.")
 #endif
 
-#ifndef __optix_optix_7_device_impl_h__
-#define __optix_optix_7_device_impl_h__
+#ifndef OPTIX_OPTIX_DEVICE_IMPL_H
+#define OPTIX_OPTIX_DEVICE_IMPL_H
 
-#include "internal/optix_7_device_impl_exception.h"
-#include "internal/optix_7_device_impl_transformations.h"
+#include "internal/optix_device_impl_transformations.h"
 
 #ifndef __CUDACC_RTC__
 #include <initializer_list>
@@ -69,8 +68,9 @@ static __forceinline__ __device__ void optixTrace( OptixTraversableHandle handle
                    "All payload parameters need to be unsigned int." );
 #endif
 
-    float        ox = rayOrigin.x, oy = rayOrigin.y, oz = rayOrigin.z;
-    float        dx = rayDirection.x, dy = rayDirection.y, dz = rayDirection.z;
+    OptixPayloadTypeID type = OPTIX_PAYLOAD_TYPE_DEFAULT;
+    float              ox = rayOrigin.x, oy = rayOrigin.y, oz = rayOrigin.z;
+    float              dx = rayDirection.x, dy = rayDirection.y, dz = rayDirection.z;
     unsigned int p[33]       = { 0, payload... };
     int          payloadSize = (int)sizeof...( Payload );
     asm volatile(
@@ -85,7 +85,7 @@ static __forceinline__ __device__ void optixTrace( OptixTraversableHandle handle
           "=r"( p[15] ), "=r"( p[16] ), "=r"( p[17] ), "=r"( p[18] ), "=r"( p[19] ), "=r"( p[20] ), "=r"( p[21] ),
           "=r"( p[22] ), "=r"( p[23] ), "=r"( p[24] ), "=r"( p[25] ), "=r"( p[26] ), "=r"( p[27] ), "=r"( p[28] ),
           "=r"( p[29] ), "=r"( p[30] ), "=r"( p[31] ), "=r"( p[32] )
-        : "r"( 0 ), "l"( handle ), "f"( ox ), "f"( oy ), "f"( oz ), "f"( dx ), "f"( dy ), "f"( dz ), "f"( tmin ),
+        : "r"( type ), "l"( handle ), "f"( ox ), "f"( oy ), "f"( oz ), "f"( dx ), "f"( dy ), "f"( dz ), "f"( tmin ),
           "f"( tmax ), "f"( rayTime ), "r"( visibilityMask ), "r"( rayFlags ), "r"( SBToffset ), "r"( SBTstride ),
           "r"( missSBTIndex ), "r"( payloadSize ), "r"( p[1] ), "r"( p[2] ), "r"( p[3] ), "r"( p[4] ), "r"( p[5] ),
           "r"( p[6] ), "r"( p[7] ), "r"( p[8] ), "r"( p[9] ), "r"( p[10] ), "r"( p[11] ), "r"( p[12] ), "r"( p[13] ),
@@ -94,7 +94,59 @@ static __forceinline__ __device__ void optixTrace( OptixTraversableHandle handle
           "r"( p[28] ), "r"( p[29] ), "r"( p[30] ), "r"( p[31] ), "r"( p[32] )
         : );
     unsigned int index = 1;
-    (void)std::initializer_list<unsigned int>{ index, ( payload = p[index++] )... };
+    (void)std::initializer_list<unsigned int>{index, ( payload = p[index++] )...};
+}
+
+template <typename... Payload>
+static __forceinline__ __device__ void optixTraverse( OptixTraversableHandle handle,
+                                                      float3                 rayOrigin,
+                                                      float3                 rayDirection,
+                                                      float                  tmin,
+                                                      float                  tmax,
+                                                      float                  rayTime,
+                                                      OptixVisibilityMask    visibilityMask,
+                                                      unsigned int           rayFlags,
+                                                      unsigned int           SBToffset,
+                                                      unsigned int           SBTstride,
+                                                      unsigned int           missSBTIndex,
+                                                      Payload&... payload )
+{
+    static_assert( sizeof...( Payload ) <= 32, "Only up to 32 payload values are allowed." );
+    // std::is_same compares each type in the two TypePacks to make sure that all types are unsigned int.
+    // TypePack 1    unsigned int    T0      T1      T2   ...   Tn-1        Tn
+    // TypePack 2      T0            T1      T2      T3   ...   Tn        unsigned int
+#ifndef __CUDACC_RTC__
+    static_assert( std::is_same<optix_internal::TypePack<unsigned int, Payload...>, optix_internal::TypePack<Payload..., unsigned int>>::value,
+                   "All payload parameters need to be unsigned int." );
+#endif
+
+    OptixPayloadTypeID type = OPTIX_PAYLOAD_TYPE_DEFAULT;
+    float              ox = rayOrigin.x, oy = rayOrigin.y, oz = rayOrigin.z;
+    float              dx = rayDirection.x, dy = rayDirection.y, dz = rayDirection.z;
+    unsigned int p[33]       = {0, payload...};
+    int          payloadSize = (int)sizeof...( Payload );
+    asm volatile(
+        "call"
+        "(%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15,%16,%17,%18,%19,%20,%21,%22,%23,%24,%25,%26,%27,%28,%"
+        "29,%30,%31),"
+        "_optix_hitobject_traverse,"
+        "(%32,%33,%34,%35,%36,%37,%38,%39,%40,%41,%42,%43,%44,%45,%46,%47,%48,%49,%50,%51,%52,%53,%54,%55,%56,%57,%58,%"
+        "59,%60,%61,%62,%63,%64,%65,%66,%67,%68,%69,%70,%71,%72,%73,%74,%75,%76,%77,%78,%79,%80);"
+        : "=r"( p[1] ), "=r"( p[2] ), "=r"( p[3] ), "=r"( p[4] ), "=r"( p[5] ), "=r"( p[6] ), "=r"( p[7] ),
+          "=r"( p[8] ), "=r"( p[9] ), "=r"( p[10] ), "=r"( p[11] ), "=r"( p[12] ), "=r"( p[13] ), "=r"( p[14] ),
+          "=r"( p[15] ), "=r"( p[16] ), "=r"( p[17] ), "=r"( p[18] ), "=r"( p[19] ), "=r"( p[20] ), "=r"( p[21] ),
+          "=r"( p[22] ), "=r"( p[23] ), "=r"( p[24] ), "=r"( p[25] ), "=r"( p[26] ), "=r"( p[27] ), "=r"( p[28] ),
+          "=r"( p[29] ), "=r"( p[30] ), "=r"( p[31] ), "=r"( p[32] )
+        : "r"( type ), "l"( handle ), "f"( ox ), "f"( oy ), "f"( oz ), "f"( dx ), "f"( dy ), "f"( dz ), "f"( tmin ),
+          "f"( tmax ), "f"( rayTime ), "r"( visibilityMask ), "r"( rayFlags ), "r"( SBToffset ), "r"( SBTstride ),
+          "r"( missSBTIndex ), "r"( payloadSize ), "r"( p[1] ), "r"( p[2] ), "r"( p[3] ), "r"( p[4] ), "r"( p[5] ),
+          "r"( p[6] ), "r"( p[7] ), "r"( p[8] ), "r"( p[9] ), "r"( p[10] ), "r"( p[11] ), "r"( p[12] ), "r"( p[13] ),
+          "r"( p[14] ), "r"( p[15] ), "r"( p[16] ), "r"( p[17] ), "r"( p[18] ), "r"( p[19] ), "r"( p[20] ),
+          "r"( p[21] ), "r"( p[22] ), "r"( p[23] ), "r"( p[24] ), "r"( p[25] ), "r"( p[26] ), "r"( p[27] ),
+          "r"( p[28] ), "r"( p[29] ), "r"( p[30] ), "r"( p[31] ), "r"( p[32] )
+        : );
+    unsigned int index = 1;
+    (void)std::initializer_list<unsigned int>{index, ( payload = p[index++] )...};
 }
 
 template <typename... Payload>
@@ -116,12 +168,14 @@ static __forceinline__ __device__ void optixTrace( OptixPayloadTypeID     type,
     // TypePack 1    unsigned int    T0      T1      T2   ...   Tn-1        Tn
     // TypePack 2      T0            T1      T2      T3   ...   Tn        unsigned int
     static_assert( sizeof...( Payload ) <= 32, "Only up to 32 payload values are allowed." );
+#ifndef __CUDACC_RTC__
     static_assert( std::is_same<optix_internal::TypePack<unsigned int, Payload...>, optix_internal::TypePack<Payload..., unsigned int>>::value,
                    "All payload parameters need to be unsigned int." );
+#endif
 
     float        ox = rayOrigin.x, oy = rayOrigin.y, oz = rayOrigin.z;
     float        dx = rayDirection.x, dy = rayDirection.y, dz = rayDirection.z;
-    unsigned int p[33]       = { 0, payload... };
+    unsigned int p[33]       = {0, payload...};
     int          payloadSize = (int)sizeof...( Payload );
 
     asm volatile(
@@ -145,7 +199,654 @@ static __forceinline__ __device__ void optixTrace( OptixPayloadTypeID     type,
           "r"( p[28] ), "r"( p[29] ), "r"( p[30] ), "r"( p[31] ), "r"( p[32] )
         : );
     unsigned int index = 1;
-    (void)std::initializer_list<unsigned int>{ index, ( payload = p[index++] )... };
+    (void)std::initializer_list<unsigned int>{index, ( payload = p[index++] )...};
+}
+
+template <typename... Payload>
+static __forceinline__ __device__ void optixTraverse( OptixPayloadTypeID     type,
+                                                      OptixTraversableHandle handle,
+                                                      float3                 rayOrigin,
+                                                      float3                 rayDirection,
+                                                      float                  tmin,
+                                                      float                  tmax,
+                                                      float                  rayTime,
+                                                      OptixVisibilityMask    visibilityMask,
+                                                      unsigned int           rayFlags,
+                                                      unsigned int           SBToffset,
+                                                      unsigned int           SBTstride,
+                                                      unsigned int           missSBTIndex,
+                                                      Payload&... payload )
+{
+    // std::is_same compares each type in the two TypePacks to make sure that all types are unsigned int.
+    // TypePack 1    unsigned int    T0      T1      T2   ...   Tn-1        Tn
+    // TypePack 2      T0            T1      T2      T3   ...   Tn        unsigned int
+    static_assert( sizeof...( Payload ) <= 32, "Only up to 32 payload values are allowed." );
+#ifndef __CUDACC_RTC__
+    static_assert( std::is_same<optix_internal::TypePack<unsigned int, Payload...>, optix_internal::TypePack<Payload..., unsigned int>>::value,
+                   "All payload parameters need to be unsigned int." );
+#endif
+
+    float        ox = rayOrigin.x, oy = rayOrigin.y, oz = rayOrigin.z;
+    float        dx = rayDirection.x, dy = rayDirection.y, dz = rayDirection.z;
+    unsigned int p[33]       = {0, payload...};
+    int          payloadSize = (int)sizeof...( Payload );
+    asm volatile(
+        "call"
+        "(%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15,%16,%17,%18,%19,%20,%21,%22,%23,%24,%25,%26,%27,%28,%"
+        "29,%30,%31),"
+        "_optix_hitobject_traverse,"
+        "(%32,%33,%34,%35,%36,%37,%38,%39,%40,%41,%42,%43,%44,%45,%46,%47,%48,%49,%50,%51,%52,%53,%54,%55,%56,%57,%58,%"
+        "59,%60,%61,%62,%63,%64,%65,%66,%67,%68,%69,%70,%71,%72,%73,%74,%75,%76,%77,%78,%79,%80);"
+        : "=r"( p[1] ), "=r"( p[2] ), "=r"( p[3] ), "=r"( p[4] ), "=r"( p[5] ), "=r"( p[6] ), "=r"( p[7] ),
+          "=r"( p[8] ), "=r"( p[9] ), "=r"( p[10] ), "=r"( p[11] ), "=r"( p[12] ), "=r"( p[13] ), "=r"( p[14] ),
+          "=r"( p[15] ), "=r"( p[16] ), "=r"( p[17] ), "=r"( p[18] ), "=r"( p[19] ), "=r"( p[20] ), "=r"( p[21] ),
+          "=r"( p[22] ), "=r"( p[23] ), "=r"( p[24] ), "=r"( p[25] ), "=r"( p[26] ), "=r"( p[27] ), "=r"( p[28] ),
+          "=r"( p[29] ), "=r"( p[30] ), "=r"( p[31] ), "=r"( p[32] )
+        : "r"( type ), "l"( handle ), "f"( ox ), "f"( oy ), "f"( oz ), "f"( dx ), "f"( dy ), "f"( dz ), "f"( tmin ),
+          "f"( tmax ), "f"( rayTime ), "r"( visibilityMask ), "r"( rayFlags ), "r"( SBToffset ), "r"( SBTstride ),
+          "r"( missSBTIndex ), "r"( payloadSize ), "r"( p[1] ), "r"( p[2] ), "r"( p[3] ), "r"( p[4] ), "r"( p[5] ),
+          "r"( p[6] ), "r"( p[7] ), "r"( p[8] ), "r"( p[9] ), "r"( p[10] ), "r"( p[11] ), "r"( p[12] ), "r"( p[13] ),
+          "r"( p[14] ), "r"( p[15] ), "r"( p[16] ), "r"( p[17] ), "r"( p[18] ), "r"( p[19] ), "r"( p[20] ),
+          "r"( p[21] ), "r"( p[22] ), "r"( p[23] ), "r"( p[24] ), "r"( p[25] ), "r"( p[26] ), "r"( p[27] ),
+          "r"( p[28] ), "r"( p[29] ), "r"( p[30] ), "r"( p[31] ), "r"( p[32] )
+        : );
+    unsigned int index = 1;
+    (void)std::initializer_list<unsigned int>{index, ( payload = p[index++] )...};
+}
+
+static __forceinline__ __device__ void optixReorder( unsigned int coherenceHint, unsigned int numCoherenceHintBits )
+{
+    asm volatile(
+         "call"
+         "(),"
+         "_optix_hitobject_reorder,"
+         "(%0,%1);"
+         :
+         : "r"( coherenceHint ), "r"( numCoherenceHintBits )
+         : );
+}
+
+static __forceinline__ __device__ void optixReorder()
+{
+    unsigned int coherenceHint = 0;
+    unsigned int numCoherenceHintBits = 0;
+    asm volatile(
+         "call"
+         "(),"
+         "_optix_hitobject_reorder,"
+         "(%0,%1);"
+         :
+         : "r"( coherenceHint ), "r"( numCoherenceHintBits )
+         : );
+}
+
+template <typename... Payload>
+static __forceinline__ __device__ void optixInvoke( OptixPayloadTypeID type, Payload&... payload )
+{
+    // std::is_same compares each type in the two TypePacks to make sure that all types are unsigned int.
+    // TypePack 1    unsigned int    T0      T1      T2   ...   Tn-1        Tn
+    // TypePack 2      T0            T1      T2      T3   ...   Tn        unsigned int
+    static_assert( sizeof...( Payload ) <= 32, "Only up to 32 payload values are allowed." );
+#ifndef __CUDACC_RTC__
+    static_assert( std::is_same<optix_internal::TypePack<unsigned int, Payload...>, optix_internal::TypePack<Payload..., unsigned int>>::value,
+                   "All payload parameters need to be unsigned int." );
+#endif
+
+    unsigned int p[33]       = {0, payload...};
+    int          payloadSize = (int)sizeof...( Payload );
+
+    asm volatile(
+        "call"
+        "(%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15,%16,%17,%18,%19,%20,%21,%22,%23,%24,%25,%26,%27,%28,%"
+        "29,%30,%31),"
+        "_optix_hitobject_invoke,"
+        "(%32,%33,%34,%35,%36,%37,%38,%39,%40,%41,%42,%43,%44,%45,%46,%47,%48,%49,%50,%51,%52,%53,%54,%55,%56,%57,%58,%"
+        "59,%60,%61,%62,%63,%64,%65);"
+        : "=r"( p[1] ), "=r"( p[2] ), "=r"( p[3] ), "=r"( p[4] ), "=r"( p[5] ), "=r"( p[6] ), "=r"( p[7] ),
+          "=r"( p[8] ), "=r"( p[9] ), "=r"( p[10] ), "=r"( p[11] ), "=r"( p[12] ), "=r"( p[13] ), "=r"( p[14] ),
+          "=r"( p[15] ), "=r"( p[16] ), "=r"( p[17] ), "=r"( p[18] ), "=r"( p[19] ), "=r"( p[20] ), "=r"( p[21] ),
+          "=r"( p[22] ), "=r"( p[23] ), "=r"( p[24] ), "=r"( p[25] ), "=r"( p[26] ), "=r"( p[27] ), "=r"( p[28] ),
+          "=r"( p[29] ), "=r"( p[30] ), "=r"( p[31] ), "=r"( p[32] )
+        : "r"( type ), "r"( payloadSize ), "r"( p[1] ), "r"( p[2] ),
+          "r"( p[3] ), "r"( p[4] ), "r"( p[5] ), "r"( p[6] ), "r"( p[7] ), "r"( p[8] ), "r"( p[9] ), "r"( p[10] ),
+          "r"( p[11] ), "r"( p[12] ), "r"( p[13] ), "r"( p[14] ), "r"( p[15] ), "r"( p[16] ), "r"( p[17] ),
+          "r"( p[18] ), "r"( p[19] ), "r"( p[20] ), "r"( p[21] ), "r"( p[22] ), "r"( p[23] ), "r"( p[24] ),
+          "r"( p[25] ), "r"( p[26] ), "r"( p[27] ), "r"( p[28] ), "r"( p[29] ), "r"( p[30] ), "r"( p[31] ), "r"( p[32] )
+        : );
+
+    unsigned int index = 1;
+    (void)std::initializer_list<unsigned int>{index, ( payload = p[index++] )...};
+}
+
+template <typename... Payload>
+static __forceinline__ __device__ void optixInvoke( Payload&... payload )
+{
+    // std::is_same compares each type in the two TypePacks to make sure that all types are unsigned int.
+    // TypePack 1    unsigned int    T0      T1      T2   ...   Tn-1        Tn
+    // TypePack 2      T0            T1      T2      T3   ...   Tn        unsigned int
+    static_assert( sizeof...( Payload ) <= 32, "Only up to 32 payload values are allowed." );
+#ifndef __CUDACC_RTC__
+    static_assert( std::is_same<optix_internal::TypePack<unsigned int, Payload...>, optix_internal::TypePack<Payload..., unsigned int>>::value,
+                   "All payload parameters need to be unsigned int." );
+#endif
+
+    OptixPayloadTypeID type        = OPTIX_PAYLOAD_TYPE_DEFAULT;
+    unsigned int       p[33]       = {0, payload...};
+    int                payloadSize = (int)sizeof...( Payload );
+
+    asm volatile(
+        "call"
+        "(%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15,%16,%17,%18,%19,%20,%21,%22,%23,%24,%25,%26,%27,%28,%"
+        "29,%30,%31),"
+        "_optix_hitobject_invoke,"
+        "(%32,%33,%34,%35,%36,%37,%38,%39,%40,%41,%42,%43,%44,%45,%46,%47,%48,%49,%50,%51,%52,%53,%54,%55,%56,%57,%58,%"
+        "59,%60,%61,%62,%63,%64,%65);"
+        : "=r"( p[1] ), "=r"( p[2] ), "=r"( p[3] ), "=r"( p[4] ), "=r"( p[5] ), "=r"( p[6] ), "=r"( p[7] ),
+          "=r"( p[8] ), "=r"( p[9] ), "=r"( p[10] ), "=r"( p[11] ), "=r"( p[12] ), "=r"( p[13] ), "=r"( p[14] ),
+          "=r"( p[15] ), "=r"( p[16] ), "=r"( p[17] ), "=r"( p[18] ), "=r"( p[19] ), "=r"( p[20] ), "=r"( p[21] ),
+          "=r"( p[22] ), "=r"( p[23] ), "=r"( p[24] ), "=r"( p[25] ), "=r"( p[26] ), "=r"( p[27] ), "=r"( p[28] ),
+          "=r"( p[29] ), "=r"( p[30] ), "=r"( p[31] ), "=r"( p[32] )
+        : "r"( type ), "r"( payloadSize ), "r"( p[1] ), "r"( p[2] ),
+          "r"( p[3] ), "r"( p[4] ), "r"( p[5] ), "r"( p[6] ), "r"( p[7] ), "r"( p[8] ), "r"( p[9] ), "r"( p[10] ),
+          "r"( p[11] ), "r"( p[12] ), "r"( p[13] ), "r"( p[14] ), "r"( p[15] ), "r"( p[16] ), "r"( p[17] ),
+          "r"( p[18] ), "r"( p[19] ), "r"( p[20] ), "r"( p[21] ), "r"( p[22] ), "r"( p[23] ), "r"( p[24] ),
+          "r"( p[25] ), "r"( p[26] ), "r"( p[27] ), "r"( p[28] ), "r"( p[29] ), "r"( p[30] ), "r"( p[31] ), "r"( p[32] )
+        : );
+
+    unsigned int index = 1;
+    (void)std::initializer_list<unsigned int>{index, ( payload = p[index++] )...};
+}
+
+template <typename... RegAttributes>
+static __forceinline__ __device__ void optixMakeHitObject( OptixTraversableHandle handle,
+                                                           float3                 rayOrigin,
+                                                           float3                 rayDirection,
+                                                           float                  tmin,
+                                                           float                  tmax,
+                                                           float                  rayTime,
+                                                           unsigned int           sbtOffset,
+                                                           unsigned int           sbtStride,
+                                                           unsigned int           instIdx,
+                                                           unsigned int           sbtGASIdx,
+                                                           unsigned int           primIdx,
+                                                           unsigned int           hitKind,
+                                                           RegAttributes... regAttributes )
+{
+    // std::is_same compares each type in the two TypePacks to make sure that all types are unsigned int.
+    // TypePack 1    unsigned int    T0      T1      T2   ...   Tn-1        Tn
+    // TypePack 2      T0            T1      T2      T3   ...   Tn        unsigned int
+    static_assert( sizeof...( RegAttributes ) <= 8, "Only up to 8 register attribute values are allowed." );
+#ifndef __CUDACC_RTC__
+    static_assert(
+        std::is_same<optix_internal::TypePack<unsigned int, RegAttributes...>, optix_internal::TypePack<RegAttributes..., unsigned int>>::value,
+        "All register attribute parameters need to be unsigned int." );
+#endif
+
+    float        ox = rayOrigin.x, oy = rayOrigin.y, oz = rayOrigin.z;
+    float        dx = rayDirection.x, dy = rayDirection.y, dz = rayDirection.z;
+    unsigned int a[9]     = {0, regAttributes...};
+    int          attrSize = (int)sizeof...( RegAttributes );
+
+    OptixTraversableHandle* transforms    = nullptr;
+    unsigned int            numTransforms = 0;
+
+    asm volatile(
+         "call"
+         "(),"
+         "_optix_hitobject_make_hit,"
+         "(%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15,%16,%17,%18,%19,%20,%21,%22,%23,%24,%25,%26);"
+         :
+         : "l"( handle ), "f"( ox ), "f"( oy ), "f"( oz ), "f"( dx ), "f"( dy ), "f"( dz ), "f"( tmin ), "f"( tmax ),
+           "f"( rayTime ), "r"( sbtOffset ), "r"( sbtStride ), "r"( instIdx ), "l"( transforms ), "r"( numTransforms ),
+           "r"( sbtGASIdx ), "r"( primIdx ), "r"( hitKind ), "r"( attrSize ), "r"( a[1] ), "r"( a[2] ), "r"( a[3] ),
+           "r"( a[4] ), "r"( a[5] ), "r"( a[6] ), "r"( a[7] ), "r"( a[8] )
+         : );
+}
+
+template <typename... RegAttributes>
+static __forceinline__ __device__ void optixMakeHitObject( OptixTraversableHandle        handle,
+                                                           float3                        rayOrigin,
+                                                           float3                        rayDirection,
+                                                           float                         tmin,
+                                                           float                         tmax,
+                                                           float                         rayTime,
+                                                           unsigned int                  sbtOffset,
+                                                           unsigned int                  sbtStride,
+                                                           unsigned int                  instIdx,
+                                                           const OptixTraversableHandle* transforms,
+                                                           unsigned int                  numTransforms,
+                                                           unsigned int                  sbtGASIdx,
+                                                           unsigned int                  primIdx,
+                                                           unsigned int                  hitKind,
+                                                           RegAttributes... regAttributes )
+{
+    // std::is_same compares each type in the two TypePacks to make sure that all types are unsigned int.
+    // TypePack 1    unsigned int    T0      T1      T2   ...   Tn-1        Tn
+    // TypePack 2      T0            T1      T2      T3   ...   Tn        unsigned int
+    static_assert( sizeof...( RegAttributes ) <= 8, "Only up to 8 register attribute values are allowed." );
+#ifndef __CUDACC_RTC__
+    static_assert(
+        std::is_same<optix_internal::TypePack<unsigned int, RegAttributes...>, optix_internal::TypePack<RegAttributes..., unsigned int>>::value,
+        "All register attribute parameters need to be unsigned int." );
+#endif
+
+    float        ox = rayOrigin.x, oy = rayOrigin.y, oz = rayOrigin.z;
+    float        dx = rayDirection.x, dy = rayDirection.y, dz = rayDirection.z;
+    unsigned int a[9]     = {0, regAttributes...};
+    int          attrSize = (int)sizeof...( RegAttributes );
+
+    asm volatile(
+         "call"
+         "(),"
+         "_optix_hitobject_make_hit,"
+         "(%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15,%16,%17,%18,%19,%20,%21,%22,%23,%24,%25,%26);"
+         :
+         : "l"( handle ), "f"( ox ), "f"( oy ), "f"( oz ), "f"( dx ), "f"( dy ), "f"( dz ), "f"( tmin ), "f"( tmax ),
+           "f"( rayTime ), "r"( sbtOffset ), "r"( sbtStride ), "r"( instIdx ), "l"( transforms ), "r"( numTransforms ),
+           "r"( sbtGASIdx ), "r"( primIdx ), "r"( hitKind ), "r"( attrSize ), "r"( a[1] ), "r"( a[2] ), "r"( a[3] ),
+           "r"( a[4] ), "r"( a[5] ), "r"( a[6] ), "r"( a[7] ), "r"( a[8] )
+         : );
+}
+
+template <typename... RegAttributes>
+static __forceinline__ __device__ void optixMakeHitObjectWithRecord( OptixTraversableHandle        handle,
+                                                                     float3                        rayOrigin,
+                                                                     float3                        rayDirection,
+                                                                     float                         tmin,
+                                                                     float                         tmax,
+                                                                     float                         rayTime,
+                                                                     unsigned int                  sbtRecordIndex,
+                                                                     unsigned int                  instIdx,
+                                                                     const OptixTraversableHandle* transforms,
+                                                                     unsigned int                  numTransforms,
+                                                                     unsigned int                  sbtGASIdx,
+                                                                     unsigned int                  primIdx,
+                                                                     unsigned int                  hitKind,
+                                                                     RegAttributes... regAttributes )
+{
+    // std::is_same compares each type in the two TypePacks to make sure that all types are unsigned int.
+    // TypePack 1    unsigned int    T0      T1      T2   ...   Tn-1        Tn
+    // TypePack 2      T0            T1      T2      T3   ...   Tn        unsigned int
+    static_assert( sizeof...( RegAttributes ) <= 8, "Only up to 8 register attribute values are allowed." );
+#ifndef __CUDACC_RTC__
+    static_assert(
+        std::is_same<optix_internal::TypePack<unsigned int, RegAttributes...>, optix_internal::TypePack<RegAttributes..., unsigned int>>::value,
+        "All register attribute parameters need to be unsigned int." );
+#endif
+
+    float        ox = rayOrigin.x, oy = rayOrigin.y, oz = rayOrigin.z;
+    float        dx = rayDirection.x, dy = rayDirection.y, dz = rayDirection.z;
+    unsigned int a[9]     = {0, regAttributes...};
+    int          attrSize = (int)sizeof...( RegAttributes );
+
+    asm volatile(
+         "call"
+         "(),"
+         "_optix_hitobject_make_hit_with_record,"
+         "(%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15,%16,%17,%18,%19,%20,%21,%22,%23,%24,%25);"
+         :
+         : "l"( handle ), "f"( ox ), "f"( oy ), "f"( oz ), "f"( dx ), "f"( dy ), "f"( dz ), "f"( tmin ), "f"( tmax ),
+           "f"( rayTime ), "r"( sbtRecordIndex ), "r"( instIdx ), "l"( transforms ), "r"( numTransforms ),
+           "r"( sbtGASIdx ), "r"( primIdx ), "r"( hitKind ), "r"( attrSize ), "r"( a[1] ), "r"( a[2] ), "r"( a[3] ),
+           "r"( a[4] ), "r"( a[5] ), "r"( a[6] ), "r"( a[7] ), "r"( a[8] )
+         : );
+}
+
+static __forceinline__ __device__ void optixMakeMissHitObject( unsigned int missSBTIndex,
+                                                               float3       rayOrigin,
+                                                               float3       rayDirection,
+                                                               float        tmin,
+                                                               float        tmax,
+                                                               float        rayTime )
+{
+    float ox = rayOrigin.x, oy = rayOrigin.y, oz = rayOrigin.z;
+    float dx = rayDirection.x, dy = rayDirection.y, dz = rayDirection.z;
+
+    asm volatile(
+         "call"
+         "(),"
+         "_optix_hitobject_make_miss,"
+         "(%0,%1,%2,%3,%4,%5,%6,%7,%8,%9);"
+         :
+         : "r"( missSBTIndex ), "f"( ox ), "f"( oy ), "f"( oz ), "f"( dx ), "f"( dy ), "f"( dz ), "f"( tmin ),
+           "f"( tmax ), "f"( rayTime )
+         : );
+}
+
+static __forceinline__ __device__ void optixMakeNopHitObject()
+{
+    asm volatile(
+         "call"
+         "(),"
+         "_optix_hitobject_make_nop,"
+         "();"
+         :
+         :
+         : );
+}
+
+static __forceinline__ __device__ bool optixHitObjectIsHit()
+{
+    unsigned int result;
+    asm volatile(
+         "call (%0), _optix_hitobject_is_hit,"
+         "();"
+         : "=r"( result )
+         :
+         : );
+    return result;
+}
+
+static __forceinline__ __device__ bool optixHitObjectIsMiss()
+{
+    unsigned int result;
+    asm volatile(
+         "call (%0), _optix_hitobject_is_miss,"
+         "();"
+         : "=r"( result )
+         :
+         : );
+    return result;
+}
+
+static __forceinline__ __device__ bool optixHitObjectIsNop()
+{
+    unsigned int result;
+    asm volatile(
+         "call (%0), _optix_hitobject_is_nop,"
+         "();"
+         : "=r"( result )
+         :
+         : );
+    return result;
+}
+
+static __forceinline__ __device__ unsigned int optixHitObjectGetInstanceId()
+{
+    unsigned int result;
+    asm volatile(
+         "call (%0), _optix_hitobject_get_instance_id,"
+         "();"
+         : "=r"( result )
+         :
+         : );
+    return result;
+}
+
+static __forceinline__ __device__ unsigned int optixHitObjectGetInstanceIndex()
+{
+    unsigned int result;
+    asm volatile(
+         "call (%0), _optix_hitobject_get_instance_idx,"
+         "();"
+         : "=r"( result )
+         :
+         : );
+    return result;
+}
+
+static __forceinline__ __device__ unsigned int optixHitObjectGetPrimitiveIndex()
+{
+    unsigned int result;
+    asm volatile(
+         "call (%0), _optix_hitobject_get_primitive_idx,"
+         "();"
+         : "=r"( result )
+         :
+         : );
+    return result;
+}
+
+static __forceinline__ __device__ unsigned int optixHitObjectGetTransformListSize()
+{
+    unsigned int result;
+    asm volatile(
+         "call (%0), _optix_hitobject_get_transform_list_size,"
+         "();"
+         : "=r"( result )
+         :
+         : );
+    return result;
+}
+
+static __forceinline__ __device__ OptixTraversableHandle optixHitObjectGetTransformListHandle( unsigned int index )
+{
+    unsigned long long result;
+    asm volatile(
+         "call (%0), _optix_hitobject_get_transform_list_handle,"
+         "(%1);"
+         : "=l"( result )
+         : "r"( index )
+         : );
+    return result;
+}
+
+static __forceinline__ __device__ unsigned int optixHitObjectGetSbtGASIndex()
+{
+    unsigned int result;
+    asm volatile(
+         "call (%0), _optix_hitobject_get_sbt_gas_idx,"
+         "();"
+         : "=r"( result )
+         :
+         : );
+    return result;
+}
+
+static __forceinline__ __device__ unsigned int optixHitObjectGetHitKind()
+{
+    unsigned int result;
+    asm volatile(
+         "call (%0), _optix_hitobject_get_hitkind,"
+         "();"
+         : "=r"( result )
+         :
+         : );
+    return result;
+}
+
+static __forceinline__ __device__ float3 optixHitObjectGetWorldRayOrigin()
+{
+    float x, y, z;
+    asm volatile(
+         "call (%0), _optix_hitobject_get_world_ray_origin_x,"
+         "();"
+         : "=f"( x )
+         :
+         : );
+    asm volatile(
+         "call (%0), _optix_hitobject_get_world_ray_origin_y,"
+         "();"
+         : "=f"( y )
+         :
+         : );
+    asm volatile(
+         "call (%0), _optix_hitobject_get_world_ray_origin_z,"
+         "();"
+         : "=f"( z )
+         :
+         : );
+    return make_float3( x, y, z );
+}
+
+static __forceinline__ __device__ float3 optixHitObjectGetWorldRayDirection()
+{
+    float x, y, z;
+    asm volatile(
+         "call (%0), _optix_hitobject_get_world_ray_direction_x,"
+         "();"
+         : "=f"( x )
+         :
+         : );
+    asm volatile(
+         "call (%0), _optix_hitobject_get_world_ray_direction_y,"
+         "();"
+         : "=f"( y )
+         :
+         : );
+    asm volatile(
+         "call (%0), _optix_hitobject_get_world_ray_direction_z,"
+         "();"
+         : "=f"( z )
+         :
+         : );
+    return make_float3( x, y, z );
+}
+
+static __forceinline__ __device__ float optixHitObjectGetRayTmin()
+{
+    float result;
+    asm volatile(
+         "call (%0), _optix_hitobject_get_ray_tmin,"
+         "();"
+         : "=f"( result )
+         :
+         : );
+    return result;
+}
+
+static __forceinline__ __device__ float optixHitObjectGetRayTmax()
+{
+    float result;
+    asm volatile(
+         "call (%0), _optix_hitobject_get_ray_tmax,"
+         "();"
+         : "=f"( result )
+         :
+         : );
+    return result;
+}
+
+static __forceinline__ __device__ float optixHitObjectGetRayTime()
+{
+    float result;
+    asm volatile(
+         "call (%0), _optix_hitobject_get_ray_time,"
+         "();"
+         : "=f"( result )
+         :
+         : );
+    return result;
+}
+
+static __forceinline__ __device__ unsigned int optixHitObjectGetAttribute_0()
+{
+    unsigned int ret;
+    asm volatile(
+         "call (%0), _optix_hitobject_get_attribute,"
+         "(%1);"
+         : "=r"( ret )
+         : "r"( 0 )
+         : );
+    return ret;
+}
+
+static __forceinline__ __device__ unsigned int optixHitObjectGetAttribute_1()
+{
+    unsigned int ret;
+    asm volatile(
+         "call (%0), _optix_hitobject_get_attribute,"
+         "(%1);"
+         : "=r"( ret )
+         : "r"( 1 )
+         : );
+    return ret;
+}
+
+static __forceinline__ __device__ unsigned int optixHitObjectGetAttribute_2()
+{
+    unsigned int ret;
+    asm volatile(
+         "call (%0), _optix_hitobject_get_attribute,"
+         "(%1);"
+         : "=r"( ret )
+         : "r"( 2 )
+         : );
+    return ret;
+}
+
+static __forceinline__ __device__ unsigned int optixHitObjectGetAttribute_3()
+{
+    unsigned int ret;
+    asm volatile(
+         "call (%0), _optix_hitobject_get_attribute,"
+         "(%1);"
+         : "=r"( ret )
+         : "r"( 3 )
+         : );
+    return ret;
+}
+
+static __forceinline__ __device__ unsigned int optixHitObjectGetAttribute_4()
+{
+    unsigned int ret;
+    asm volatile(
+         "call (%0), _optix_hitobject_get_attribute,"
+         "(%1);"
+         : "=r"( ret )
+         : "r"( 4 )
+         : );
+    return ret;
+}
+
+static __forceinline__ __device__ unsigned int optixHitObjectGetAttribute_5()
+{
+    unsigned int ret;
+    asm volatile(
+         "call (%0), _optix_hitobject_get_attribute,"
+         "(%1);"
+         : "=r"( ret )
+         : "r"( 5 )
+         : );
+    return ret;
+}
+
+static __forceinline__ __device__ unsigned int optixHitObjectGetAttribute_6()
+{
+    unsigned int ret;
+    asm volatile(
+         "call (%0), _optix_hitobject_get_attribute,"
+         "(%1);"
+         : "=r"( ret )
+         : "r"( 6 )
+         : );
+    return ret;
+}
+
+static __forceinline__ __device__ unsigned int optixHitObjectGetAttribute_7()
+{
+    unsigned int ret;
+    asm volatile(
+         "call (%0), _optix_hitobject_get_attribute,"
+         "(%1);"
+         : "=r"( ret )
+         : "r"( 7 )
+         : );
+    return ret;
+}
+
+static __forceinline__ __device__ unsigned int optixHitObjectGetSbtRecordIndex()
+{
+    unsigned int result;
+    asm volatile(
+         "call (%0), _optix_hitobject_get_sbt_record_index,"
+         "();"
+         : "=r"( result )
+         :
+         : );
+    return result;
+}
+
+static __forceinline__ __device__ CUdeviceptr optixHitObjectGetSbtDataPointer()
+{
+    unsigned long long ptr;
+    asm volatile(
+         "call (%0), _optix_hitobject_get_sbt_data_pointer,"
+         "();"
+         : "=l"( ptr )
+         :
+         : );
+    return ptr;
 }
 
 static __forceinline__ __device__ void optixSetPayload_0( unsigned int p )
@@ -639,6 +1340,22 @@ static __forceinline__ __device__ void optixGetTriangleVertexData( OptixTraversa
          : );
 }
 
+static __forceinline__ __device__ void optixGetMicroTriangleVertexData( float3 data[3] )
+{
+    asm( "call (%0, %1, %2, %3, %4, %5, %6, %7, %8), _optix_get_microtriangle_vertex_data, "
+         "();"
+         : "=f"( data[0].x ), "=f"( data[0].y ), "=f"( data[0].z ), "=f"( data[1].x ), "=f"( data[1].y ),
+           "=f"( data[1].z ), "=f"( data[2].x ), "=f"( data[2].y ), "=f"( data[2].z )
+         : );
+}
+static __forceinline__ __device__ void optixGetMicroTriangleBarycentricsData( float2 data[3] )
+{
+  asm( "call (%0, %1, %2, %3, %4, %5), _optix_get_microtriangle_barycentrics_data, "
+       "();"
+       : "=f"( data[0].x ), "=f"( data[0].y ), "=f"( data[1].x ), "=f"( data[1].y ), "=f"( data[2].x ), "=f"( data[2].y )
+       : );
+}
+
 static __forceinline__ __device__ void optixGetLinearCurveVertexData( OptixTraversableHandle gas,
                                                                       unsigned int           primIdx,
                                                                       unsigned int           sbtGASIndex,
@@ -661,7 +1378,7 @@ static __forceinline__ __device__ void optixGetQuadraticBSplineVertexData( Optix
 {
     asm( "call (%0, %1, %2, %3,  %4, %5, %6, %7,  %8, %9, %10, %11), _optix_get_quadratic_bspline_vertex_data, "
          "(%12, %13, %14, %15);"
-         : "=f"( data[0].x ), "=f"( data[0].y ), "=f"( data[0].z ), "=f"( data[0].w ), 
+         : "=f"( data[0].x ), "=f"( data[0].y ), "=f"( data[0].z ), "=f"( data[0].w ),
            "=f"( data[1].x ), "=f"( data[1].y ), "=f"( data[1].z ), "=f"( data[1].w ),
            "=f"( data[2].x ), "=f"( data[2].y ), "=f"( data[2].z ), "=f"( data[2].w )
          : "l"( gas ), "r"( primIdx ), "r"( sbtGASIndex ), "f"( time )
@@ -677,7 +1394,7 @@ static __forceinline__ __device__ void optixGetCubicBSplineVertexData( OptixTrav
     asm( "call (%0, %1, %2, %3,  %4, %5, %6, %7,  %8, %9, %10, %11,  %12, %13, %14, %15), "
          "_optix_get_cubic_bspline_vertex_data, "
          "(%16, %17, %18, %19);"
-         : "=f"( data[0].x ), "=f"( data[0].y ), "=f"( data[0].z ), "=f"( data[0].w ), 
+         : "=f"( data[0].x ), "=f"( data[0].y ), "=f"( data[0].z ), "=f"( data[0].w ),
            "=f"( data[1].x ), "=f"( data[1].y ), "=f"( data[1].z ), "=f"( data[1].w ),
            "=f"( data[2].x ), "=f"( data[2].y ), "=f"( data[2].z ), "=f"( data[2].w ),
            "=f"( data[3].x ), "=f"( data[3].y ), "=f"( data[3].z ), "=f"( data[3].w )
@@ -699,6 +1416,52 @@ static __forceinline__ __device__ void optixGetCatmullRomVertexData( OptixTraver
            "=f"( data[2].z ), "=f"( data[2].w ), "=f"( data[3].x ), "=f"( data[3].y ), "=f"( data[3].z ), "=f"( data[3].w )
          : "l"( gas ), "r"( primIdx ), "r"( sbtGASIndex ), "f"( time )
          : );
+}
+
+static __forceinline__ __device__ void optixGetCubicBezierVertexData( OptixTraversableHandle gas,
+                                                                      unsigned int           primIdx,
+                                                                      unsigned int           sbtGASIndex,
+                                                                      float                  time,
+                                                                      float4                 data[4] )
+{
+    asm( "call (%0, %1, %2, %3,  %4, %5, %6, %7,  %8, %9, %10, %11,  %12, %13, %14, %15), "
+         "_optix_get_cubic_bezier_vertex_data, "
+         "(%16, %17, %18, %19);"
+         : "=f"( data[0].x ), "=f"( data[0].y ), "=f"( data[0].z ), "=f"( data[0].w ), "=f"( data[1].x ),
+           "=f"( data[1].y ), "=f"( data[1].z ), "=f"( data[1].w ), "=f"( data[2].x ), "=f"( data[2].y ),
+           "=f"( data[2].z ), "=f"( data[2].w ), "=f"( data[3].x ), "=f"( data[3].y ), "=f"( data[3].z ), "=f"( data[3].w )
+         : "l"( gas ), "r"( primIdx ), "r"( sbtGASIndex ), "f"( time )
+         : );
+}
+
+static __forceinline__ __device__ void optixGetRibbonVertexData( OptixTraversableHandle gas,
+                                                                 unsigned int           primIdx,
+                                                                 unsigned int           sbtGASIndex,
+                                                                 float                  time,
+                                                                 float4                 data[3] )
+{
+    asm( "call (%0, %1, %2, %3,  %4, %5, %6, %7,  %8, %9, %10, %11), _optix_get_ribbon_vertex_data, "
+         "(%12, %13, %14, %15);"
+         : "=f"( data[0].x ), "=f"( data[0].y ), "=f"( data[0].z ), "=f"( data[0].w ), "=f"( data[1].x ), "=f"( data[1].y ),
+           "=f"( data[1].z ), "=f"( data[1].w ), "=f"( data[2].x ), "=f"( data[2].y ), "=f"( data[2].z ), "=f"( data[2].w )
+         : "l"( gas ), "r"( primIdx ), "r"( sbtGASIndex ), "f"( time )
+         : );
+}
+
+static __forceinline__ __device__ float3 optixGetRibbonNormal( OptixTraversableHandle gas,
+                                                               unsigned int           primIdx,
+                                                               unsigned int           sbtGASIndex,
+                                                               float                  time,
+                                                               float2                 ribbonParameters )
+{
+    float3 normal;
+    asm( "call (%0, %1, %2), _optix_get_ribbon_normal, "
+         "(%3, %4, %5, %6, %7, %8);"
+         : "=f"( normal.x ), "=f"( normal.y ), "=f"( normal.z )
+         : "l"( gas ), "r"( primIdx ), "r"( sbtGASIndex ), "f"( time ),
+           "f"( ribbonParameters.x ), "f"( ribbonParameters.y )
+         : );
+    return normal;
 }
 
 static __forceinline__ __device__ void optixGetSphereData( OptixTraversableHandle gas,
@@ -1228,9 +1991,33 @@ static __forceinline__ __device__ bool optixIsTriangleBackFaceHit()
     return optixGetHitKind() == OPTIX_HIT_KIND_TRIANGLE_BACK_FACE;
 }
 
+static __forceinline__ __device__ bool optixIsDisplacedMicromeshTriangleHit()
+{
+    return optixGetPrimitiveType( optixGetHitKind() ) == OPTIX_PRIMITIVE_TYPE_DISPLACED_MICROMESH_TRIANGLE;
+}
+
+static __forceinline__ __device__ bool optixIsDisplacedMicromeshTriangleFrontFaceHit()
+{
+    return optixIsDisplacedMicromeshTriangleHit() && optixIsFrontFaceHit();
+}
+
+static __forceinline__ __device__ bool optixIsDisplacedMicromeshTriangleBackFaceHit()
+{
+    return optixIsDisplacedMicromeshTriangleHit() && optixIsBackFaceHit();
+}
+
 static __forceinline__ __device__ float optixGetCurveParameter()
 {
-    return __int_as_float( optixGetAttribute_0() );
+    float f0;
+    asm( "call (%0), _optix_get_curve_parameter, ();" : "=f"(f0) : );
+    return f0;
+}
+
+static __forceinline__ __device__ float2 optixGetRibbonParameters()
+{
+    float f0, f1;
+    asm( "call (%0, %1), _optix_get_ribbon_parameters, ();" : "=f"( f0 ), "=f"( f1 ) : );
+    return make_float2( f0, f1 );
 }
 
 static __forceinline__ __device__ float2 optixGetTriangleBarycentrics()
@@ -1400,50 +2187,6 @@ static __forceinline__ __device__ unsigned int optixGetExceptionDetail_7()
 
 #undef OPTIX_DEFINE_optixGetExceptionDetail_BODY
 
-static __forceinline__ __device__ OptixTraversableHandle optixGetExceptionInvalidTraversable()
-{
-    unsigned long long handle;
-    asm( "call (%0), _optix_get_exception_invalid_traversable, ();" : "=l"( handle ) : );
-    return (OptixTraversableHandle)handle;
-}
-
-static __forceinline__ __device__ int optixGetExceptionInvalidSbtOffset()
-{
-    int s0;
-    asm( "call (%0), _optix_get_exception_invalid_sbt_offset, ();" : "=r"( s0 ) : );
-    return s0;
-}
-
-static __forceinline__ __device__ OptixInvalidRayExceptionDetails optixGetExceptionInvalidRay()
-{
-    float rayOriginX, rayOriginY, rayOriginZ, rayDirectionX, rayDirectionY, rayDirectionZ, tmin, tmax, rayTime;
-    asm( "call (%0, %1, %2, %3, %4, %5, %6, %7, %8), _optix_get_exception_invalid_ray, ();"
-         : "=f"( rayOriginX ), "=f"( rayOriginY ), "=f"( rayOriginZ ), "=f"( rayDirectionX ), "=f"( rayDirectionY ),
-           "=f"( rayDirectionZ ), "=f"( tmin ), "=f"( tmax ), "=f"( rayTime )
-         : );
-    OptixInvalidRayExceptionDetails ray;
-    ray.origin    = make_float3( rayOriginX, rayOriginY, rayOriginZ );
-    ray.direction = make_float3( rayDirectionX, rayDirectionY, rayDirectionZ );
-    ray.tmin      = tmin;
-    ray.tmax      = tmax;
-    ray.time      = rayTime;
-    return ray;
-}
-
-static __forceinline__ __device__ OptixParameterMismatchExceptionDetails optixGetExceptionParameterMismatch()
-{
-    unsigned int expected, actual, sbtIdx;
-    unsigned long long calleeName;
-    asm(
-        "call (%0, %1, %2, %3), _optix_get_exception_parameter_mismatch, ();"
-        : "=r"(expected), "=r"(actual), "=r"(sbtIdx), "=l"(calleeName) : );
-    OptixParameterMismatchExceptionDetails details;
-    details.expectedParameterCount = expected;
-    details.passedArgumentCount = actual;
-    details.sbtIndex = sbtIdx;
-    details.callableName = (char*)calleeName;
-    return details;
-}
 
 static __forceinline__ __device__ char* optixGetExceptionLineInfo()
 {
@@ -1471,7 +2214,6 @@ static __forceinline__ __device__ ReturnT optixContinuationCall( unsigned int sb
     funcT call  = ( funcT )( func );
     return call( args... );
 }
-#endif
 
 static __forceinline__ __device__ uint4 optixTexFootprint2D( unsigned long long tex, unsigned int texInfo, float x, float y, unsigned int* singleMipLevel )
 {
@@ -1532,3 +2274,5 @@ optixTexFootprint2DLod( unsigned long long tex, unsigned int texInfo, float x, f
         : );
     return result;
 }
+
+#endif // OPTIX_OPTIX_DEVICE_IMPL_H
