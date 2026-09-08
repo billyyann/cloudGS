@@ -70,6 +70,10 @@ static __device__ __inline__ void trace(
     // 所有奇数寄存器初始化：存储相交距离，先把无穷远浮点数无损转为uint32赋值
     r1 = r3 = r5 = r7 = r9 = r11 = r13 = r15 = r17 = r19 = r21 = r23 = r25 = r27 = r29 = r31 = __float_as_int(RayHit::InfiniteDistance);
 
+#if defined(ATM_PAYLOAD_WORDS) && (ATM_PAYLOAD_WORDS < 32)
+    (void)tmin;
+    (void)tmax;
+#else
     // Trace the ray against our scene hierarchy
     optixTrace(params.handle, ray.origin, ray.direction,
                tmin,                     // Min intersection distance
@@ -82,6 +86,7 @@ static __device__ __inline__ void trace(
                0, // missSBTIndex -- See SBT discussion
                r0, r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11, r12, r13, r14, r15,
                r16, r17, r18, r19, r20, r21, r22, r23, r24, r25, r26, r27, r28, r29, r30, r31);
+#endif
 
     rayPayload[0].particleId  = r0;
     rayPayload[0].distance    = __uint_as_float(r1);

@@ -140,6 +140,7 @@ protected:
         unsigned long long lastRaygenSetupCycles;
         float lastRaygenSetupMs;
         int smClockRateKHz;
+        CUdeviceptr atmBounceCycles;
     }* _state;  // 声明指向State结构体的指针 _state，通常在堆上动态分配（cudaMallocManaged或new）
 
     std::vector<std::string> generateDefines(

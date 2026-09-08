@@ -9,6 +9,7 @@ import argparse
 import math
 import os
 import sys
+import time
 from types import SimpleNamespace
 
 import numpy as np
@@ -321,6 +322,14 @@ def main():
     p.add_argument("--ply", default=os.path.join(ROOT, "scenes/mountain_gs/mountain_gs.ply"))
     p.add_argument("--outdir", default=os.path.join(ROOT, "scenes/mountain_gs"))
     p.add_argument("--res", type=int, default=512)
+    p.add_argument(
+        "--film",
+        nargs=2,
+        type=int,
+        metavar=("W", "H"),
+        default=None,
+        help="override perspective film size (default mountain/above=1280x720)",
+    )
     p.add_argument("--spp", type=int, default=16)
     p.add_argument("--htcp-bin", default=os.path.join(ROOT, "scenes/mountain_gs/dzvar_voxels.bin"))
     p.add_argument("--height", type=float, default=6400.0, help="ortho sensor height meters (htrdr DZVAR_ortho)")
@@ -339,9 +348,10 @@ def main():
     )
     p.add_argument(
         "--camera",
-        choices=("ortho", "mountain"),
+        choices=("ortho", "mountain", "above"),
         default="ortho",
-        help="ortho = desert_ortho nadir 6.4 km; mountain = mountain.sh perspective",
+        help="ortho = desert_ortho nadir 6.4 km; mountain = mountain.sh (z=422 look up); "
+        "above = z=4500 look down through Cu at the mountain",
     )
     p.add_argument(
         "--ground",
@@ -357,8 +367,34 @@ def main():
         default=None,
         help="trace a pixel window only (does not overwrite gpu_xyz_*.npy)",
     )
+    p.add_argument(
+        "--profile",
+        action="store_true",
+        help="print host/OptiX wall times per chunk (set PTIR_PROFILE_RAYGEN=1 for CUDA events)",
+    )
+    p.add_argument(
+        "--batch-cloud",
+        action="store_true",
+        help="compact sky vs cloud AABB into two optixLaunch (ATM_BATCH_CLOUD=1)",
+    )
+    p.add_argument(
+        "--brick",
+        type=int,
+        default=8,
+        help="Woodcock majorant brick edge (8 baseline; 4 is tighter kmax)",
+    )
+    p.add_argument(
+        "--cont-stack",
+        type=int,
+        default=None,
+        help="OptiX continuation stack bytes; 0=computed, default=16384 floor. Set before pipeline create.",
+    )
     args = p.parse_args()
     os.makedirs(args.outdir, exist_ok=True)
+    if args.batch_cloud:
+        os.environ["ATM_BATCH_CLOUD"] = "1"
+    if args.cont_stack is not None:
+        os.environ["ATM_CONT_STACK"] = str(int(args.cont_stack))
 
     import mountain_gs_scene as mgs
 
@@ -446,7 +482,7 @@ def main():
         voxel_temp=temp,
         voxel_origin=tuple(origin.tolist()),
         voxel_spacing=tuple(np.asarray(spacing, np.float32).tolist()),
-        brick=8,
+        brick=int(args.brick),
         gas_z=gas["z"],
         gas_ka=gas_ka,
         gas_ks=gas_ks,
@@ -539,37 +575,80 @@ def main():
     nchunk = (args.spp + chunk - 1) // chunk
     from threedgptir_tracer.atmosphere import trace_atmosphere
 
-    if args.camera == "mountain":
-        w, h = 1280, 720
-        pos = np.array([10245.37, 615.02, 422.34], np.float32)
-        tgt = np.array([-2977.39, 6829.40, 842.40], np.float32)
-        up = np.array([0.0, 0.0, 1.0], np.float32)
-        print(f"GPU PTIR mountain.sh persp {w}x{h} spp={args.spp} fov=30 (chunks of {chunk})")
-    else:
+    if args.camera == "ortho":
         w = h = args.res
         center = np.array([3200.0, 3200.0, 80000.0], np.float32)
         look = np.array([0.0, 0.0, -1.0], np.float32)
         up = np.array([0.0, 1.0, 0.0], np.float32)
+        pos = tgt = None
         print(f"GPU PTIR ortho {w}x{h} spp={args.spp} (chunks of {chunk})")
+    elif args.camera == "above":
+        # ARMCu cloud ~1.02–2.27 km. Camera above cloud top, look down through
+        # the slab at mountain.obj (z≤700). mountain.sh pose is unchanged.
+        w, h = 1280, 720
+        if args.film is not None:
+            w, h = int(args.film[0]), int(args.film[1])
+        pos = np.array([5000.0, 9000.0, 4500.0], np.float32)
+        tgt = np.array([4000.0, 3200.0, 400.0], np.float32)
+        up = np.array([0.0, 0.0, 1.0], np.float32)
+        look = tgt - pos
+        look = look / np.linalg.norm(look)
+        print(
+            f"GPU PTIR above-cloud persp {w}x{h} spp={args.spp} fov=30 "
+            f"pos={pos.tolist()} tgt={tgt.tolist()} dir.z={float(look[2]):.3f} "
+            f"(chunks of {chunk})"
+        )
+    else:
+        w, h = 1280, 720
+        if args.film is not None:
+            w, h = int(args.film[0]), int(args.film[1])
+        pos = np.array([10245.37, 615.02, 422.34], np.float32)
+        tgt = np.array([-2977.39, 6829.40, 842.40], np.float32)
+        up = np.array([0.0, 0.0, 1.0], np.float32)
+        print(f"GPU PTIR mountain.sh persp {w}x{h} spp={args.spp} fov=30 (chunks of {chunk})")
 
+    t_loop0 = time.perf_counter()
+    prof = {"rays": 0.0, "trace": 0.0, "d2h": 0.0, "optix_ms": 0.0, "nray": 0}
     for c in range(nchunk):
         n = min(chunk, args.spp - c * chunk)
-        if args.camera == "mountain":
-            ori, drc = make_persp_rays(w, h, pos, tgt, up, 30.0, n, device)
-        else:
+        t0 = time.perf_counter()
+        if args.camera == "ortho":
             ori, drc = make_ortho_rays(w, h, center, args.height, up, look, n, device)
+        else:
+            ori, drc = make_persp_rays(w, h, pos, tgt, up, 30.0, n, device)
         if args.crop is not None:
             x0, y0, x1, y1 = args.crop
             ori = ori[:, y0:y1, x0:x1].contiguous()
             drc = drc[:, y0:y1, x0:x1].contiguous()
+        torch.cuda.synchronize()
+        t1 = time.perf_counter()
         out = trace_atmosphere(tracer, ori, drc, buffers, frame_number=c)
+        torch.cuda.synchronize()
+        t2 = time.perf_counter()
+        optix_ms = 0.0
+        if hasattr(tracer, "get_last_optix_launch_ms"):
+            optix_ms = float(tracer.get_last_optix_launch_ms())
         rgb = out[10]  # ray_pbr (full CIE XYZ)
         first = out[11]  # ray_light: first volume NEE only
         part = rgb.float().mean(dim=0).cpu().numpy()
         part_first = first.float().mean(dim=0).cpu().numpy()
+        t3 = time.perf_counter()
         acc = part if acc is None else acc + part
         acc_first = part_first if acc_first is None else acc_first + part_first
-        print(f"  chunk {c+1}/{nchunk} mean={part.mean():.4f}")
+        nray = int(ori.shape[0] * ori.shape[1] * ori.shape[2])
+        prof["rays"] += t1 - t0
+        prof["trace"] += t2 - t1
+        prof["d2h"] += t3 - t2
+        prof["optix_ms"] += optix_ms
+        prof["nray"] += nray
+        extra = ""
+        if args.profile or optix_ms > 0.0:
+            extra = (
+                f"  rays={t1-t0:.2f}s  optixLaunch={optix_ms/1000.0:.2f}s  "
+                f"trace_wall={t2-t1:.2f}s  d2h={t3-t2:.2f}s  "
+                f"{nray/max(t2-t1,1e-9):.0f} rays/s"
+            )
+        print(f"  chunk {c+1}/{nchunk} mean={part.mean():.4f}{extra}")
         if c == 0:
             hit = out[2][..., 0].float().cpu().numpy().reshape(-1)
             rad = rgb.float().mean(dim=-1).cpu().numpy().reshape(-1)
@@ -590,6 +669,11 @@ def main():
             for k, name in names.items():
                 ev_parts.append(f"{name}={float((ev_flat == k).mean()):.3f}")
             print("  diag first_event", " ".join(ev_parts))
+            dz = drc[..., 2].float().cpu().numpy().reshape(-1)
+            print(
+                f"  diag cam dir.z down={float((dz < 0).mean()):.3f} "
+                f"mean={float(dz.mean()):.3f} p10/p90={np.percentile(dz, [10, 90])}"
+            )
             if args.camera == "mountain":
                 ntop = max(1, ev.shape[-2] // 5)
                 top_ev = ev[..., :ntop, :].reshape(-1)
@@ -667,6 +751,16 @@ def main():
             )
         del ori, drc, out, rgb
         torch.cuda.empty_cache()
+    loop_s = time.perf_counter() - t_loop0
+    nray = max(prof["nray"], 1)
+    print(
+        f"profile loop={loop_s:.1f}s  rays={prof['rays']:.1f}s  "
+        f"optixLaunch={prof['optix_ms']/1000.0:.1f}s  trace_wall={prof['trace']:.1f}s  "
+        f"d2h={prof['d2h']:.1f}s  rays={nray}  "
+        f"{nray/max(prof['trace'],1e-9):.0f} camera-rays/s  "
+        f"{1e3*prof['trace']/nray:.3f} ms/camera-ray  "
+        f"(CIE split: 3 channels as launch depth)"
+    )
     img = acc / float(nchunk)
     img_first = None if acc_first is None else acc_first / float(nchunk)
     if args.crop is not None:
@@ -675,12 +769,12 @@ def main():
             f"crop {x0},{y0}-{x1},{y1} max_bounces={args.max_bounces} "
             f"GPU Y mean/p50={float(img[...,1].mean()):.3f}/{float(np.median(img[...,1])):.3f}"
         )
-        htrdr_txt = (
-            os.path.join(args.outdir, "htrdr_ref_mountain_1280x720x256.txt")
-            if args.camera == "mountain"
-            else os.path.join(args.outdir, "htrdr_ref_ortho_512x512x256.txt")
-        )
-        if os.path.isfile(htrdr_txt):
+        htrdr_txt = None
+        if args.camera == "mountain":
+            htrdr_txt = os.path.join(args.outdir, "htrdr_ref_mountain_1280x720x256.txt")
+        elif args.camera == "ortho":
+            htrdr_txt = os.path.join(args.outdir, "htrdr_ref_ortho_512x512x256.txt")
+        if htrdr_txt and os.path.isfile(htrdr_txt):
             href = np.loadtxt(htrdr_txt, skiprows=1, dtype=np.float64).reshape(-1, 8)
             hy = href[:, 2].reshape(h, w)[y0:y1, x0:x1]
             hx = href[:, 0].reshape(h, w)[y0:y1, x0:x1]
@@ -741,13 +835,13 @@ def main():
             float(np.median(Y)),
             y995,
         )
-        htrdr_txt = (
-            os.path.join(args.outdir, "htrdr_ref_mountain_1280x720x256.txt")
-            if args.camera == "mountain"
-            else os.path.join(args.outdir, "htrdr_ref_ortho_512x512x256.txt")
-        )
+        htrdr_txt = None
+        if args.camera == "mountain":
+            htrdr_txt = os.path.join(args.outdir, "htrdr_ref_mountain_1280x720x256.txt")
+        elif args.camera == "ortho":
+            htrdr_txt = os.path.join(args.outdir, "htrdr_ref_ortho_512x512x256.txt")
         white = None
-        if os.path.isfile(htrdr_txt):
+        if htrdr_txt and os.path.isfile(htrdr_txt):
             href = np.loadtxt(htrdr_txt, skiprows=1, dtype=np.float64)
             href = href.reshape(-1, 8)
             href_y995 = float(np.percentile(href[:, 2], 99.5))
@@ -781,6 +875,8 @@ def main():
     tag = ""
     if args.camera == "mountain":
         tag += "_mountain"
+    elif args.camera == "above":
+        tag += "_above"
     if args.ground == "mesh":
         tag += "_mesh"
     if args.no_clouds:
@@ -797,17 +893,19 @@ def main():
         Image.fromarray(rgb8).save(keep_gpu)
 
     spk = os.path.join(ROOT, "htrdr-atmosphere-spk/htrdr-Atmosphere-Starter-Pack-0.8.0")
+    orig = None
+    left_label = ""
     if args.camera == "mountain":
         orig = os.path.join(args.outdir, "htrdr_ref_mountain_1280x720x256.png")
         if not os.path.isfile(orig):
             orig = os.path.join(spk, "test_320x240x16.ppm")
         left_label = "htrdr mountain.sh 1280x720 spp256  (frozen png)"
-    else:
+    elif args.camera == "ortho":
         orig = os.path.join(args.outdir, "htrdr_ref_ortho_512x512x256.png")
         if not os.path.isfile(orig):
             orig = os.path.join(spk, "ortho_512x512x32.ppm")
         left_label = "htrdr ortho 512x512 spp256  (frozen png)"
-    if os.path.isfile(orig):
+    if orig and os.path.isfile(orig):
         oim = Image.open(orig).convert("RGB").resize((w, h), Image.NEAREST)
         canvas = Image.new("RGB", (w * 2 + 24, h + 48), (18, 18, 18))
         canvas.paste(oim, (8, 40))

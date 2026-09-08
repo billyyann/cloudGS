@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#define ATM_KERNEL_REV 42
+#define ATM_KERNEL_REV 55
 #include <3dgptir/pipelineParameters.h>
 #include <3dgptir/kernels/cuda/sampler.cuh>
 // clang-format on
@@ -25,7 +25,7 @@ __constant__ PipelineParameters params;
 #include <3dgptir/kernels/cuda/environment.cuh>
 #include <3dgptir/kernels/cuda/pathTracer.cuh>
 #include <3dgptir/kernels/cuda/atmospherePathTracer.cuh>
-/* NVRTC: ATM_KERNEL_REV 42 analog DDA walks to tmax (periodic XY). */
+/* NVRTC: ATM_KERNEL_REV 55 OptiX 8 SER bin mesh/volume/skip. */
 
 // Ablation early-return stages (only with ENABLE_RAYGEN_SETUP_PROFILING).
 // Official release: do not define ENABLE_RAYGEN_SETUP_PROFILING.
@@ -96,7 +96,13 @@ __constant__ PipelineParameters params;
     // - 重要性采样（BRDF 采样）
     // initFromLaunch 使用像素坐标和帧号初始化随机种子
     Sampler sampler;
-    sampler.initFromLaunch(idx, params.frameNumber);
+    uint3 seedIdx = idx;
+    if (params.raySeedFromBuffer) {
+        seedIdx.x = static_cast<unsigned int>(params.raySeedIdx[idx.z][idx.y][idx.x][0]);
+        seedIdx.y = static_cast<unsigned int>(params.raySeedIdx[idx.z][idx.y][idx.x][1]);
+        seedIdx.z = static_cast<unsigned int>(params.raySeedIdx[idx.z][idx.y][idx.x][2]);
+    }
+    sampler.initFromLaunch(seedIdx, params.frameNumber);
 #ifdef ENABLE_RAYGEN_SETUP_PROFILING
     if (params.raygenSetupCycleCounter != nullptr) {
         atomicAdd(params.raygenSetupCycleCounter, clock64() - setupT0);
@@ -253,6 +259,10 @@ extern "C" __global__ void __intersection__is() {
     }
 
 extern "C" __global__ void __anyhit__ah() {
+#if defined(ATM_PAYLOAD_WORDS) && (ATM_PAYLOAD_WORDS < 32)
+    /* Slim atmosphere pipeline: GS anyhit kept in source but not used. */
+    optixIgnoreIntersection();
+#else
     RayHit hit = RayHit{optixPrimitiveIndex(), optixGetRayTmax()};
 
     if (hit.distance < __uint_as_float(optixGetPayload_31())) {
@@ -278,6 +288,7 @@ extern "C" __global__ void __anyhit__ah() {
             optixIgnoreIntersection();
         }
     }
+#endif
 }
 
 /* Mesh Triangle GAS closest-hit. Payload: t, kind=1, primId. */

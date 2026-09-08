@@ -418,6 +418,9 @@ enum AtmHitgroupSbt {
     /* htrdr -R: repeating mesh tile AABB in world XY (and Z slab). Zero extent = no wrap. */
     float meshRepeatLow[3];
     float meshRepeatUpp[3];
+    /* Compact cloud/sky launches: seed RNG from original film (x,y,z), not launch index. */
+    int raySeedFromBuffer;
+    PackedTensorAccessor32<int32_t, 4> raySeedIdx;
 
     // ============================================================
     // 7. 帧信息
@@ -547,6 +550,11 @@ enum AtmHitgroupSbt {
             rayToWorld[2].x * direction.x + rayToWorld[2].y * direction.y + rayToWorld[2].z * direction.z);
     }
 #endif
+
+    /* Append only. Bounce-section cycles: mesh, woodcock, gas, nee, path. Null = off. */
+    unsigned long long* atmBounceCycles;
+    /* OptiX 8 SER: bin mesh / volume / skip warps before mesh optixTrace. */
+    int atmSerReorder;
 };
 
 /**

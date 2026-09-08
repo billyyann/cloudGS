@@ -115,6 +115,10 @@ struct AtmParams {
     /* Native HTCP Z faces [nz+1]. Null = uniform g->dz. Do not put this on
      * AtmVoxelGrid (would shift gas/mesh/sun). */
     const float* voxel_z_iface;
+    /* 1 = one CIE channel per launch index (depth = 3*spp, z = ch*spp + s). */
+    int cie_split_launch;
+    /* Original film spp (before CIE-split repeat). Compact launches have z=1. */
+    int cie_spp;
 };
 
 #ifdef __cplusplus

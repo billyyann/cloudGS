@@ -364,6 +364,18 @@ OptixTracer::OptixTracer(
         // device context
         CUcontext cuCtx = 0; // zero means take the current context
         OPTIX_CHECK(optixDeviceContextCreate(cuCtx, &options, &_state->context));
+        unsigned int serFlags = 0;
+        OPTIX_CHECK(optixDeviceContextGetProperty(
+            _state->context,
+            OPTIX_DEVICE_PROPERTY_SHADER_EXECUTION_REORDERING,
+            &serFlags,
+            sizeof(serFlags)));
+        std::fprintf(stderr, "[atm] OptiX %d SER flags=0x%x (%s)\n",
+                     OPTIX_VERSION,
+                     serFlags,
+                     (serFlags & OPTIX_DEVICE_PROPERTY_SHADER_EXECUTION_REORDERING_FLAG_STANDARD)
+                         ? "hardware reorder"
+                         : "reorder is no-op");
     }
 
     _state->particleRadianceSphDegree     = particleRadianceSphDegree;
@@ -385,6 +397,7 @@ OptixTracer::OptixTracer(
         CUDA_CHECK(cudaDeviceGetAttribute(&clockRateKHz, cudaDevAttrClockRate, 0));
         _state->smClockRateKHz = clockRateKHz;
     }
+    _state->atmBounceCycles = 0;
     if (_state->enableRaygenSetupProfiling) {
         CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&_state->raygenSetupCycleCounter),
                               sizeof(unsigned long long)));
@@ -405,15 +418,21 @@ OptixTracer::OptixTracer(
     _state->moduleTracingFwd   = nullptr;
     _state->pipelineTracingFwd = nullptr;
     _state->sbtTracingFwd      = {};
-    //调用 createPipeline 函数，编译着色器源码、创建 OptiX 模块、链接程序组、生成着色器绑定表，最终建立一条完整的光线追踪管线。
-    createPipeline(_state->context, path, path, cuda_path, defines, pipeline + "Optix",
-                   sharedFlags | PipelineFlag_HasRG | PipelineFlag_HasAH | PipelineFlag_AtmAccel,
-                   &_state->moduleTracingFwd, &_state->pipelineTracingFwd, _state->sbtTracingFwd, 32);
+    /* Atmosphere fwd: 7-payload mesh/vol closest-hit. No GS anyhit in this pipeline.
+     * Pure PTIR backward stays 32-payload + HasAH. */
+    std::vector<std::string> definesFwd = defines;
+    definesFwd.emplace_back("-DATM_PAYLOAD_WORDS=7");
+    createPipeline(_state->context, path, path, cuda_path, definesFwd, pipeline + "Optix",
+                   sharedFlags | PipelineFlag_HasRG | PipelineFlag_AtmAccel,
+                   &_state->moduleTracingFwd, &_state->pipelineTracingFwd, _state->sbtTracingFwd, 7);
 
     _state->moduleTracingBwd   = nullptr;
     _state->pipelineTracingBwd = nullptr;
     _state->sbtTracingBwd      = {};
-    createPipeline(_state->context, path, path, cuda_path, defines, backwardPipeline + "Optix", sharedFlags | PipelineFlag_HasRG | PipelineFlag_HasAH,
+    std::vector<std::string> definesBwd = defines;
+    definesBwd.emplace_back("-DATM_PAYLOAD_WORDS=32");
+    createPipeline(_state->context, path, path, cuda_path, definesBwd, backwardPipeline + "Optix",
+                   sharedFlags | PipelineFlag_HasRG | PipelineFlag_HasAH,
                    &_state->moduleTracingBwd, &_state->pipelineTracingBwd, _state->sbtTracingBwd, 32);
 }
 
@@ -461,6 +480,10 @@ OptixTracer::~OptixTracer(void) {
     if (_state->raygenSetupCycleCounter) {
         CUDA_CHECK(cudaFree(reinterpret_cast<void*>(_state->raygenSetupCycleCounter)));
         _state->raygenSetupCycleCounter = 0;
+    }
+    if (_state->atmBounceCycles) {
+        CUDA_CHECK(cudaFree(reinterpret_cast<void*>(_state->atmBounceCycles)));
+        _state->atmBounceCycles = 0;
     }
     CUDA_CHECK(cudaFree(reinterpret_cast<void*>(_state->gasBufferTmp)));
     OPTIX_CHECK(optixDeviceContextDestroy(_state->context));
@@ -565,7 +588,7 @@ void OptixTracer::createPipeline(
 
         // ---------- 1.6 从 PTX 创建 OptiX 模块 ----------
         // 这是 OptiX 的核心步骤：将 PTX 代码加载到 GPU，生成可执行的机器码
-        OPTIX_CHECK_LOG(optixModuleCreateFromPTX(
+        OPTIX_CHECK_LOG(optixModuleCreate(
             context,                      // OptiX 上下文
             &module_compile_options,      // 模块编译选项
             &pipeline_compile_options,    // 管线编译选项
@@ -730,7 +753,6 @@ void OptixTracer::createPipeline(
         // ---------- 3.1 设置管线链接选项 ----------
         OptixPipelineLinkOptions pipeline_link_options = {};
         pipeline_link_options.maxTraceDepth = max_trace_depth;
-        pipeline_link_options.debugLevel = OPTIX_COMPILE_DEBUG_LEVEL_DEFAULT;
 
         // ---------- 3.2 创建管线 ----------
         // 这是链接步骤：将程序组组合成可执行的管线
@@ -751,7 +773,7 @@ void OptixTracer::createPipeline(
         OptixStackSizes stack_sizes = {};
         for (auto& prog_group : program_groups) {
             // 累加每个程序组的栈使用量
-            OPTIX_CHECK(optixUtilAccumulateStackSizes(prog_group, &stack_sizes));
+            OPTIX_CHECK(optixUtilAccumulateStackSizes(prog_group, &stack_sizes, *pipeline));
         }
 
         uint32_t direct_callable_stack_size_from_traversal;
@@ -767,20 +789,43 @@ void OptixTracer::createPipeline(
             &continuation_stack_size
         ));
         if (flags & PipelineFlag_AtmAccel) {
-            /* 8M-triangle mesh GAS + custom volume IS needs a deeper continuation stack. */
-            if (direct_callable_stack_size_from_traversal < 2048u) {
-                direct_callable_stack_size_from_traversal = 2048u;
+            const uint32_t computedTrav = direct_callable_stack_size_from_traversal;
+            const uint32_t computedState = direct_callable_stack_size_from_state;
+            const uint32_t computedCont = continuation_stack_size;
+            std::fprintf(stderr, "[atm] stack computed trav=%u state=%u cont=%u payload=%u\n",
+                         computedTrav, computedState, computedCont, numPayloadValues);
+            const char* contEnv = std::getenv("ATM_CONT_STACK");
+            int contOverride = -1;
+            if (contEnv && contEnv[0] != '\0') {
+                contOverride = std::atoi(contEnv);
             }
-            if (direct_callable_stack_size_from_state < 2048u) {
-                direct_callable_stack_size_from_state = 2048u;
+            if (contOverride == 0) {
+                /* Drop 16K continuation floor; still floor trav/state for mesh GAS. */
+                if (direct_callable_stack_size_from_traversal < 2048u) {
+                    direct_callable_stack_size_from_traversal = 2048u;
+                }
+                if (direct_callable_stack_size_from_state < 2048u) {
+                    direct_callable_stack_size_from_state = 2048u;
+                }
+            } else if (contOverride > 0) {
+                continuation_stack_size = static_cast<uint32_t>(contOverride);
+            } else {
+                /* 8M-triangle mesh GAS + custom volume IS needs a deeper continuation stack. */
+                if (direct_callable_stack_size_from_traversal < 2048u) {
+                    direct_callable_stack_size_from_traversal = 2048u;
+                }
+                if (direct_callable_stack_size_from_state < 2048u) {
+                    direct_callable_stack_size_from_state = 2048u;
+                }
+                if (continuation_stack_size < 16384u) {
+                    continuation_stack_size = 16384u;
+                }
             }
-            if (continuation_stack_size < 16384u) {
-                continuation_stack_size = 16384u;
-            }
-            std::fprintf(stderr, "[atm] pipeline stack trav=%u state=%u cont=%u\n",
+            std::fprintf(stderr, "[atm] pipeline stack trav=%u state=%u cont=%u (ATM_CONT_STACK=%s)\n",
                          direct_callable_stack_size_from_traversal,
                          direct_callable_stack_size_from_state,
-                         continuation_stack_size);
+                         continuation_stack_size,
+                         contEnv ? contEnv : "default");
         }
 
         // ---------- 3.4 设置管线栈大小 ----------
@@ -2032,6 +2077,50 @@ void OptixTracer::buildAtmosphereAccel(
     std::fprintf(stderr, "[atm] IAS disabled (separate mesh GAS + vol GAS traces)\n");
 }
 
+/* CIE split launch writes one channel per z-slab: (X,0,0) / (0,Y,0) / (0,0,Z). */
+static torch::Tensor atmReduceCieXyz(const torch::Tensor& t, int64_t spp) {
+    auto x = t.slice(0, 0, spp).select(-1, 0);
+    auto y = t.slice(0, spp, 2 * spp).select(-1, 1);
+    auto z = t.slice(0, 2 * spp, 3 * spp).select(-1, 2);
+    return torch::stack({x, y, z}, -1).contiguous();
+}
+
+static torch::Tensor atmHitsAabbMask(
+    const torch::Tensor& ori,
+    const torch::Tensor& dir,
+    const float bmin[3],
+    const float bmax[3],
+    float tmax) {
+    auto o = ori.reshape({-1, 3});
+    auto d = dir.reshape({-1, 3});
+    auto t0 = torch::zeros({o.size(0)}, o.options());
+    auto t1 = torch::full({o.size(0)}, tmax, o.options());
+    auto miss = torch::zeros({o.size(0)}, torch::TensorOptions().dtype(torch::kBool).device(o.device()));
+    for (int a = 0; a < 3; ++a) {
+        auto oa = o.select(-1, a);
+        auto da = d.select(-1, a);
+        auto parallel = da.abs() < 1e-20;
+        auto outside = (oa < bmin[a]) | (oa > bmax[a]);
+        miss = miss | (parallel & outside);
+        auto ta = (bmin[a] - oa) / da;
+        auto tb = (bmax[a] - oa) / da;
+        auto lo = torch::minimum(ta, tb);
+        auto hi = torch::maximum(ta, tb);
+        t0 = torch::where(parallel, t0, torch::maximum(t0, lo));
+        t1 = torch::where(parallel, t1, torch::minimum(t1, hi));
+    }
+    return (t0 < t1) & miss.logical_not();
+}
+
+static torch::Tensor atmSeedFromLin(const torch::Tensor& lin, int64_t H, int64_t W) {
+    const int64_t HW = H * W;
+    auto z = torch::div(lin, HW, "trunc");
+    auto rem = lin - z * HW;
+    auto y = torch::div(rem, W, "trunc");
+    auto x = rem - y * W;
+    return torch::stack({x.to(torch::kInt32), y.to(torch::kInt32), z.to(torch::kInt32)}, -1);
+}
+
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
            torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
            torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
@@ -2090,18 +2179,29 @@ OptixTracer::traceAtmosphere(
 
     const torch::TensorOptions opts = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
 
-    torch::Tensor rayRad = torch::empty({rayOri.size(0), rayOri.size(1), rayOri.size(2), 3}, opts);
-    torch::Tensor rayDns = torch::empty({rayOri.size(0), rayOri.size(1), rayOri.size(2), 1}, opts);
-    torch::Tensor rayHit = torch::empty({rayOri.size(0), rayOri.size(1), rayOri.size(2), 2}, opts);
-    torch::Tensor rayHitSecondMoment = torch::empty({rayOri.size(0), rayOri.size(1), rayOri.size(2), 1}, opts);
-    torch::Tensor rayDepthDistortion = torch::empty({rayOri.size(0), rayOri.size(1), rayOri.size(2), 1}, opts);
-    torch::Tensor rayNrm = torch::empty({rayOri.size(0), rayOri.size(1), rayOri.size(2), 3}, opts);
-    torch::Tensor rayShadingNrm = torch::empty({rayOri.size(0), rayOri.size(1), rayOri.size(2), 3}, opts);
-    torch::Tensor rayMaterial = torch::empty({rayOri.size(0), rayOri.size(1), rayOri.size(2), 5}, opts);
-    torch::Tensor rayHitsCount = torch::zeros({rayOri.size(0), rayOri.size(1), rayOri.size(2), 1}, opts);
-    torch::Tensor rayPbr = torch::zeros({rayOri.size(0), rayOri.size(1), rayOri.size(2), 3}, opts);
-    torch::Tensor rayLight = torch::zeros({rayOri.size(0), rayOri.size(1), rayOri.size(2), 3}, opts);
-    torch::Tensor rayPbrComponents = torch::zeros({rayOri.size(0), rayOri.size(1), rayOri.size(2), 2, 3}, opts);
+    torch::Tensor rayOriLaunch = rayOri.contiguous();
+    torch::Tensor rayDirLaunch = rayDir.contiguous();
+    const int64_t spp0 = rayOriLaunch.size(0);
+    const bool cieSplit =
+        cieCdf.defined() && cieCdf.numel() >= 3 && cieRcpIntegral.defined() && cieRcpIntegral.numel() >= 3;
+    if (cieSplit) {
+        /* depth = 3*spp, z = ch*spp + s so a warp (x-major) stays on one CIE channel. */
+        rayOriLaunch = rayOriLaunch.repeat({3, 1, 1, 1}).contiguous();
+        rayDirLaunch = rayDirLaunch.repeat({3, 1, 1, 1}).contiguous();
+    }
+
+    torch::Tensor rayRad = torch::empty({rayOriLaunch.size(0), rayOriLaunch.size(1), rayOriLaunch.size(2), 3}, opts);
+    torch::Tensor rayDns = torch::empty({rayOriLaunch.size(0), rayOriLaunch.size(1), rayOriLaunch.size(2), 1}, opts);
+    torch::Tensor rayHit = torch::empty({rayOriLaunch.size(0), rayOriLaunch.size(1), rayOriLaunch.size(2), 2}, opts);
+    torch::Tensor rayHitSecondMoment = torch::empty({rayOriLaunch.size(0), rayOriLaunch.size(1), rayOriLaunch.size(2), 1}, opts);
+    torch::Tensor rayDepthDistortion = torch::empty({rayOriLaunch.size(0), rayOriLaunch.size(1), rayOriLaunch.size(2), 1}, opts);
+    torch::Tensor rayNrm = torch::empty({rayOriLaunch.size(0), rayOriLaunch.size(1), rayOriLaunch.size(2), 3}, opts);
+    torch::Tensor rayShadingNrm = torch::empty({rayOriLaunch.size(0), rayOriLaunch.size(1), rayOriLaunch.size(2), 3}, opts);
+    torch::Tensor rayMaterial = torch::empty({rayOriLaunch.size(0), rayOriLaunch.size(1), rayOriLaunch.size(2), 5}, opts);
+    torch::Tensor rayHitsCount = torch::zeros({rayOriLaunch.size(0), rayOriLaunch.size(1), rayOriLaunch.size(2), 1}, opts);
+    torch::Tensor rayPbr = torch::zeros({rayOriLaunch.size(0), rayOriLaunch.size(1), rayOriLaunch.size(2), 3}, opts);
+    torch::Tensor rayLight = torch::zeros({rayOriLaunch.size(0), rayOriLaunch.size(1), rayOriLaunch.size(2), 3}, opts);
+    torch::Tensor rayPbrComponents = torch::zeros({rayOriLaunch.size(0), rayOriLaunch.size(1), rayOriLaunch.size(2), 2, 3}, opts);
 
     const int64_t nPart = particleDensity.defined() ? particleDensity.size(0) : 0;
     torch::Tensor particleVisibility = torch::zeros({nPart, 1}, opts);
@@ -2133,8 +2233,8 @@ OptixTracer::traceAtmosphere(
 
     std::memcpy(&paramsHost.rayToWorld[0].x, rayToWorld.cpu().data_ptr<float>(), 3 * sizeof(float4));
 
-    paramsHost.rayOrigin = packed_accessor32<float, 4>(rayOri);
-    paramsHost.rayDirection = packed_accessor32<float, 4>(rayDir);
+    paramsHost.rayOrigin = packed_accessor32<float, 4>(rayOriLaunch);
+    paramsHost.rayDirection = packed_accessor32<float, 4>(rayDirLaunch);
 
     if (nPart > 0) {
         paramsHost.particleDensity = getPtr<const ParticleDensity>(particleDensity);
@@ -2173,7 +2273,13 @@ OptixTracer::traceAtmosphere(
 
     AtmParams& atm = paramsHost.atmosphere;
     atm.enabled = 1;
-    atm.gs_enabled = (nPart > 0 && _state->gasHandle != 0) ? 1 : 0;
+    atm.gs_enabled = 0;
+    {
+        const char* gsEnv = std::getenv("ATM_ENABLE_GS");
+        if (gsEnv && gsEnv[0] == '1' && nPart > 0 && _state->gasHandle != 0) {
+            atm.gs_enabled = 1;
+        }
+    }
     atm.spectral_mode = spectralMode;
     atm.wavelength_m = wavelength_m > 0.f ? wavelength_m : 5.0e-7f;
     atm.mie_omega = mieOmega;
@@ -2251,6 +2357,8 @@ OptixTracer::traceAtmosphere(
         atm.cie_rcp_integral[2] = rcp[2];
         atm.cie_enabled = (atm.cie_nbins > 0 && atm.cie_cdf != nullptr) ? 1 : 0;
     }
+    atm.cie_split_launch = (cieSplit && atm.cie_enabled) ? 1 : 0;
+    atm.cie_spp = cieSplit ? static_cast<int>(spp0) : 0;
     if (swLambdaLo.defined() && swGasKa.defined() && swGasKa.numel() > 0) {
         if (swGasKa.dim() == 3) {
             atm.sw_nbands = static_cast<int>(swGasKa.size(0));
@@ -2352,33 +2460,335 @@ OptixTracer::traceAtmosphere(
                      (double)b[0], (double)b[1], (double)b[2]);
     }
 
+    paramsHost.raySeedFromBuffer = 0;
+
     std::fprintf(stderr,
                  "[atm] sizeof PipelineParameters=%zu AtmParams=%zu sunL=%g mesh_ntri=%d voxels=%dx%dx%d gs=%d "
-                 "meshGAS=%d volGAS=%d ias=%d volPrims=%d gas_nlayers=%d gas_ks=%d path_tmax=%g z_iface=%d\n",
+                 "meshGAS=%d volGAS=%d ias=%d volPrims=%d gas_nlayers=%d gas_ks=%d path_tmax=%g z_iface=%d cie_split=%d launchZ=%d\n",
                  sizeof(PipelineParameters), sizeof(AtmParams), (double)atm.sun.radiance,
                  atm.mesh.ntri, atm.voxels.nx, atm.voxels.ny, atm.voxels.nz, atm.gs_enabled,
                  paramsHost.meshHandle != 0, paramsHost.volHandle != 0, paramsHost.meshVolIas != 0,
                  paramsHost.volPrimCount, atm.gas.nlayers, atm.gas.ks != nullptr, (double)atm.path_tmax,
-                 atm.voxel_z_iface != nullptr);
+                 atm.voxel_z_iface != nullptr, atm.cie_split_launch, (int)rayRad.size(0));
 
     reallocateParamsDevice(sizeof(paramsHost), cudaStream);
-    CUDA_CHECK(cudaMemcpyAsync(
-        reinterpret_cast<void*>(_state->paramsDevice),
-        &paramsHost,
-        sizeof(paramsHost),
-        cudaMemcpyHostToDevice,
-        cudaStream));
 
-    OPTIX_CHECK(optixLaunch(
-        _state->pipelineTracingFwd,
-        cudaStream,
-        _state->paramsDevice,
-        sizeof(PipelineParameters),
-        &_state->sbtTracingFwd,
-        rayRad.size(2),
-        rayRad.size(1),
-        rayRad.size(0)));
-    CUDA_CHECK_LAST();
+    const char* profileRaygenEnv = std::getenv("PTIR_PROFILE_RAYGEN");
+    const bool profileRaygen = profileRaygenEnv && profileRaygenEnv[0] == '1';
+    paramsHost.atmBounceCycles = nullptr;
+    paramsHost.atmSerReorder = 1;
+    {
+        const char* serEnv = std::getenv("ATM_SER");
+        if (serEnv && serEnv[0] == '0') {
+            paramsHost.atmSerReorder = 0;
+        }
+    }
+    std::fprintf(stderr, "[atm] atmSerReorder=%d\n", paramsHost.atmSerReorder);
+    if (profileRaygen) {
+        if (!_state->atmBounceCycles) {
+            CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&_state->atmBounceCycles),
+                                  26u * sizeof(unsigned long long)));
+        }
+        CUDA_CHECK(cudaMemsetAsync(
+            reinterpret_cast<void*>(_state->atmBounceCycles),
+            0,
+            26u * sizeof(unsigned long long),
+            cudaStream));
+        paramsHost.atmBounceCycles = reinterpret_cast<unsigned long long*>(_state->atmBounceCycles);
+    }
+    const char* batchEnv = std::getenv("ATM_BATCH_CLOUD");
+    const bool batchCloud = batchEnv && batchEnv[0] == '1' && atm.voxels.nx > 0;
+    const char* wfEnv = std::getenv("ATM_WAVEFRONT");
+    if (wfEnv && wfEnv[0] == '1') {
+        std::fprintf(stderr, "[atm] ATM_WAVEFRONT=1 ignored (A+B+C passed; path-compact would not shrink in-cloud 256-bounce walks)\n");
+    }
+
+    auto launchGrid = [&](torch::Tensor& o,
+                          torch::Tensor& d,
+                          torch::Tensor seed,
+                          torch::Tensor& rad,
+                          torch::Tensor& dns,
+                          torch::Tensor& hit,
+                          torch::Tensor& hit2,
+                          torch::Tensor& depthD,
+                          torch::Tensor& nrm,
+                          torch::Tensor& shNrm,
+                          torch::Tensor& mat,
+                          torch::Tensor& hitsC,
+                          torch::Tensor& pbr,
+                          torch::Tensor& light,
+                          torch::Tensor& pbrC,
+                          int seedFromBuf,
+                          float* msAcc) {
+        paramsHost.rayOrigin = packed_accessor32<float, 4>(o);
+        paramsHost.rayDirection = packed_accessor32<float, 4>(d);
+        paramsHost.rayRadiance = packed_accessor32<float, 4>(rad);
+        paramsHost.rayDensity = packed_accessor32<float, 4>(dns);
+        paramsHost.rayHitDistance = packed_accessor32<float, 4>(hit);
+        paramsHost.rayHitDistanceSecondMoment = packed_accessor32<float, 4>(hit2);
+        paramsHost.rayDepthDistortion = packed_accessor32<float, 4>(depthD);
+        paramsHost.rayNormal = packed_accessor32<float, 4>(nrm);
+        paramsHost.rayShadingNormal = packed_accessor32<float, 4>(shNrm);
+        paramsHost.rayMaterial = packed_accessor32<float, 4>(mat);
+        paramsHost.rayHitsCount = packed_accessor32<float, 4>(hitsC);
+        paramsHost.rayPbr = packed_accessor32<float, 4>(pbr);
+        paramsHost.rayLight = packed_accessor32<float, 4>(light);
+        paramsHost.rayPbrComponents = packed_accessor32<float, 5>(pbrC);
+        paramsHost.frameBounds.x = static_cast<unsigned int>(o.size(2) - 1);
+        paramsHost.frameBounds.y = static_cast<unsigned int>(o.size(1) - 1);
+        paramsHost.raySeedFromBuffer = seedFromBuf;
+        if (seedFromBuf) {
+            paramsHost.raySeedIdx = packed_accessor32<int32_t, 4>(seed);
+        }
+        CUDA_CHECK(cudaMemcpyAsync(
+            reinterpret_cast<void*>(_state->paramsDevice),
+            &paramsHost,
+            sizeof(paramsHost),
+            cudaMemcpyHostToDevice,
+            cudaStream));
+        cudaEvent_t ev0 = nullptr;
+        cudaEvent_t ev1 = nullptr;
+        if (profileRaygen) {
+            CUDA_CHECK(cudaEventCreate(&ev0));
+            CUDA_CHECK(cudaEventCreate(&ev1));
+            CUDA_CHECK(cudaEventRecord(ev0, cudaStream));
+        }
+        OPTIX_CHECK(optixLaunch(
+            _state->pipelineTracingFwd,
+            cudaStream,
+            _state->paramsDevice,
+            sizeof(PipelineParameters),
+            &_state->sbtTracingFwd,
+            static_cast<unsigned int>(o.size(2)),
+            static_cast<unsigned int>(o.size(1)),
+            static_cast<unsigned int>(o.size(0))));
+        CUDA_CHECK_LAST();
+        if (profileRaygen) {
+            CUDA_CHECK(cudaEventRecord(ev1, cudaStream));
+            CUDA_CHECK(cudaEventSynchronize(ev1));
+            float ms = 0.f;
+            CUDA_CHECK(cudaEventElapsedTime(&ms, ev0, ev1));
+            *msAcc += ms;
+            CUDA_CHECK(cudaEventDestroy(ev0));
+            CUDA_CHECK(cudaEventDestroy(ev1));
+        } else {
+            CUDA_CHECK(cudaStreamSynchronize(cudaStream));
+        }
+    };
+
+    _state->lastOptixLaunchMs = 0.f;
+
+    if (batchCloud) {
+        float bmin[3] = {1e30f, 1e30f, 1e30f};
+        float bmax[3] = {-1e30f, -1e30f, -1e30f};
+        int anyCloud = 0;
+        if (voxelKmax.defined() && voxelKmax.numel() > 0 && atm.voxels.nbx > 0) {
+            const torch::Tensor km = voxelKmax.contiguous().cpu();
+            const float* kmp = km.data_ptr<float>();
+            const int b = atm.voxels.brick > 0 ? atm.voxels.brick : 8;
+            torch::Tensor zc;
+            const float* zp = nullptr;
+            if (atm.voxel_z_iface && voxelZIface.defined() && voxelZIface.numel() >= static_cast<int64_t>(atm.voxels.nz) + 1) {
+                zc = voxelZIface.contiguous().cpu();
+                zp = zc.data_ptr<float>();
+            }
+            for (int bz = 0; bz < atm.voxels.nbz; ++bz) {
+                for (int by = 0; by < atm.voxels.nby; ++by) {
+                    for (int bx = 0; bx < atm.voxels.nbx; ++bx) {
+                        const int li = (bz * atm.voxels.nby + by) * atm.voxels.nbx + bx;
+                        if (kmp[li] <= 1e-12f) {
+                            continue;
+                        }
+                        anyCloud = 1;
+                        const float x0 = atm.voxels.origin[0] + atm.voxels.dx * static_cast<float>(bx * b);
+                        const float y0 = atm.voxels.origin[1] + atm.voxels.dy * static_cast<float>(by * b);
+                        int ix1 = (bx + 1) * b;
+                        int iy1 = (by + 1) * b;
+                        int iz0 = bz * b;
+                        int iz1 = iz0 + b;
+                        if (ix1 > atm.voxels.nx) ix1 = atm.voxels.nx;
+                        if (iy1 > atm.voxels.ny) iy1 = atm.voxels.ny;
+                        if (iz1 > atm.voxels.nz) iz1 = atm.voxels.nz;
+                        const float x1 = atm.voxels.origin[0] + atm.voxels.dx * static_cast<float>(ix1);
+                        const float y1 = atm.voxels.origin[1] + atm.voxels.dy * static_cast<float>(iy1);
+                        float z0, z1;
+                        if (zp) {
+                            z0 = zp[iz0];
+                            z1 = zp[iz1];
+                        } else {
+                            z0 = atm.voxels.origin[2] + atm.voxels.dz * static_cast<float>(iz0);
+                            z1 = atm.voxels.origin[2] + atm.voxels.dz * static_cast<float>(iz1);
+                        }
+                        bmin[0] = bmin[0] < x0 ? bmin[0] : x0;
+                        bmin[1] = bmin[1] < y0 ? bmin[1] : y0;
+                        bmin[2] = bmin[2] < z0 ? bmin[2] : z0;
+                        bmax[0] = bmax[0] > x1 ? bmax[0] : x1;
+                        bmax[1] = bmax[1] > y1 ? bmax[1] : y1;
+                        bmax[2] = bmax[2] > z1 ? bmax[2] : z1;
+                    }
+                }
+            }
+        }
+        if (!anyCloud) {
+            bmin[0] = bmin[1] = bmin[2] = 0.f;
+            bmax[0] = bmax[1] = bmax[2] = -1.f;
+        }
+        const float tmax = atm.path_tmax > 0.f ? atm.path_tmax : 1.0e5f;
+        auto hitMask = atmHitsAabbMask(rayOriLaunch, rayDirLaunch, bmin, bmax, tmax);
+        auto cloudLin = torch::nonzero(hitMask).squeeze(-1).to(torch::kInt64).contiguous();
+        auto skyLin = torch::nonzero(hitMask.logical_not()).squeeze(-1).to(torch::kInt64).contiguous();
+        std::fprintf(stderr, "[atm] batch cloud n=%lld sky n=%lld aabb z=[%.1f,%.1f]\n",
+                     (long long)cloudLin.numel(), (long long)skyLin.numel(), (double)bmin[2], (double)bmax[2]);
+
+        auto runPacked = [&](const torch::Tensor& linIn, const char* tag) {
+            if (linIn.numel() == 0) {
+                return;
+            }
+            auto lin = linIn.contiguous();
+            const int64_t n = lin.numel();
+            const int64_t H = rayOriLaunch.size(1);
+            const int64_t W = rayOriLaunch.size(2);
+            /* 1D width=n * 16K CSS OOMs; keep x-major warps with a modest width. */
+            const int64_t packW = 256;
+            const int64_t packH = (n + packW - 1) / packW;
+            const int64_t pad = packH * packW;
+            auto pack4 = [&](const torch::Tensor& src) {
+                auto s = src.reshape({-1, src.size(-1)}).index_select(0, lin);
+                auto out = torch::zeros({pad, src.size(-1)}, opts);
+                out.slice(0, 0, n).copy_(s);
+                return out.view({1, packH, packW, src.size(-1)}).contiguous();
+            };
+            auto of = pack4(rayOriLaunch);
+            auto df = pack4(rayDirLaunch);
+            auto seedN = atmSeedFromLin(lin, H, W);
+            auto seed = torch::zeros({1, packH, packW, 3}, torch::TensorOptions().dtype(torch::kInt32).device(rayOriLaunch.device()));
+            seed.reshape({-1, 3}).slice(0, 0, n).copy_(seedN);
+            torch::Tensor pRad = torch::empty({1, packH, packW, 3}, opts);
+            torch::Tensor pDns = torch::empty({1, packH, packW, 1}, opts);
+            torch::Tensor pHit = torch::empty({1, packH, packW, 2}, opts);
+            torch::Tensor pHit2 = torch::empty({1, packH, packW, 1}, opts);
+            torch::Tensor pDep = torch::empty({1, packH, packW, 1}, opts);
+            torch::Tensor pNrm = torch::empty({1, packH, packW, 3}, opts);
+            torch::Tensor pSh = torch::empty({1, packH, packW, 3}, opts);
+            torch::Tensor pMat = torch::empty({1, packH, packW, 5}, opts);
+            torch::Tensor pHits = torch::zeros({1, packH, packW, 1}, opts);
+            torch::Tensor pPbr = torch::zeros({1, packH, packW, 3}, opts);
+            torch::Tensor pLight = torch::zeros({1, packH, packW, 3}, opts);
+            torch::Tensor pComp = torch::zeros({1, packH, packW, 2, 3}, opts);
+            launchGrid(of, df, seed, pRad, pDns, pHit, pHit2, pDep, pNrm, pSh, pMat, pHits, pPbr, pLight, pComp, 1,
+                       &_state->lastOptixLaunchMs);
+            auto scatter4 = [&](torch::Tensor& full, const torch::Tensor& packed) {
+                auto f = full.reshape({full.numel() / full.size(-1), full.size(-1)});
+                auto p = packed.reshape({pad, packed.size(-1)}).slice(0, 0, n);
+                f.index_copy_(0, lin, p);
+            };
+            scatter4(rayRad, pRad);
+            scatter4(rayDns, pDns);
+            scatter4(rayHit, pHit);
+            scatter4(rayHitSecondMoment, pHit2);
+            scatter4(rayDepthDistortion, pDep);
+            scatter4(rayNrm, pNrm);
+            scatter4(rayShadingNrm, pSh);
+            scatter4(rayMaterial, pMat);
+            scatter4(rayHitsCount, pHits);
+            scatter4(rayPbr, pPbr);
+            scatter4(rayLight, pLight);
+            {
+                auto f = rayPbrComponents.reshape({rayPbrComponents.size(0) * rayPbrComponents.size(1) * rayPbrComponents.size(2), 2, 3});
+                auto p = pComp.reshape({pad, 2, 3}).slice(0, 0, n);
+                f.index_copy_(0, lin, p);
+            }
+            std::fprintf(stderr, "[atm] batch %s packed n=%lld grid=%lldx%lld optix_ms=%.1f\n",
+                         tag, (long long)n, (long long)packW, (long long)packH, (double)_state->lastOptixLaunchMs);
+        };
+        runPacked(skyLin, "sky");
+        const float skyMs = _state->lastOptixLaunchMs;
+        runPacked(cloudLin, "cloud");
+        std::fprintf(stderr, "[atm] batch sky_ms=%.1f cloud_ms=%.1f total_ms=%.1f\n",
+                     (double)skyMs, (double)(_state->lastOptixLaunchMs - skyMs), (double)_state->lastOptixLaunchMs);
+    } else {
+        launchGrid(rayOriLaunch, rayDirLaunch, torch::empty({1, 1, 1, 3}, torch::TensorOptions().dtype(torch::kInt32).device(rayOriLaunch.device())),
+                   rayRad, rayDns, rayHit, rayHitSecondMoment, rayDepthDistortion, rayNrm, rayShadingNrm, rayMaterial,
+                   rayHitsCount, rayPbr, rayLight, rayPbrComponents, 0, &_state->lastOptixLaunchMs);
+    }
+
+    if (profileRaygen && _state->atmBounceCycles) {
+        CUDA_CHECK(cudaStreamSynchronize(cudaStream));
+        unsigned long long h[26] = {};
+        CUDA_CHECK(cudaMemcpy(
+            h,
+            reinterpret_cast<void*>(_state->atmBounceCycles),
+            26u * sizeof(unsigned long long),
+            cudaMemcpyDeviceToHost));
+        const double tot = h[4] > 0ull ? static_cast<double>(h[4]) : 1.0;
+        const double other = tot > static_cast<double>(h[0] + h[1] + h[2] + h[3])
+            ? tot - static_cast<double>(h[0] + h[1] + h[2] + h[3])
+            : 0.0;
+        std::fprintf(stderr,
+                     "[atm] bounce cycles mesh=%.1f%% woodcock=%.1f%% gas=%.1f%% nee=%.1f%% other=%.1f%%\n",
+                     100.0 * static_cast<double>(h[0]) / tot,
+                     100.0 * static_cast<double>(h[1]) / tot,
+                     100.0 * static_cast<double>(h[2]) / tot,
+                     100.0 * static_cast<double>(h[3]) / tot,
+                     100.0 * other / tot);
+        const double meshCyc = h[0] > 0ull ? static_cast<double>(h[0]) : 1.0;
+        const double camT = static_cast<double>(h[5]);
+        const double postT = static_cast<double>(h[9]);
+        const double cdT = static_cast<double>(h[13]);
+        const double npath = static_cast<double>(h[17] + h[18]);
+        const double surfT = static_cast<double>(h[19]);
+        const double othT = static_cast<double>(h[22]);
+        auto pctM = [&](unsigned long long c) {
+            return 100.0 * static_cast<double>(c) / meshCyc;
+        };
+        auto pctP = [&](unsigned long long c) {
+            return 100.0 * static_cast<double>(c) / tot;
+        };
+        std::fprintf(stderr,
+                     "[atm] mesh queries paths=%.0f camDir down=%.0f up=%.0f\n"
+                     "[atm]   cam    traces=%.0f  geomHit=%.0f (%.1f%%)  groundEvt=%.0f (%.1f%%)  mesh=%.1f%% path=%.1f%%\n"
+                     "[atm]   post   traces=%.0f  geomHit=%.0f (%.1f%%)  groundEvt=%.0f (%.1f%%)  mesh=%.1f%% path=%.1f%%\n"
+                     "[atm]   cloud↓ traces=%.0f  geomHit=%.0f (%.1f%%)  groundEvt=%.0f (%.1f%%)  mesh=%.1f%% path=%.1f%%  <- after cloud scatter, before ground bounce\n"
+                     "[atm]   surf   traces=%.0f  groundEvt=%.0f (%.1f%%)  mesh=%.1f%% path=%.1f%%  <- after ground bounce\n"
+                     "[atm]   other  traces=%.0f  groundEvt=%.0f (%.1f%%)  mesh=%.1f%% path=%.1f%%\n",
+                     npath, static_cast<double>(h[17]), static_cast<double>(h[18]),
+                     camT, static_cast<double>(h[6]),
+                     camT > 0.0 ? 100.0 * static_cast<double>(h[6]) / camT : 0.0,
+                     static_cast<double>(h[7]),
+                     camT > 0.0 ? 100.0 * static_cast<double>(h[7]) / camT : 0.0,
+                     pctM(h[8]), pctP(h[8]),
+                     postT, static_cast<double>(h[10]),
+                     postT > 0.0 ? 100.0 * static_cast<double>(h[10]) / postT : 0.0,
+                     static_cast<double>(h[11]),
+                     postT > 0.0 ? 100.0 * static_cast<double>(h[11]) / postT : 0.0,
+                     pctM(h[12]), pctP(h[12]),
+                     cdT, static_cast<double>(h[14]),
+                     cdT > 0.0 ? 100.0 * static_cast<double>(h[14]) / cdT : 0.0,
+                     static_cast<double>(h[15]),
+                     cdT > 0.0 ? 100.0 * static_cast<double>(h[15]) / cdT : 0.0,
+                     pctM(h[16]), pctP(h[16]),
+                     surfT, static_cast<double>(h[20]),
+                     surfT > 0.0 ? 100.0 * static_cast<double>(h[20]) / surfT : 0.0,
+                     pctM(h[21]), pctP(h[21]),
+                     othT, static_cast<double>(h[23]),
+                     othT > 0.0 ? 100.0 * static_cast<double>(h[23]) / othT : 0.0,
+                     pctM(h[24]), pctP(h[24]));
+    }
+
+    if (cieSplit && atm.cie_split_launch) {
+        rayRad = atmReduceCieXyz(rayRad, spp0);
+        rayPbr = atmReduceCieXyz(rayPbr, spp0);
+        rayLight = atmReduceCieXyz(rayLight, spp0);
+        rayPbrComponents = atmReduceCieXyz(rayPbrComponents, spp0);
+        rayDns = rayDns.slice(0, 0, spp0).contiguous();
+        rayHit = rayHit.slice(0, 0, spp0).contiguous();
+        rayHitSecondMoment = rayHitSecondMoment.slice(0, 0, spp0).contiguous();
+        rayDepthDistortion = rayDepthDistortion.slice(0, 0, spp0).contiguous();
+        rayNrm = rayNrm.slice(0, 0, spp0).contiguous();
+        rayShadingNrm = rayShadingNrm.slice(0, 0, spp0).contiguous();
+        rayMaterial = rayMaterial.slice(0, 0, spp0).contiguous();
+        rayHitsCount = rayHitsCount.slice(0, 0, spp0).contiguous();
+    }
 
     return std::tuple<torch::Tensor, torch::Tensor, torch::Tensor,
                       torch::Tensor, torch::Tensor, torch::Tensor,

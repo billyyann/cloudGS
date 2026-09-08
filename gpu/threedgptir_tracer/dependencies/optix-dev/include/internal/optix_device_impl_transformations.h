@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2021 NVIDIA Corporation.  All rights reserved.
+* Copyright (c) 2023 NVIDIA Corporation.  All rights reserved.
 *
 * NVIDIA Corporation and its licensors retain all intellectual property and proprietary
 * rights in and to this software, related documentation and any modifications thereto.
@@ -19,7 +19,7 @@
 */
 
 /**
-* @file   optix_7_device_impl_transformations.h
+* @file   optix_device_impl_transformations.h
 * @author NVIDIA Corporation
 * @brief  OptiX public API
 *
@@ -27,11 +27,11 @@
 */
 
 #if !defined( __OPTIX_INCLUDE_INTERNAL_HEADERS__ )
-#error("optix_7_device_impl_transformations.h is an internal header file and must not be used directly.  Please use optix_device.h or optix.h instead.")
+#error("optix_device_impl_transformations.h is an internal header file and must not be used directly.  Please use optix_device.h or optix.h instead.")
 #endif
 
-#ifndef __optix_optix_7_device_impl_transformations_h__
-#define __optix_optix_7_device_impl_transformations_h__
+#ifndef OPTIX_OPTIX_DEVICE_IMPL_TRANSFORMATIONS_H
+#define OPTIX_OPTIX_DEVICE_IMPL_TRANSFORMATIONS_H
 
 namespace optix_impl {
 
@@ -59,7 +59,9 @@ static __forceinline__ __device__ uint4 optixLdg( unsigned long long addr )
 template <class T>
 static __forceinline__ __device__ T optixLoadReadOnlyAlign16( const T* ptr )
 {
-    T v;
+    // Debug mode may keep this temporary variable
+    // If T does not enforce 16B alignment, v may not be 16B aligned and storing the loaded data from ptr fails
+    __align__(16) T v;
     for( int ofs                     = 0; ofs < sizeof( T ); ofs += 16 )
         *(uint4*)( (char*)&v + ofs ) = optixLdg( (unsigned long long)( (char*)ptr + ofs ) );
     return v;
@@ -221,8 +223,14 @@ static __forceinline__ __device__ void optixResolveMotionKey( float& localt, int
     // No need to check the motion flags. If data originates from a valid transform list handle, then globalt is in
     // range, or vanish flags are not set.
 
-    const float time = max( 0.f, min( numIntervals, ( globalt - timeBegin ) * numIntervals / ( timeEnd - timeBegin ) ) );
-    const float fltKey = floorf( time );
+    // should be NaN or in [0,numIntervals]
+    float time = max( 0.f, min( numIntervals, numIntervals * __fdividef( globalt - timeBegin, timeEnd - timeBegin ) ) );
+
+    // catch NaN (for example when timeBegin=timeEnd)
+    if( time != time )
+        time = 0.f;
+
+    const float fltKey = fminf( floorf(time), numIntervals - 1 );
 
     localt = time - fltKey;
     key    = (int)fltKey;
@@ -421,4 +429,4 @@ static __forceinline__ __device__ float3 optixTransformNormal( const float4& m0,
 
 }  // namespace optix_impl
 
-#endif
+#endif // OPTIX_OPTIX_DEVICE_IMPL_TRANSFORMATIONS_H
