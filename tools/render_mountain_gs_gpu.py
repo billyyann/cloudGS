@@ -261,8 +261,7 @@ def diagnose_cloud_sun_tr(ka, ks, origin, spacing, sun, z_iface=None):
         print("warning: expected analog sun Tr in (0,1)")
 
 
-def make_persp_rays(w, h, pos, tgt, up, fov_y_deg, spp, device):
-    """htrdr perspective: fov is vertical FOV in degrees (mountain.sh fov=30)."""
+def persp_camera(w, h, pos, tgt, up, fov_y_deg):
     look = tgt - pos
     look = look / np.linalg.norm(look)
     up = up - look * np.dot(up, look)
@@ -271,12 +270,19 @@ def make_persp_rays(w, h, pos, tgt, up, fov_y_deg, spp, device):
     right = right / np.linalg.norm(right)
     half_v = math.tan(0.5 * math.radians(fov_y_deg))
     half_u = half_v * (w / float(h))
-    rng = np.random.default_rng(0)
+    return pos, look, right, up, half_u, half_v
+
+
+def make_persp_rays(w, h, pos, tgt, up, fov_y_deg, spp, device, rng=None):
+    """htrdr perspective: fov is vertical FOV in degrees (mountain.sh fov=30)."""
+    pos, look, right, up, half_u, half_v = persp_camera(w, h, pos, tgt, up, fov_y_deg)
+    if rng is None:
+        rng = np.random.default_rng(0)
     ori = np.zeros((spp, h, w, 3), np.float32)
     drc = np.zeros((spp, h, w, 3), np.float32)
     for s in range(spp):
-        js = (np.arange(w, dtype=np.float32)[None, :] + rng.random((h, w))) / w
-        is_ = (np.arange(h, dtype=np.float32)[:, None] + rng.random((h, w))) / h
+        js = (np.arange(w, dtype=np.float32)[None, :] + rng.random((h, w)).astype(np.float32)) / w
+        is_ = (np.arange(h, dtype=np.float32)[:, None] + rng.random((h, w)).astype(np.float32)) / h
         u = (js - 0.5) * 2.0 * half_u
         v = (0.5 - is_) * 2.0 * half_v
         d = look[None, None, :] + right[None, None, :] * u[..., None] + up[None, None, :] * v[..., None]
@@ -286,7 +292,22 @@ def make_persp_rays(w, h, pos, tgt, up, fov_y_deg, spp, device):
     return torch.from_numpy(ori).to(device), torch.from_numpy(drc).to(device)
 
 
-def make_ortho_rays(w, h, center, height, up, look, spp, device):
+def make_persp_rays_pixels(w, h, pos, tgt, up, fov_y_deg, ys, xs, rng):
+    """One jittered camera ray per (y, x) film pixel. Returns (n, 3) float32."""
+    pos, look, right, upv, half_u, half_v = persp_camera(w, h, pos, tgt, up, fov_y_deg)
+    n = int(ys.size)
+    js = (xs.astype(np.float32) + rng.random(n).astype(np.float32)) / float(w)
+    is_ = (ys.astype(np.float32) + rng.random(n).astype(np.float32)) / float(h)
+    u = (js - 0.5) * 2.0 * half_u
+    v = (0.5 - is_) * 2.0 * half_v
+    d = look[None, :] + right[None, :] * u[:, None] + upv[None, :] * v[:, None]
+    nrm = np.linalg.norm(d, axis=-1, keepdims=True)
+    ori = np.broadcast_to(pos.astype(np.float32), (n, 3)).copy()
+    drc = (d / np.maximum(nrm, 1e-12)).astype(np.float32)
+    return ori, drc
+
+
+def make_ortho_rays(w, h, center, height, up, look, spp, device, rng=None):
     """htrdr orthographic: pos/tgt/up, height = vertical sensor extent (meters)."""
     look = look / np.linalg.norm(look)
     up = up - look * np.dot(up, look)
@@ -296,18 +317,54 @@ def make_ortho_rays(w, h, center, height, up, look, spp, device):
     aspect = w / float(h)
     half_h = 0.5 * height
     half_w = half_h * aspect
-    rng = np.random.default_rng(0)
+    if rng is None:
+        rng = np.random.default_rng(0)
     ori = np.zeros((spp, h, w, 3), np.float32)
     drc = np.zeros((spp, h, w, 3), np.float32)
     for s in range(spp):
-        js = (np.arange(w, dtype=np.float32)[None, :] + rng.random((h, w))) / w
-        is_ = (np.arange(h, dtype=np.float32)[:, None] + rng.random((h, w))) / h
+        js = (np.arange(w, dtype=np.float32)[None, :] + rng.random((h, w)).astype(np.float32)) / w
+        is_ = (np.arange(h, dtype=np.float32)[:, None] + rng.random((h, w)).astype(np.float32)) / h
         u = (js - 0.5) * 2.0 * half_w
         v = (0.5 - is_) * 2.0 * half_h
         o = center[None, None, :] + right[None, None, :] * u[..., None] + up[None, None, :] * v[..., None]
         ori[s] = o
         drc[s] = look[None, None, :]
     return torch.from_numpy(ori).to(device), torch.from_numpy(drc).to(device)
+
+
+def make_ortho_rays_pixels(w, h, center, height, up, look, ys, xs, rng):
+    look = look / np.linalg.norm(look)
+    up = up - look * np.dot(up, look)
+    up = up / np.linalg.norm(up)
+    right = np.cross(look, up)
+    right = right / np.linalg.norm(right)
+    half_h = 0.5 * height
+    half_w = half_h * (w / float(h))
+    n = int(ys.size)
+    js = (xs.astype(np.float32) + rng.random(n).astype(np.float32)) / float(w)
+    is_ = (ys.astype(np.float32) + rng.random(n).astype(np.float32)) / float(h)
+    u = (js - 0.5) * 2.0 * half_w
+    v = (0.5 - is_) * 2.0 * half_h
+    o = center[None, :] + right[None, :] * u[:, None] + up[None, :] * v[:, None]
+    d = np.broadcast_to(look.astype(np.float32), (n, 3)).copy()
+    return o.astype(np.float32), d
+
+
+def pack_trace_pixels(tracer, buffers, ori_np, drc_np, frame, device, pack_w=256):
+    from threedgptir_tracer.atmosphere import trace_atmosphere
+
+    n = int(ori_np.shape[0])
+    pack_h = (n + pack_w - 1) // pack_w
+    pad = pack_h * pack_w
+    ori = torch.zeros((1, pack_h, pack_w, 3), dtype=torch.float32, device=device)
+    drc = torch.zeros((1, pack_h, pack_w, 3), dtype=torch.float32, device=device)
+    ori.view(-1, 3)[:n].copy_(torch.from_numpy(np.ascontiguousarray(ori_np)))
+    drc.view(-1, 3)[:n].copy_(torch.from_numpy(np.ascontiguousarray(drc_np)))
+    out = trace_atmosphere(tracer, ori, drc, buffers, frame_number=int(frame))
+    rgb = out[10].float().reshape(pad, 3)[:n].cpu().numpy()
+    first = out[11].float().reshape(pad, 3)[:n].cpu().numpy()
+    del out
+    return rgb, first, n
 
 
 def tonemap(img, exposure=1.8):
@@ -388,6 +445,20 @@ def main():
         type=int,
         default=None,
         help="OptiX continuation stack bytes; 0=computed, default=16384 floor. Set before pipeline create.",
+    )
+    p.add_argument(
+        "--adaptive",
+        dest="adaptive",
+        action="store_true",
+        default=False,
+        help="after warmup, spend remaining spp on high-Y-variance pixels",
+    )
+    p.add_argument("--no-adaptive", dest="adaptive", action="store_false")
+    p.add_argument(
+        "--adaptive-warmup",
+        type=int,
+        default=32,
+        help="uniform spp before variance allocation (default 32)",
     )
     args = p.parse_args()
     os.makedirs(args.outdir, exist_ok=True)
@@ -569,10 +640,13 @@ def main():
         float(buffers.voxel_kmax.max().item()),
     )
 
-    acc = None
-    acc_first = None
-    chunk = min(args.spp, 4)
-    nchunk = (args.spp + chunk - 1) // chunk
+    rng = np.random.default_rng(0)
+    do_adapt = bool(args.adaptive) and int(args.spp) > 1
+    warmup = int(args.spp)
+    if do_adapt:
+        warmup = min(int(args.spp), max(int(args.adaptive_warmup), 1))
+    chunk = min(warmup, 4)
+    nchunk = (warmup + chunk - 1) // chunk
     from threedgptir_tracer.atmosphere import trace_atmosphere
 
     if args.camera == "ortho":
@@ -581,7 +655,7 @@ def main():
         look = np.array([0.0, 0.0, -1.0], np.float32)
         up = np.array([0.0, 1.0, 0.0], np.float32)
         pos = tgt = None
-        print(f"GPU PTIR ortho {w}x{h} spp={args.spp} (chunks of {chunk})")
+        print(f"GPU PTIR ortho {w}x{h} spp={args.spp} warmup={warmup} adaptive={int(do_adapt)} (chunks of {chunk})")
     elif args.camera == "above":
         # ARMCu cloud ~1.02–2.27 km. Camera above cloud top, look down through
         # the slab at mountain.obj (z≤700). mountain.sh pose is unchanged.
@@ -594,7 +668,7 @@ def main():
         look = tgt - pos
         look = look / np.linalg.norm(look)
         print(
-            f"GPU PTIR above-cloud persp {w}x{h} spp={args.spp} fov=30 "
+            f"GPU PTIR above-cloud persp {w}x{h} spp={args.spp} warmup={warmup} adaptive={int(do_adapt)} fov=30 "
             f"pos={pos.tolist()} tgt={tgt.tolist()} dir.z={float(look[2]):.3f} "
             f"(chunks of {chunk})"
         )
@@ -605,17 +679,33 @@ def main():
         pos = np.array([10245.37, 615.02, 422.34], np.float32)
         tgt = np.array([-2977.39, 6829.40, 842.40], np.float32)
         up = np.array([0.0, 0.0, 1.0], np.float32)
-        print(f"GPU PTIR mountain.sh persp {w}x{h} spp={args.spp} fov=30 (chunks of {chunk})")
+        print(
+            f"GPU PTIR mountain.sh persp {w}x{h} spp={args.spp} warmup={warmup} "
+            f"adaptive={int(do_adapt)} fov=30 (chunks of {chunk})"
+        )
+
+    if args.crop is not None:
+        crop_x0, crop_y0, crop_x1, crop_y1 = args.crop
+        th, tw = crop_y1 - crop_y0, crop_x1 - crop_x0
+    else:
+        crop_x0, crop_y0 = 0, 0
+        th, tw = h, w
+    sum_xyz = np.zeros((th, tw, 3), np.float64)
+    sum_first = np.zeros((th, tw, 3), np.float64)
+    sum_y2 = np.zeros((th, tw), np.float64)
+    count = np.zeros((th, tw), np.float64)
 
     t_loop0 = time.perf_counter()
     prof = {"rays": 0.0, "trace": 0.0, "d2h": 0.0, "optix_ms": 0.0, "nray": 0}
+    acc = None
+    acc_first = None
     for c in range(nchunk):
-        n = min(chunk, args.spp - c * chunk)
+        n = min(chunk, warmup - c * chunk)
         t0 = time.perf_counter()
         if args.camera == "ortho":
-            ori, drc = make_ortho_rays(w, h, center, args.height, up, look, n, device)
+            ori, drc = make_ortho_rays(w, h, center, args.height, up, look, n, device, rng=rng)
         else:
-            ori, drc = make_persp_rays(w, h, pos, tgt, up, 30.0, n, device)
+            ori, drc = make_persp_rays(w, h, pos, tgt, up, 30.0, n, device, rng=rng)
         if args.crop is not None:
             x0, y0, x1, y1 = args.crop
             ori = ori[:, y0:y1, x0:x1].contiguous()
@@ -630,9 +720,15 @@ def main():
             optix_ms = float(tracer.get_last_optix_launch_ms())
         rgb = out[10]  # ray_pbr (full CIE XYZ)
         first = out[11]  # ray_light: first volume NEE only
-        part = rgb.float().mean(dim=0).cpu().numpy()
-        part_first = first.float().mean(dim=0).cpu().numpy()
+        rgb_np = rgb.float().cpu().numpy()
+        first_np = first.float().cpu().numpy()
+        part = rgb_np.mean(axis=0)
+        part_first = first_np.mean(axis=0)
         t3 = time.perf_counter()
+        sum_xyz += rgb_np.sum(axis=0)
+        sum_first += first_np.sum(axis=0)
+        sum_y2 += (rgb_np[..., 1] ** 2).sum(axis=0)
+        count += float(n)
         acc = part if acc is None else acc + part
         acc_first = part_first if acc_first is None else acc_first + part_first
         nray = int(ori.shape[0] * ori.shape[1] * ori.shape[2])
@@ -751,6 +847,99 @@ def main():
             )
         del ori, drc, out, rgb
         torch.cuda.empty_cache()
+
+    if do_adapt and int(args.spp) > warmup:
+        mean_y = sum_xyz[..., 1] / np.maximum(count, 1.0)
+        var_y = np.maximum(sum_y2 / np.maximum(count, 1.0) - mean_y * mean_y, 0.0)
+        std = np.sqrt(var_y)
+        floor = float(np.percentile(std, 10)) * 0.05 + 1e-6
+        weight = std + floor
+        weight = weight / max(float(weight.sum()), 1e-12)
+        remain = int(args.spp - warmup) * th * tw
+        extra = np.floor(remain * weight).astype(np.int32)
+        cap = int(args.spp) - warmup
+        extra = np.clip(extra, 0, cap)
+        print(
+            f"adaptive extra: target spp={args.spp} warmup={warmup} "
+            f"extra min/mean/p50/max={int(extra.min())}/{float(extra.mean()):.1f}/"
+            f"{int(np.median(extra))}/{int(extra.max())}  "
+            f"at_cap={float((extra == cap).mean()):.3f}  at_0={float((extra == 0).mean()):.3f}  "
+            f"total_extra={int(extra.sum())} ({100.0 * extra.sum() / max(th * tw * args.spp, 1):.1f}% of spp*{th}*{tw})"
+        )
+        wave = 0
+        while True:
+            if int(extra.max()) >= 4:
+                k = 4
+                mask = extra >= k
+            else:
+                k = 1
+                mask = extra > 0
+            ys, xs = np.nonzero(mask)
+            if ys.size == 0:
+                break
+            max_pix = th * tw
+            if ys.size > max_pix:
+                key = extra[ys, xs]
+                pick = np.argpartition(-key, max_pix)[:max_pix]
+                ys, xs = ys[pick], xs[pick]
+            if k > 1:
+                ys_l = np.repeat(ys, k)
+                xs_l = np.repeat(xs, k)
+            else:
+                ys_l, xs_l = ys, xs
+            film_ys = ys_l + crop_y0
+            film_xs = xs_l + crop_x0
+            t0 = time.perf_counter()
+            if args.camera == "ortho":
+                ori_np, drc_np = make_ortho_rays_pixels(
+                    w, h, center, args.height, up, look, film_ys, film_xs, rng
+                )
+            else:
+                ori_np, drc_np = make_persp_rays_pixels(
+                    w, h, pos, tgt, up, 30.0, film_ys, film_xs, rng
+                )
+            torch.cuda.synchronize()
+            t1 = time.perf_counter()
+            rgb_np, first_np, nray = pack_trace_pixels(
+                tracer, buffers, ori_np, drc_np, 10000 + wave, device
+            )
+            torch.cuda.synchronize()
+            t2 = time.perf_counter()
+            t3 = t2
+            if k > 1:
+                raw_rgb = rgb_np.reshape(-1, k, 3)
+                raw_first = first_np.reshape(-1, k, 3)
+                sum_xyz[ys, xs] += raw_rgb.sum(axis=1)
+                sum_first[ys, xs] += raw_first.sum(axis=1)
+                sum_y2[ys, xs] += (raw_rgb[..., 1] ** 2).sum(axis=1)
+                count[ys, xs] += float(k)
+            else:
+                sum_xyz[ys, xs] += rgb_np
+                sum_first[ys, xs] += first_np
+                sum_y2[ys, xs] += rgb_np[:, 1] ** 2
+                count[ys, xs] += 1.0
+            extra[ys, xs] -= k
+            optix_ms = 0.0
+            if hasattr(tracer, "get_last_optix_launch_ms"):
+                optix_ms = float(tracer.get_last_optix_launch_ms())
+            prof["rays"] += t1 - t0
+            prof["trace"] += t2 - t1
+            prof["d2h"] += t3 - t2
+            prof["optix_ms"] += optix_ms
+            prof["nray"] += nray
+            if wave % 8 == 0 or extra.max() == 0:
+                extra_s = (
+                    f"  rays={t1-t0:.2f}s  trace_wall={t2-t1:.2f}s  {nray/max(t2-t1,1e-9):.0f} rays/s"
+                    if args.profile
+                    else ""
+                )
+                print(
+                    f"  adaptive wave {wave+1} n={nray} remain={int(extra.sum())} "
+                    f"meanY={float((sum_xyz[...,1]/np.maximum(count,1)).mean()):.4f}{extra_s}"
+                )
+            wave += 1
+            torch.cuda.empty_cache()
+
     loop_s = time.perf_counter() - t_loop0
     nray = max(prof["nray"], 1)
     print(
@@ -759,10 +948,15 @@ def main():
         f"d2h={prof['d2h']:.1f}s  rays={nray}  "
         f"{nray/max(prof['trace'],1e-9):.0f} camera-rays/s  "
         f"{1e3*prof['trace']/nray:.3f} ms/camera-ray  "
-        f"(CIE split: 3 channels as launch depth)"
+        f"(CIE same-path XYZ; ATM_CIE_SPLIT=1 for legacy 3x)"
     )
-    img = acc / float(nchunk)
-    img_first = None if acc_first is None else acc_first / float(nchunk)
+    denom = np.maximum(count[..., None], 1.0)
+    img = (sum_xyz / denom).astype(np.float32)
+    img_first = (sum_first / denom).astype(np.float32)
+    print(
+        f"  spp/pixel min/mean/p50/max={float(count.min()):.0f}/{float(count.mean()):.1f}/"
+        f"{float(np.median(count)):.0f}/{float(count.max()):.0f}"
+    )
     if args.crop is not None:
         x0, y0, x1, y1 = args.crop
         print(
