@@ -896,9 +896,11 @@ static __device__ void traceAtmospherePath(const uint3& idx, Sampler& sampler) {
     atm_normalize3(dir0);
 
     const int cieOn = (atm_base->cie_enabled && atm_base->cie_cdf && atm_base->cie_nbins > 0) ? 1 : 0;
+    const int cieSplit = (cieOn && atm_base->cie_split_launch) ? 1 : 0;
+    const int cieSame = (cieOn && !cieSplit) ? 1 : 0;
     int cie_ch0 = 0;
-    int nch = cieOn ? 3 : 1;
-    if (cieOn && atm_base->cie_split_launch) {
+    int nch = 1;
+    if (cieSplit) {
         unsigned filmZ = idx.z;
         if (params.raySeedFromBuffer) {
             filmZ = static_cast<unsigned int>(params.raySeedIdx[idx.z][idx.y][idx.x][2]);
@@ -917,7 +919,6 @@ static __device__ void traceAtmospherePath(const uint3& idx, Sampler& sampler) {
         if (cie_ch0 > 2) {
             cie_ch0 = 2;
         }
-        nch = 1;
     }
     float xyz[3] = {0.f, 0.f, 0.f};
     float firstHitTKeep = 0.f;
@@ -949,16 +950,27 @@ static __device__ void traceAtmospherePath(const uint3& idx, Sampler& sampler) {
     }
 
     for (int cie_i = 0; cie_i < nch; ++cie_i) {
-    const int cie_ch = (cieOn && atm_base->cie_split_launch) ? cie_ch0 : cie_i;
+    const int cie_ch = cieSplit ? cie_ch0 : cie_i;
     float org[3] = {org0[0], org0[1], org0[2]};
     float dir[3] = {dir0[0], dir0[1], dir0[2]};
     AtmParams atm_ch = *atm_base;
     float wlen_pdf = 1.f;
     if (cieOn) {
+        int bind_ch = cie_ch;
+        if (cieSame) {
+            float r_ch = sampler.next_1d();
+            bind_ch = (int)(r_ch * 3.f);
+            if (bind_ch < 0) {
+                bind_ch = 0;
+            }
+            if (bind_ch > 2) {
+                bind_ch = 2;
+            }
+        }
         const float r0 = sampler.next_1d();
         const float r1 = sampler.next_1d();
         const float r_quad = sampler.next_1d();
-        atm_cie_bind_path(&atm_ch, cie_ch, r0, r1, r_quad, &wlen_pdf);
+        atm_cie_bind_path(&atm_ch, bind_ch, r0, r1, r_quad, &wlen_pdf);
         const float wlen_nm = atm_ch.wavelength_m * 1.0e9f;
         atm_ch.path_albedo = atm_mrumtl_fetch_R(&atm_ch, wlen_nm, sampler.next_1d());
     } else {
@@ -1348,10 +1360,16 @@ static __device__ void traceAtmospherePath(const uint3& idx, Sampler& sampler) {
 
     if (cieOn) {
         const float L = (radiance.x + radiance.y + radiance.z) * (1.f / 3.f);
-        xyz[cie_ch] = L / fmaxf(wlen_pdf, 1e-20f);
         const float L0 = (firstVolNee.x + firstVolNee.y + firstVolNee.z) * (1.f / 3.f);
-        xyzFirst[cie_ch] = L0 / fmaxf(wlen_pdf, 1e-20f);
-        if (cie_ch == 0 || atm_base->cie_split_launch) {
+        if (cieSame) {
+            const float wlen_nm = atm_ch.wavelength_m * 1.0e9f;
+            atm_cie_xyz_from_L(atm_base, wlen_nm, L, xyz);
+            atm_cie_xyz_from_L(atm_base, wlen_nm, L0, xyzFirst);
+        } else {
+            xyz[cie_ch] = L / fmaxf(wlen_pdf, 1e-20f);
+            xyzFirst[cie_ch] = L0 / fmaxf(wlen_pdf, 1e-20f);
+        }
+        if (cieSame || cie_ch == 0 || cieSplit) {
             firstHitTKeep = firstHitT;
             firstEventKeep = firstEvent;
             escapedKeep = escaped;

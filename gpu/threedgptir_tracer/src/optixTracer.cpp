@@ -2182,10 +2182,12 @@ OptixTracer::traceAtmosphere(
     torch::Tensor rayOriLaunch = rayOri.contiguous();
     torch::Tensor rayDirLaunch = rayDir.contiguous();
     const int64_t spp0 = rayOriLaunch.size(0);
-    const bool cieSplit =
+    const bool cieTables =
         cieCdf.defined() && cieCdf.numel() >= 3 && cieRcpIntegral.defined() && cieRcpIntegral.numel() >= 3;
+    const char* cieSplitEnv = std::getenv("ATM_CIE_SPLIT");
+    const bool cieSplit = cieTables && cieSplitEnv && cieSplitEnv[0] == '1';
     if (cieSplit) {
-        /* depth = 3*spp, z = ch*spp + s so a warp (x-major) stays on one CIE channel. */
+        /* ATM_CIE_SPLIT=1: depth = 3*spp, z = ch*spp + s (legacy per-channel). */
         rayOriLaunch = rayOriLaunch.repeat({3, 1, 1, 1}).contiguous();
         rayDirLaunch = rayDirLaunch.repeat({3, 1, 1, 1}).contiguous();
     }
@@ -2464,12 +2466,12 @@ OptixTracer::traceAtmosphere(
 
     std::fprintf(stderr,
                  "[atm] sizeof PipelineParameters=%zu AtmParams=%zu sunL=%g mesh_ntri=%d voxels=%dx%dx%d gs=%d "
-                 "meshGAS=%d volGAS=%d ias=%d volPrims=%d gas_nlayers=%d gas_ks=%d path_tmax=%g z_iface=%d cie_split=%d launchZ=%d\n",
+                 "meshGAS=%d volGAS=%d ias=%d volPrims=%d gas_nlayers=%d gas_ks=%d path_tmax=%g z_iface=%d cie_split=%d cie_same=%d launchZ=%d\n",
                  sizeof(PipelineParameters), sizeof(AtmParams), (double)atm.sun.radiance,
                  atm.mesh.ntri, atm.voxels.nx, atm.voxels.ny, atm.voxels.nz, atm.gs_enabled,
                  paramsHost.meshHandle != 0, paramsHost.volHandle != 0, paramsHost.meshVolIas != 0,
                  paramsHost.volPrimCount, atm.gas.nlayers, atm.gas.ks != nullptr, (double)atm.path_tmax,
-                 atm.voxel_z_iface != nullptr, atm.cie_split_launch, (int)rayRad.size(0));
+                 atm.voxel_z_iface != nullptr, atm.cie_split_launch, cieTables && !cieSplit, (int)rayRad.size(0));
 
     reallocateParamsDevice(sizeof(paramsHost), cudaStream);
 

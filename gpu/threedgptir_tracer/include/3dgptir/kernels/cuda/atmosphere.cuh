@@ -1600,6 +1600,21 @@ ATM_FN int atm_sample_quad(const float* cdf, int n, float r) {
     return lo;
 }
 
+/* λ ~ mixture of the 3 CMF PDFs (pick channel, then that CDF). One path writes
+ * X,Y,Z = L * CMF / p_mix. p_mix uses the same analytic CMFs as the CDFs. */
+ATM_FN void atm_cie_xyz_from_L(const struct AtmParams* atm, float wlen_nm, float L, float xyz[3]) {
+    const float xb = atm_cie_xbar(wlen_nm);
+    const float yb = atm_cie_ybar(wlen_nm);
+    const float zb = atm_cie_zbar(wlen_nm);
+    const float p_nm = (1.f / 3.f) * (fmaxf(xb, 0.f) * atm->cie_rcp_integral[0] +
+                                      fmaxf(yb, 0.f) * atm->cie_rcp_integral[1] +
+                                      fmaxf(zb, 0.f) * atm->cie_rcp_integral[2]);
+    const float s = L / fmaxf(p_nm * 1.0e9f, 1e-20f);
+    xyz[0] = s * xb;
+    xyz[1] = s * yb;
+    xyz[2] = s * zb;
+}
+
 /* Bind per-path gas quad + Planck sun + Mie band scale. pdf_m = rcp_integral * 1e9 (m^-1). */
 ATM_FN void atm_cie_bind_path(struct AtmParams* atm, int ch, float r0, float r1, float r_quad, float* pdf_m) {
     const float wlen_nm = atm_cie_sample_wlen_nm(atm, ch, r0, r1);
