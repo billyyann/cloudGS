@@ -62,7 +62,7 @@ GPU：`load_htcp_voxels` 把不规则 Z **重采样成均匀** `dz` 的规则网
 
 文档：1D 层 + 云内按 LES x_{\mathrm{H_2O}} 插值 k。
 
-GPU：`AtmGasLayers` 只有名义 `ka/ks(z)`（CIE 路径上换成当前 `(iband,iquad)` 的 HTGOP 层表）。**云盒子里不读 RCT/RVT，不做 x_{\mathrm{H_2O}} 插值。**
+GPU：CIE / LW 仍只有名义 `ka/ks(z)`（路径上换成当前 `(iband,iquad)` 的 HTGOP 层表）。**`ATM_SPECTRAL_SW`（rev 75）在 HTCP 盒子里读 `RVT→x_H2O`，按 HTGOP 三支插该 iquad 的 \(k\)。CIE 不绑这些指针。**
 
 ### 1.4 加速结构
 
