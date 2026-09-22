@@ -56,6 +56,11 @@ BODY_T_K = 300.0
 ENGINE_T_K = 400.0
 BODY_R = 0.42
 ENGINE_R = 0.08
+# SWIR 1600 nm: not visible paint. Lower grey reflectances so clear nadir
+# body/sea contrast is ~2–4 (direct-sun Lambert), not rho_vis/rho_sea≈10.
+SWIR_BODY_R = 0.16
+SWIR_ENGINE_R = 0.06
+SWIR_WING_R = 0.14
 # IR: painted airframe ε~0.90; nacelle hotter than the visible-mesh 400 K slot.
 IR_BODY_R = 0.10
 IR_ENGINE_R = 0.08
@@ -325,6 +330,30 @@ def apply_ir_airframe(ac: dict) -> dict:
         f"An-124 IR optics  body ρ={IR_BODY_R:.2f} T={BODY_T_K:.0f} K  "
         f"engine ρ={IR_ENGINE_R:.2f} T={IR_ENGINE_T_K:.0f} K  "
         f"engine_tris={int(np.count_nonzero(dark))}/{out['temp'].shape[0]}"
+    )
+    return out
+
+
+def apply_swir_airframe(ac: dict) -> dict:
+    """SWIR 1600 nm grey reflectances (not visible paint, not LW Kirchhoff)."""
+    out = {
+        "verts": np.asarray(ac["verts"], np.float32).copy(),
+        "idx": np.asarray(ac["idx"], np.int32).copy(),
+        "albedo": np.asarray(ac["albedo"], np.float32).copy(),
+        "temp": np.asarray(ac["temp"], np.float32).copy(),
+        "mat_id": np.asarray(ac["mat_id"], np.int32).copy(),
+    }
+    a0 = np.max(out["albedo"], axis=1)
+    eng = a0 < 0.2
+    wing = (~eng) & (a0 < 0.38)
+    out["albedo"][:] = SWIR_BODY_R
+    out["albedo"][wing] = SWIR_WING_R
+    out["albedo"][eng] = SWIR_ENGINE_R
+    print(
+        f"An-124 SWIR optics  body ρ={SWIR_BODY_R:.2f} wing ρ={SWIR_WING_R:.2f}  "
+        f"engine ρ={SWIR_ENGINE_R:.2f}  "
+        f"engine_tris={int(np.count_nonzero(eng))}/{out['albedo'].shape[0]}  "
+        f"(target body/sea≈{SWIR_BODY_R / float(IR_WATER_ALBEDO[0]):.2f} under direct sun)"
     )
     return out
 
@@ -949,6 +978,11 @@ def main() -> int:
             ac_use = apply_ir_airframe(ac)
             t_eng = IR_ENGINE_T_K
             r_body, r_eng = IR_BODY_R, IR_ENGINE_R
+        elif band["mode"] == SPECTRAL_SW:
+            gas = mgs.load_ecrad_gas_1d(wavelength_m=lam * 1.0e-9)
+            ac_use = apply_swir_airframe(ac)
+            t_eng = ENGINE_T_K
+            r_body, r_eng = SWIR_BODY_R, SWIR_ENGINE_R
         else:
             gas = mgs.load_ecrad_gas_1d(wavelength_m=lam * 1.0e-9)
             ac_use = ac

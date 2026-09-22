@@ -244,7 +244,51 @@ LW 若再乘 \(\mathrm{Tr}(k_a)\)，权重变成 \(\mathrm{e}^{-\tau_s-2\tau_a}\
 
 ---
 
-## 9. 不要做的事
+## 9. 云下飞机为什么不改云顶辐射分布
+
+不改核。数来自主机 analog 柱、与反演 LUT 同符号的两流、以及已跑的 GPU 对照。
+
+模型：相机正交 \(z=2000\) m；层积云 \(k>0\) 大约 \(350\)–\(610\) m；An-124 \(z=100\) m，约 \(69\times73\) m。太阳 az=340°、el=25°，**先打云顶**再进云。机身不在云顶直射路径上，不能在云顶投下几何阴影。
+
+云顶像素的光子最后一次作用在云**上部**：
+
+- 长波 10500 nm：\(\omega_{\overline{C}}=0.481\)。皮肤在从顶往下 \(\tau_{\mathrm{ext}}\approx1\)（\(T_{\mathrm{skin}}\approx283.2\,\mathrm{K}\)，\(T_b\) 偏差 \(0.95\,\mathrm{K}\)）。\(L\to B_\lambda(T_{\mathrm{skin}})\)。
+- 短波 1600 nm：\(\omega\approx0.991\)。\(L\) 是云顶 BRF；\(\tau_{550}\approx11\) 已饱和。
+
+机身要改云顶 \(L\)，只有弹道、长波再发射、海面/云底回传。三条都弱。
+
+**弹道（轮廓）。** 从 \(z=100\) m 向上，`analog_column` 与 GPU 同一套 \(k_{\mathrm{ext}}=k_a+k_s\)：
+
+| | \(\tau_{\mathrm{ext}}\) | \(\mathrm{Tr}=e^{-\tau}\) |
+|--|--|--|
+| SWIR | 11.53 | \(9.8\times10^{-6}\) |
+| LWIR 原地 | 10.90 | \(1.84\times10^{-5}\) |
+| LWIR +200 m | 10.31 | \(3.3\times10^{-5}\) |
+
+70 m 机身的几何轮廓在云顶被压到 \(10^{-5}\)。这是 Beer 定律，不是 mesh 没进路径（有机 `ntri=306`，无机水 2）。
+
+**长波热。** LWIR \(\tau_a=4.28\)，\(\mathrm{Tr}(k_a)=0.014\)。吸收后按当地 \(T\) 再发射：云 \(\approx284\,\mathrm{K}\)，机身 \(300\,\mathrm{K}\)。几个吸收光程后，机身 \(B_\lambda\) 换成 \(B_\lambda(T_{\mathrm{cloud}})\)。云顶见到皮肤，不是云下 \(16\,\mathrm{K}\) 差。
+
+GPU `scenes/fire_gs/lwir_an124_dx200/record.json`（800 m 胶片、256 spp）：机身 mask 内 \((\mathrm{home}-\mathrm{cloud})/L\) 的 \(C=9.7\times10^{-6}\)；\((+200-\mathrm{home})\) rel_rms \(=9.3\times10^{-5}\)，与噪声底同量级，和 analog \(\mathrm{Tr}\) 一致。
+
+**短波慢射。** 几乎不吸收，通量可以下到海再散回天，但云顶 BRF 主体仍是云内多次散射。守恒 Eddington（\(g_{1600}=0.847\)，\(\tau=11.53\)，\(\gamma=0.75(1-g)\approx0.115\)）：\(R=\gamma\tau/(1+\gamma\tau)\approx0.57\)，\(T\approx0.43\)。海面 \(\rho=0.04\) 对 TOA 的相对贡献 \(\approx T\rho T/R\approx1\%\)。
+
+横向：\(\bar k\approx0.044\,\mathrm{m}^{-1}\)，\(\ell_{\mathrm{tr}}=1/(k(1-g))\approx150\,\mathrm{m}\)，云厚 \(H\approx260\,\mathrm{m}\)，\(\tau_{\mathrm{tr}}=\tau(1-g)\approx1.8\)。云底 70 m 物体在云顶糊成数百米。面积占空 \(\approx5000/(\pi\,200^2)\approx4\%\)。量级 \(1\%\times4\%\approx4\times10^{-4}\)。已测 SWIR \((+200-\mathrm{home})/L\) rms \(=4.7\times10^{-4}\)（`scenes/fire_gs/swir_uav_dx200_slab/record.json`），同量级。这是挡住一点本就弱的海面回传，再被横向混合，不是轮廓。
+
+**平移 200 m。** 200 m 与 \(\ell_{\mathrm{tr}}\)、\(H\) 同量级：原地和 +200 m 是同一模糊斑挪了一个扩散尺度。两根柱都是满盖 \(\tau\approx11\)。Woodcock 走满这段 \(\tau\)，不是把云下路径剪掉。
+
+有机 HTCP+机 减 反演柱板（20 m 平滑）：
+
+| | 有机/无机 rms | 200 m 位移 rms | 两幅残差相关 |
+|--|--|--|--|
+| SWIR | 9.7%（LES 孔/泡） | 0.047% ≈ 1/200 | 0.99999 |
+| LWIR | 0.18%（皮肤 \(T\)） | 0.00089% ≈ 1/200 | 0.9997 |
+
+两幅差图重合，是位移项已被消光和扩散吃掉，不是反演把飞机洽掉了。能分三维云对柱板；分不了这 200 m。长波 \(L\) 对整柱 \(k_{\mathrm{ext}}\) 本来不敏感，不能拿长波闭环验 \(k\)。要看机身：云底往上看、云缝，或微波（本仓库没有微波正演）。
+
+---
+
+## 10. 不要做的事
 
 - 不要给 SWIR 走 \(k_{\mathrm{ext}}\) 或 `mie_omega=0`（会与 analog \(\mathrm{Tr}(k_a)\) 双重吸收）。
 - 不要给红外 λ 调 `load_ecrad_gas_1d`。
@@ -254,11 +298,12 @@ LW 若再乘 \(\mathrm{Tr}(k_a)\)，权重变成 \(\mathrm{e}^{-\tau_s-2\tau_a}\
 - 不要把 LWIR 改回 8–12 μm 均匀抽 λ。
 - 不要为「看起来有大气」编 3D \(q_v\) 或第三块沙面。
 - 不要用无限 XY / `ATM_WRAP_XY` 修 nadir 地面。
+- 不要把云顶正视 ΔL 当成云下 An-124 位移的探测：满盖 τ≈11 时弹道/慢射在 \(10^{-5}\)–\(10^{-4}\)，见 §9。
 - 改核必须清 OptiX 缓存并升 `ATM_KERNEL_REV`。
 
 ---
 
-## 10. 文件锚点
+## 11. 文件锚点
 
 | | |
 |--|--|
@@ -267,4 +312,8 @@ LW 若再乘 \(\mathrm{Tr}(k_a)\)，权重变成 \(\mathrm{e}^{-\tau_s-2\tau_a}\
 | Planck、Woodcock、`atm_lw_bind_path` / `atm_sw_bind_wavelength` | `atmosphere.cuh` |
 | `load_ecrad_gas_1d_lw` / `require_sw_band` / `require_sw_h2o` | `tools/mountain_gs_scene.py` |
 | FIRE 三档 | `tools/render_fire_shahed_bands.py` |
+| analog 柱 | 同文件 `analog_column` |
+| 柱反演 / 板 | `tools/retrieve_fire_sc_rte.py`，`scenes/fire_gs/retrieve_rte/` |
+| LWIR 原地 vs +200 m | `tools/compare_fire_lwir_an124_dx200.py` |
+| 有机−反演板 SWIR / LWIR | `tools/compare_fire_swir_uav_dx200_slab.py`、`compare_fire_lwir_uav_dx200_slab.py` |
 | htrdr 对照 | `tools/render_htrdr_fire_swir1600.sh`、`_mwir.sh`、`_lwir.sh` |

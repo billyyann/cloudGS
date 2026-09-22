@@ -1,0 +1,73 @@
+{
+  "stamp": "20260922_153920",
+  "geometry": {
+    "H_m": 3022.738970588235,
+    "film_w_m": 2349.1,
+    "film_h_m": 2349.1,
+    "nx": 512,
+    "ny": 512,
+    "gsd_m": 4.5880859375,
+    "gsd_optics_m": 4.723029641544118,
+    "half_need_m": 1174.55,
+    "water_m": 2549.1
+  },
+  "lambda_nm": 1600.0,
+  "spp": 1024,
+  "seed": 0,
+  "L_offset": 0.0,
+  "L_scale": 428336.30125,
+  "L_calibration": "u16_shared_0_stack_p99.5; beauty=SS_MTF_box2x; RTE_pre_MTF_in_ss_npy",
+  "downsample_csv": "/home/szyj2025/scatterGS/cloudGS/scenes/fire_gs/swir_video5s/downsample_2x_box.csv",
+  "mtf_csv": "/home/szyj2025/scatterGS/cloudGS/scenes/fire_gs/swir_video5s/detector_mtf_gaussian.csv",
+  "ss": 2,
+  "swir_rho_body": 0.16,
+  "swir_rho_engine": 0.06,
+  "water_rho": 0.03999999910593033,
+  "note": "No sky pad. Sea rho=0.04 matches htrdr IR LUT. MTF is detector/optical only.",
+  "detector_nx": 512,
+  "detector_ny": 512,
+  "cases": {
+    "clear_off": {
+      "npy": "/home/szyj2025/scatterGS/cloudGS/scenes/fire_gs/swir_video5s/gate/gpu_swir_clear_off_spp1024.npy",
+      "npy_ss": "/home/szyj2025/scatterGS/cloudGS/scenes/fire_gs/swir_video5s/gate/gpu_swir_clear_off_spp1024_ss2.npy",
+      "cloud_mode": "none",
+      "has_aircraft": 1,
+      "mean": 420739.8303840142,
+      "downsample_csv": "/home/szyj2025/scatterGS/cloudGS/scenes/fire_gs/swir_video5s/downsample_2x_box.csv",
+      "mtf_csv": "/home/szyj2025/scatterGS/cloudGS/scenes/fire_gs/swir_video5s/detector_mtf_gaussian.csv",
+      "ss": 2,
+      "swir_rho_body": 0.16,
+      "swir_rho_engine": 0.06,
+      "water_rho": 0.03999999910593033,
+      "png": "/home/szyj2025/scatterGS/cloudGS/scenes/fire_gs/swir_video5s/gate/swir_clear_off_spp1024_20260922_153920.png",
+      "png_u8": "/home/szyj2025/scatterGS/cloudGS/scenes/fire_gs/swir_video5s/gate/swir_clear_off_spp1024_20260922_153920_u8.png"
+    }
+  },
+  "mie": {
+    "Cs": 163.127673573627,
+    "Ca": 1.0705201417787,
+    "g": 0.8468360632674,
+    "omega_dump": 0.9934803171852538
+  },
+  "imaging_csv": "/home/szyj2025/scatterGS/cloudGS/scenes/fire_gs/swir_video5s/gate/imaging.csv",
+  "target_csv": "/home/szyj2025/scatterGS/cloudGS/scenes/fire_gs/swir_video5s/gate/target.csv",
+  "scene_csv": "/home/szyj2025/scatterGS/cloudGS/scenes/fire_gs/swir_video5s/gate/scene.csv",
+  "accept_clear_off": {
+    "body_core_mean": 1004691.0509776536,
+    "body_bbox_mean": 785465.265516493,
+    "sea_corner_mean": 420266.48973083496,
+    "contrast_body_sea": 2.3906047127885945,
+    "contrast_bbox_sea": 1.8689695341152568,
+    "peak_sea": 3.520424626164164,
+    "shadow_p1": 413723.0403125,
+    "edge_grad_mean": 22124.628313202724,
+    "edge_grad_p95": 129744.57041857894,
+    "core_npix": 179,
+    "target_contrast": [
+      2.0,
+      4.0
+    ],
+    "ok_contrast": true,
+    "ok_shadow_not_near_zero": true
+  }
+}

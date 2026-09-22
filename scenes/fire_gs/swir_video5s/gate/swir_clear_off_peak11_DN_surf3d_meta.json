@@ -1,0 +1,7 @@
+{
+  "L_scale": 7700000.0,
+  "L_offset": 0.0,
+  "DN_peak": 12592.0,
+  "DN_sea": 3576.5,
+  "note": "absolute DN vs cloudy-scale; not peak-normalized"
+}
