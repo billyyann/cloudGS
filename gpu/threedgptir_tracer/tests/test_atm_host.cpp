@@ -284,6 +284,21 @@ int main() {
         expect_near("analog_xy_wrap_tau", tau_w, k * tmax_w, 0.05);
     }
 
+    /* htgop three-case fetch: below first knot, linear through zero, log-log. */
+    {
+        const float xt[3] = {0.01f, 0.02f, 0.04f};
+        const float kt[3] = {1.f, 4.f, 16.f};
+        expect_near("htgop_k_below", atm_htgop_tab_k(xt, kt, 3, 0.005f), 0.5, 1e-5);
+        expect_near("htgop_k_zero_k", atm_htgop_tab_k(xt, kt, 3, 0.0f), 0.0, 1e-12);
+        const float kmid = atm_htgop_tab_k(xt, kt, 3, 0.02f);
+        expect_near("htgop_k_knot", kmid, 4.0, 1e-5);
+        const float kll = atm_htgop_tab_k(xt, kt, 3, 0.028284271f); /* sqrt(0.02*0.04) → sqrt(4*16)=8 */
+        expect_near("htgop_k_loglog", kll, 8.0, 0.05);
+        const float kz[2] = {0.f, 2.f};
+        const float xz[2] = {0.01f, 0.02f};
+        expect_near("htgop_k_linear_zero", atm_htgop_tab_k(xz, kz, 2, 0.015f), 1.0, 1e-5);
+    }
+
     if (g_fail) {
         std::fprintf(stderr, "%d checks failed\n", g_fail);
         return 1;

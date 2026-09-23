@@ -247,6 +247,28 @@ ATM_FN float atm_fetch_temp(const struct AtmVoxelGrid* g, int ix, int iy, int iz
     return g->temperature[atm_voxel_index(g, ix, iy, iz)];
 }
 
+/* HTCP T only inside the finite cloud AABB. No XY wrap (htrdr in-cloud T). */
+ATM_FN float atm_fetch_temp_aabb(const struct AtmVoxelGrid* g, const float p[3], const float* z_iface) {
+    if (!g || !g->temperature || g->nx <= 0 || g->ny <= 0 || g->nz <= 0) {
+        return 0.f;
+    }
+    int ijk[3];
+    atm_world_to_ijk(g, p, ijk, z_iface);
+    if (!atm_in_grid(g, ijk[0], ijk[1], ijk[2])) {
+        return 0.f;
+    }
+    return g->temperature[atm_voxel_index(g, ijk[0], ijk[1], ijk[2])];
+}
+
+/* Planck T: HTCP if the point is in the cloud box, else HTGOP layer T. */
+ATM_FN float atm_event_temperature(const struct AtmParams* atm, const float p[3], float gas_T) {
+    if (!atm) {
+        return gas_T;
+    }
+    const float tv = atm_fetch_temp_aabb(&atm->voxels, p, atm->voxel_z_iface);
+    return tv > 0.f ? tv : gas_T;
+}
+
 ATM_FN float atm_brick_kmax(const struct AtmVoxelGrid* g, int bx, int by, int bz) {
     if (!g->kext_max || g->nbx <= 0 || g->nby <= 0) {
         return 0.f;
@@ -569,8 +591,139 @@ ATM_FN void atm_woodcock_brick(
     }
 }
 
+ATM_FN int atm_gas_layer_id(const struct AtmGasLayers* gas, float z) {
+    if (!gas || gas->nlayers <= 0 || !gas->z_iface) {
+        return -1;
+    }
+    for (int i = 0; i < gas->nlayers; ++i) {
+        if (z >= gas->z_iface[i] && z < gas->z_iface[i + 1]) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* SPECTRAL_SW + host-bound LES humidity. CIE/LW keep pointers null. */
+ATM_FN int atm_sw_h2o_on(const struct AtmParams* atm) {
+    return atm && atm->spectral_mode == ATM_SPECTRAL_SW && atm->cie_enabled == 0 &&
+           atm->voxel_x_h2o && atm->sw_h2o_ka && atm->sw_h2o_ks && atm->sw_h2o_x &&
+           atm->sw_h2o_n && atm->sw_h2o_ntab > 0 && atm->path_sw_iband >= 0 &&
+           atm->path_sw_iquad >= 0 && atm->gas.nlayers > 0;
+}
+
+/* htgop_layer_sw_spectral_interval_tab_fetch_* three cases. x<=0 or empty tab → 0. */
+ATM_FN float atm_htgop_tab_k(const float* x_tab, const float* k_tab, int n, float x) {
+    if (!x_tab || !k_tab || n <= 0 || x <= 0.f) {
+        return 0.f;
+    }
+    const float x_first = x_tab[0];
+    const float k_first = k_tab[0];
+    if (x < x_first) {
+        if (x_first <= 0.f) {
+            return 0.f;
+        }
+        return x * k_first / x_first;
+    }
+    if (n == 1 || x >= x_tab[n - 1]) {
+        return k_tab[n - 1];
+    }
+    int i = 0;
+    for (; i < n - 1; ++i) {
+        if (x <= x_tab[i + 1]) {
+            break;
+        }
+    }
+    const float x1 = x_tab[i];
+    const float x2 = x_tab[i + 1];
+    const float k1 = k_tab[i];
+    const float k2 = k_tab[i + 1];
+    if (x2 <= x1) {
+        return k1;
+    }
+    if (k1 <= 0.f || k2 <= 0.f) {
+        return k1 + (k2 - k1) / (x2 - x1) * (x - x1);
+    }
+    const float lx = logf(x);
+    const float lx1 = logf(x1);
+    const float lx2 = logf(x2);
+    if (lx2 == lx1) {
+        return k1;
+    }
+    const float alpha = (logf(k2) - logf(k1)) / (lx2 - lx1);
+    const float beta = logf(k1) - alpha * lx1;
+    return expf(alpha * lx + beta);
+}
+
+ATM_FN float atm_fetch_x_h2o(const struct AtmParams* atm, const float p[3]) {
+    if (!atm || !atm->voxel_x_h2o || atm->voxels.nx <= 0) {
+        return -1.f;
+    }
+    int ijk[3];
+    atm_world_to_ijk(&atm->voxels, p, ijk, atm->voxel_z_iface);
+    if (ijk[2] < 0 || ijk[2] >= atm->voxels.nz) {
+        return -1.f;
+    }
+    atm_wrap_xy_cell(&atm->voxels, &ijk[0], &ijk[1]);
+    if (ijk[0] < 0 || ijk[1] < 0 || ijk[0] >= atm->voxels.nx || ijk[1] >= atm->voxels.ny) {
+        return -1.f;
+    }
+    return atm->voxel_x_h2o[atm_voxel_index(&atm->voxels, ijk[0], ijk[1], ijk[2])];
+}
+
+ATM_FN void atm_sw_gas_k_at(const struct AtmParams* atm, const float p[3], float* ka, float* ks) {
+    *ka = 0.f;
+    *ks = 0.f;
+    if (!atm) {
+        return;
+    }
+    const int layer = atm_gas_layer_id(&atm->gas, p[2]);
+    if (layer < 0) {
+        return;
+    }
+    *ka = atm->gas.ka ? atm->gas.ka[layer] : 0.f;
+    *ks = atm->gas.ks ? atm->gas.ks[layer] : 0.f;
+    if (!atm_sw_h2o_on(atm)) {
+        return;
+    }
+    const float x = atm_fetch_x_h2o(atm, p);
+    if (x < 0.f) {
+        return;
+    }
+    const int ntab = atm->sw_h2o_ntab;
+    const int n = atm->sw_h2o_n[layer];
+    if (n <= 0 || ntab <= 0) {
+        return;
+    }
+    const int ib = atm->path_sw_iband;
+    const int iq = atm->path_sw_iquad;
+    const int nqmax = atm->sw_nquad_max > 0 ? atm->sw_nquad_max : 1;
+    const int nlayers = atm->gas.nlayers;
+    const int base = ((ib * nqmax + iq) * nlayers + layer) * ntab;
+    const float* x_tab = atm->sw_h2o_x + layer * ntab;
+    *ka = atm_htgop_tab_k(x_tab, atm->sw_h2o_ka + base, n < ntab ? n : ntab, x);
+    *ks = atm_htgop_tab_k(x_tab, atm->sw_h2o_ks + base, n < ntab ? n : ntab, x);
+}
+
+ATM_FN float atm_sw_h2o_ks_hat(const struct AtmParams* atm, int layer) {
+    float hat = 0.f;
+    if (!atm || layer < 0 || layer >= atm->gas.nlayers) {
+        return 0.f;
+    }
+    if (atm->gas.ks) {
+        hat = atm->gas.ks[layer];
+    }
+    if (!atm_sw_h2o_on(atm) || !atm->sw_h2o_ks_max) {
+        return hat;
+    }
+    const int nqmax = atm->sw_nquad_max > 0 ? atm->sw_nquad_max : 1;
+    const int idx = (atm->path_sw_iband * nqmax + atm->path_sw_iquad) * atm->gas.nlayers + layer;
+    const float t = atm->sw_h2o_ks_max[idx];
+    return t > hat ? t : hat;
+}
+
 /* 1D layered gas: SW walks ks (scatter only); LW walks kext then ka/ks split.
- * Writes *hit (NVRTC must not return AtmHit by value). */
+ * Writes *hit (NVRTC must not return AtmHit by value).
+ * SPECTRAL_SW + x_H2O: Woodcock with layer hat ks, accept ks(x)/hat. */
 template <typename Rng>
 ATM_FN void atm_gas_free_path_into(
     const struct AtmGasLayers* gas,
@@ -579,29 +732,24 @@ ATM_FN void atm_gas_free_path_into(
     float tmax,
     Rng& rng,
     int walk_ks,
-    struct AtmHit* hit) {
+    struct AtmHit* hit,
+    const struct AtmParams* atm = nullptr) {
     atm_hit_clear(hit);
     if (!gas || !hit || gas->nlayers <= 0 || !gas->z_iface || tmax <= 1e-8f) {
         return;
     }
+    const int h2o = walk_ks && atm_sw_h2o_on(atm);
     float Ts = atm_ran_exp(rng.next_1d());
     float t = 0.f;
     float z = org[2];
     const float dz = dir[2];
+    const int nsafe = h2o ? (gas->nlayers * 64 + 256) : (gas->nlayers * 4 + 8);
 
-    for (int safety = 0; safety < gas->nlayers * 4 + 8; ++safety) {
+    for (int safety = 0; safety < nsafe; ++safety) {
         if (t >= tmax) {
             break;
         }
-        int layer = -1;
-        for (int i = 0; i < gas->nlayers; ++i) {
-            const float z0 = gas->z_iface[i];
-            const float z1 = gas->z_iface[i + 1];
-            if (z >= z0 && z < z1) {
-                layer = i;
-                break;
-            }
-        }
+        int layer = atm_gas_layer_id(gas, z);
         if (layer < 0) {
             /* Outside atmosphere: skip to next interface if heading toward it */
             if (dz > 0.f && z < gas->z_iface[0]) {
@@ -634,33 +782,47 @@ ATM_FN void atm_gas_free_path_into(
                 t_exit_layer = 0.f;
             }
         }
-        const float ka = gas->ka ? gas->ka[layer] : 0.f;
-        const float ks = gas->ks ? gas->ks[layer] : 0.f;
-        const float kext = ka + ks;
-        const float k_walk = walk_ks ? ks : kext;
-        if (k_walk <= 1e-12f) {
+        float ka = gas->ka ? gas->ka[layer] : 0.f;
+        float ks = gas->ks ? gas->ks[layer] : 0.f;
+        float k_hat = walk_ks ? ks : (ka + ks);
+        if (h2o) {
+            const float hat = atm_sw_h2o_ks_hat(atm, layer);
+            if (hat > k_hat) {
+                k_hat = hat;
+            }
+        }
+        if (k_hat <= 1e-12f) {
             t += t_exit_layer + atm_ray_eps(t);
             z = org[2] + dir[2] * t;
             continue;
         }
-        const float Tau = t_exit_layer * k_walk;
+        const float Tau = t_exit_layer * k_hat;
         if (Ts > Tau) {
             Ts -= Tau;
             t += t_exit_layer + atm_ray_eps(t);
             z = org[2] + dir[2] * t;
             continue;
         }
-        const float dt = Ts / k_walk;
+        const float dt = Ts / k_hat;
         t += dt;
         if (t > tmax) {
             break;
         }
         float pos[3] = {org[0] + dir[0] * t, org[1] + dir[1] * t, org[2] + dir[2] * t};
+        if (h2o) {
+            atm_sw_gas_k_at(atm, pos, &ka, &ks);
+            if (rng.next_1d() * k_hat >= ks) {
+                Ts = atm_ran_exp(rng.next_1d());
+                z = pos[2];
+                continue;
+            }
+        }
+        const float kext = ka + ks;
         if (walk_ks) {
             hit->event = ATM_EVENT_SCATTER_GAS;
         } else {
             const float r = rng.next_1d();
-            hit->event = (r < ka / kext) ? ATM_EVENT_ABSORB_GAS : ATM_EVENT_SCATTER_GAS;
+            hit->event = (kext > 1e-20f && r < ka / kext) ? ATM_EVENT_ABSORB_GAS : ATM_EVENT_SCATTER_GAS;
         }
         hit->t = t;
         hit->pos[0] = pos[0];
@@ -669,7 +831,10 @@ ATM_FN void atm_gas_free_path_into(
         hit->ka = ka;
         hit->ks = ks;
         hit->kext = kext;
-        hit->temperature = gas->temperature ? gas->temperature[layer] : 0.f;
+        {
+            const float gas_T = gas->temperature ? gas->temperature[layer] : 0.f;
+            hit->temperature = atm_event_temperature(atm, pos, gas_T);
+        }
         return;
     }
 }
@@ -955,6 +1120,21 @@ ATM_FN void atm_mesh_hit_clear(struct AtmMeshHit* h) {
     h->temperature = 0.f;
 }
 
+ATM_FN int atm_mesh_mat_id(const struct AtmParams* atm, int prim) {
+    if (!atm || prim < 0 || prim >= atm->mesh.ntri || !atm->mesh_mat_id) {
+        return ATM_MTL_SPECTRAL_LAMBERT;
+    }
+    return atm->mesh_mat_id[prim];
+}
+
+ATM_FN int atm_mesh_use_spectral_lambert(const struct AtmParams* atm, int prim) {
+    return atm_mesh_mat_id(atm, prim) == ATM_MTL_SPECTRAL_LAMBERT;
+}
+
+ATM_FN int atm_mesh_use_spectral_specular(const struct AtmParams* atm, int prim) {
+    return atm_mesh_mat_id(atm, prim) == ATM_MTL_SPECTRAL_SPECULAR;
+}
+
 ATM_FN struct AtmMeshHit atm_mesh_closest_hit(
     const struct AtmMesh* mesh,
     const float org[3],
@@ -1147,7 +1327,7 @@ ATM_FN void atm_next_volume_event_into(
     const float omega_arg = atm->mie_omega > 0.f ? atm->mie_omega : -1.f;
     struct AtmHit gas;
     struct AtmHit vox;
-    atm_gas_free_path_into(&atm->gas, org, dir, tmax, rng, walk_ks, &gas);
+    atm_gas_free_path_into(&atm->gas, org, dir, tmax, rng, walk_ks, &gas, atm);
     atm_woodcock_voxels_into(
         &atm->voxels,
         org,
@@ -1348,12 +1528,13 @@ ATM_HEAVY_FN float atm_voxel_optical_depth(
     return tau;
 }
 
-ATM_FN float atm_gas_optical_depth(
+ATM_HEAVY_FN float atm_gas_optical_depth(
     const struct AtmGasLayers* gas,
     const float org[3],
     const float dir[3],
     float tmax,
-    int kind = ATM_K_EXT) {
+    int kind = ATM_K_EXT,
+    const struct AtmParams* atm = nullptr) {
     if (!gas || gas->nlayers <= 0 || !gas->z_iface || tmax <= 1e-8f) {
         return 0.f;
     }
@@ -1405,9 +1586,60 @@ ATM_FN float atm_gas_optical_depth(
                 t_exit_layer = 0.f;
             }
         }
-        const float ds = fminf(t_exit_layer, tmax - t);
-        tau += atm_layer_k(gas, layer, kind) * fmaxf(ds, 0.f);
-        t += ds + atm_ray_eps(t);
+        const float ds_layer = fminf(t_exit_layer, tmax - t);
+        if (atm_sw_h2o_on(atm) && ds_layer > 0.f) {
+            float t_seg = 0.f;
+            const float dxv = atm->voxels.dx > 1e-6f ? atm->voxels.dx : 1.f;
+            const float dyv = atm->voxels.dy > 1e-6f ? atm->voxels.dy : 1.f;
+            const float step_cap = fminf(dxv, dyv);
+            for (int s = 0; s < 100000 && t_seg < ds_layer - 1e-8f; ++s) {
+                float p[3] = {
+                    org[0] + dir[0] * (t + t_seg),
+                    org[1] + dir[1] * (t + t_seg),
+                    org[2] + dir[2] * (t + t_seg)};
+                float t_next = ds_layer;
+                if (atm->voxels.nx > 0 && atm->voxels.dx > 1e-12f && fabsf(dir[0]) > 1e-20f) {
+                    const float ix = floorf((p[0] - atm->voxels.origin[0]) / atm->voxels.dx);
+                    const float xb = atm->voxels.origin[0] +
+                                     (dir[0] > 0.f ? (ix + 1.f) : ix) * atm->voxels.dx;
+                    const float tx = (xb - org[0]) / dir[0] - t;
+                    if (tx > t_seg && tx < t_next) {
+                        t_next = tx;
+                    }
+                }
+                if (atm->voxels.ny > 0 && atm->voxels.dy > 1e-12f && fabsf(dir[1]) > 1e-20f) {
+                    const float iy = floorf((p[1] - atm->voxels.origin[1]) / atm->voxels.dy);
+                    const float yb = atm->voxels.origin[1] +
+                                     (dir[1] > 0.f ? (iy + 1.f) : iy) * atm->voxels.dy;
+                    const float ty = (yb - org[1]) / dir[1] - t;
+                    if (ty > t_seg && ty < t_next) {
+                        t_next = ty;
+                    }
+                }
+                if (t_next <= t_seg) {
+                    t_next = fminf(ds_layer, t_seg + step_cap);
+                }
+                const float ds = t_next - t_seg;
+                float pmid[3] = {
+                    org[0] + dir[0] * (t + t_seg + 0.5f * ds),
+                    org[1] + dir[1] * (t + t_seg + 0.5f * ds),
+                    org[2] + dir[2] * (t + t_seg + 0.5f * ds)};
+                float ka = 0.f;
+                float ks = 0.f;
+                atm_sw_gas_k_at(atm, pmid, &ka, &ks);
+                float kv = ka + ks;
+                if (kind == ATM_K_KA) {
+                    kv = ka;
+                } else if (kind == ATM_K_KS) {
+                    kv = ks;
+                }
+                tau += kv * fmaxf(ds, 0.f);
+                t_seg = t_next;
+            }
+        } else {
+            tau += atm_layer_k(gas, layer, kind) * fmaxf(ds_layer, 0.f);
+        }
+        t += ds_layer + atm_ray_eps(t);
         z = org[2] + dir[2] * t;
     }
     return tau;
@@ -1428,7 +1660,7 @@ ATM_FN float atm_optical_depth(
                atm_path_ks_scale(atm),
                atm_path_ka_scale(atm),
                atm->voxel_z_iface) +
-           atm_gas_optical_depth(&atm->gas, org, dir, tmax, kind);
+           atm_gas_optical_depth(&atm->gas, org, dir, tmax, kind, atm);
 }
 
 ATM_FN float atm_transmittance_kind(
@@ -1656,6 +1888,117 @@ ATM_FN void atm_cie_bind_path(struct AtmParams* atm, int ch, float r0, float r1,
     const int nlayers = atm->gas.nlayers;
     atm->gas.ka = atm->sw_gas_ka + ((ib * nqmax + iq) * nlayers);
     atm->gas.ks = atm->sw_gas_ks + ((ib * nqmax + iq) * nlayers);
+    if (atm->mie_cs_band && atm->mie_cs_ref > 0.f) {
+        atm->path_ks_scale = atm->mie_cs_band[ib] / atm->mie_cs_ref;
+    }
+    if (atm->mie_ca_band && atm->mie_ca_ref > 0.f) {
+        atm->path_ka_scale = atm->mie_ca_band[ib] / atm->mie_ca_ref;
+    }
+}
+
+ATM_FN void atm_apply_mie_g(struct AtmParams* atm, float wlen_nm) {
+    if (!atm->mie_g_nm || atm->mie_g_n <= 1 || atm->mie_g_dlambda_nm <= 0.f) {
+        return;
+    }
+    float x = (wlen_nm - atm->mie_g_lambda0_nm) / atm->mie_g_dlambda_nm;
+    if (x < 0.f) {
+        x = 0.f;
+    }
+    const float xmax = (float)(atm->mie_g_n - 1);
+    if (x > xmax) {
+        x = xmax;
+    }
+    const int i0 = (int)x;
+    const int i1 = i0 + 1 < atm->mie_g_n ? i0 + 1 : i0;
+    const float t = x - (float)i0;
+    atm->mie_g = atm->mie_g_nm[i0] * (1.f - t) + atm->mie_g_nm[i1] * t;
+}
+
+ATM_FN int atm_lw_find_band(const struct AtmParams* atm, float wlen_nm) {
+    if (!atm || atm->lw_nbands <= 0 || !atm->lw_lambda_lo_nm || !atm->lw_lambda_hi_nm) {
+        return -1;
+    }
+    for (int i = 0; i < atm->lw_nbands; ++i) {
+        if (wlen_nm >= atm->lw_lambda_lo_nm[i] && wlen_nm < atm->lw_lambda_hi_nm[i]) {
+            return i;
+        }
+    }
+    const int last = atm->lw_nbands - 1;
+    if (wlen_nm >= atm->lw_lambda_lo_nm[last] && wlen_nm <= atm->lw_lambda_hi_nm[last]) {
+        return last;
+    }
+    return -1;
+}
+
+/* Monochromatic SW: wavelength_m already set. Sample iquad, bind gas + Mie scale. */
+ATM_FN void atm_sw_bind_wavelength(struct AtmParams* atm, float r_quad) {
+    const float wlen_nm = atm->wavelength_m * 1.0e9f;
+    atm->sun.radiance = atm_planck_monochromatic(atm->wavelength_m, 5778.f);
+    atm->path_ks_scale = 1.f;
+    atm->path_ka_scale = 1.f;
+    atm_apply_mie_g(atm, wlen_nm);
+    atm->path_sw_iband = -1;
+    atm->path_sw_iquad = -1;
+    const int ib = atm_sw_find_band(atm, wlen_nm);
+    if (ib < 0 || !atm->sw_gas_ka || !atm->sw_gas_ks || atm->gas.nlayers <= 0) {
+        return;
+    }
+    int nq = 1;
+    if (atm->sw_nquad && ib < atm->sw_nbands) {
+        nq = atm->sw_nquad[ib];
+    }
+    if (nq < 1) {
+        nq = 1;
+    }
+    const int nqmax = atm->sw_nquad_max > 0 ? atm->sw_nquad_max : nq;
+    int iq = 0;
+    if (atm->sw_quad_cdf && nq > 1) {
+        iq = atm_sample_quad(atm->sw_quad_cdf + ib * nqmax, nq, r_quad);
+    }
+    const int nlayers = atm->gas.nlayers;
+    atm->gas.ka = atm->sw_gas_ka + ((ib * nqmax + iq) * nlayers);
+    atm->gas.ks = atm->sw_gas_ks + ((ib * nqmax + iq) * nlayers);
+    atm->path_sw_iband = ib;
+    atm->path_sw_iquad = iq;
+    if (atm->mie_cs_band && atm->mie_cs_ref > 0.f) {
+        atm->path_ks_scale = atm->mie_cs_band[ib] / atm->mie_cs_ref;
+    }
+    if (atm->mie_ca_band && atm->mie_ca_ref > 0.f) {
+        atm->path_ka_scale = atm->mie_ca_band[ib] / atm->mie_ca_ref;
+    }
+}
+
+/* LW: bind gas.ka from the RRTMG band that contains host wavelength_m.
+ * Monochromatic dump λ — GPU MWIR is 4000 nm (htrdr -s lw=4000,4001), not CIE/SW.
+ * r_lam unused. ks left as host 1D (must be 0). Cloud k scaled to C̄(Δν) like htrdr.
+ * Host sun.radiance>0 → Planck 5778 K (not htrdr LW). Else no sun. */
+ATM_FN void atm_lw_bind_path(struct AtmParams* atm, float r_lam, float r_quad) {
+    (void)r_lam;
+    atm->path_ks_scale = 1.f;
+    atm->path_ka_scale = 1.f;
+    if (atm->sun.radiance > 0.f) {
+        atm->sun.radiance = atm_planck_monochromatic(atm->wavelength_m, 5778.f);
+    } else {
+        atm->sun.radiance = 0.f;
+    }
+    const float wlen_nm = atm->wavelength_m * 1.0e9f;
+    const int ib = atm_lw_find_band(atm, wlen_nm);
+    if (ib < 0 || !atm->lw_gas_ka || atm->gas.nlayers <= 0) {
+        return;
+    }
+    int nq = 1;
+    if (atm->lw_nquad && ib < atm->lw_nbands) {
+        nq = atm->lw_nquad[ib];
+    }
+    if (nq < 1) {
+        nq = 1;
+    }
+    const int nqmax = atm->lw_nquad_max > 0 ? atm->lw_nquad_max : nq;
+    int iq = 0;
+    if (atm->lw_quad_cdf && nq > 1) {
+        iq = atm_sample_quad(atm->lw_quad_cdf + ib * nqmax, nq, r_quad);
+    }
+    atm->gas.ka = atm->lw_gas_ka + ((ib * nqmax + iq) * atm->gas.nlayers);
     if (atm->mie_cs_band && atm->mie_cs_ref > 0.f) {
         atm->path_ks_scale = atm->mie_cs_band[ib] / atm->mie_cs_ref;
     }

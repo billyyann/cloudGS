@@ -13,6 +13,13 @@ enum AtmSpectralMode {
     ATM_SPECTRAL_SW_CIE_XYZ = 2 /* htrdr default image: CIE 1931 380-780 nm */
 };
 
+/* Scene mesh materials. Kernel does not know "sand"; slot 0 is the LUT the host bound. */
+enum AtmMeshMaterial {
+    ATM_MTL_SPECTRAL_LAMBERT = 0, /* brdf_lambda_nm / brdf_R */
+    ATM_MTL_RGB_LAMBERT = 1,      /* mesh.albedo[tri] */
+    ATM_MTL_SPECTRAL_SPECULAR = 2 /* htrdr ssf_specular: Dirac + ρ(λ) from the same LUT */
+};
+
 enum AtmEvent {
     ATM_EVENT_NONE = 0,
     ATM_EVENT_ABSORB_VOXEL,
@@ -93,11 +100,11 @@ struct AtmParams {
     const float* sw_lambda_hi_nm; /* [sw_nbands] */
     const float* sw_gas_ka;       /* [sw_nbands * sw_nquad_max * nlayers] */
     const float* sw_gas_ks;
-    /* sand.mrumtl lambertian knots; path_albedo set per CIE sample */
+    /* Spectral Lambert LUT from the scene (mountain.sh binds sand.mrumtl). */
     int brdf_n;
     const float* brdf_lambda_nm;
     const float* brdf_R;
-    float path_albedo; /* >=0 scalar R(λ); <0 use mesh RGB */
+    float path_albedo; /* this path's R(λ) from the LUT; <0 = no LUT */
     /* HTGOP quadrature (htrdr iquad) + htsky Mie band averages. Append only. */
     int sw_nquad_max;
     const int* sw_nquad;         /* [sw_nbands] */
@@ -119,6 +126,39 @@ struct AtmParams {
     int cie_split_launch;
     /* Original film spp (before CIE-split repeat). Compact launches have z=1. */
     int cie_spp;
+    /* Per-triangle AtmMeshMaterial. Null / empty = all SPECTRAL_LAMBERT. Append only. */
+    const int* mesh_mat_id;
+    /* Ground searchlight: Lambert disk in a cone. Le = sun.radiance * (L_lamp / L_sun).
+     * L_lamp from real xenon lumens, not a small sun. Append only. */
+    int spot_enabled;
+    float spot_pos[3];
+    float spot_dir[3]; /* disk normal / beam axis, toward the target */
+    float spot_sun_scale;
+    float spot_cos_half;
+    float spot_radius;
+    /* HTGOP LW (RRTMG, ka only). Append only.
+     * SWIR is SW RTE. MWIR: host sun.radiance>0 → Planck sun + thermal emit.
+     * LWIR: host sun.radiance=0 → thermal only.
+     * MWIR dump λ = 4000 nm (htrdr -s lw=4000,4001). Not CIE, not SW.
+     * blue_water.mrumtl zeros ρ after 2.08 μm — IR must not bind it. */
+    int lw_nbands;
+    int lw_nquad_max;
+    const float* lw_lambda_lo_nm;
+    const float* lw_lambda_hi_nm;
+    const float* lw_gas_ka; /* [lw_nbands * lw_nquad_max * nlayers] */
+    const int* lw_nquad;
+    const float* lw_quad_cdf;
+    /* SPECTRAL_SW only: LES x_H2O in the HTCP box + HTGOP humidity tabs.
+     * CIE/LW leave these null. Append only. */
+    const float* voxel_x_h2o; /* [nz*ny*nx]; <0 => no LES sample, use nominal */
+    int sw_h2o_ntab;
+    const int* sw_h2o_n;       /* [nlayers] knots per layer */
+    const float* sw_h2o_x;     /* [nlayers * sw_h2o_ntab] */
+    const float* sw_h2o_ka;    /* [sw_nbands * sw_nquad_max * nlayers * sw_h2o_ntab] */
+    const float* sw_h2o_ks;
+    const float* sw_h2o_ks_max; /* [sw_nbands * sw_nquad_max * nlayers] Woodcock hat ks */
+    int path_sw_iband; /* this path's HTGOP SW interval; -1 = unset */
+    int path_sw_iquad;
 };
 
 #ifdef __cplusplus

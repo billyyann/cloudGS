@@ -1,0 +1,9 @@
+{
+  "manifest1": "scenes/fire_gs/swir_video5s/manifest1.csv",
+  "manifest2": "scenes/fire_gs/swir_video5s/manifest2.csv",
+  "note": "Unified manifests. clouds + has_aircraft in one CSV. Gate: --manifest path",
+  "run": [
+    "python tools/render_fire_swir_gate_four.py --manifest scenes/fire_gs/swir_video5s/manifest1.csv",
+    "python tools/render_fire_swir_gate_four.py --manifest scenes/fire_gs/swir_video5s/manifest2.csv"
+  ]
+}

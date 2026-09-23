@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#define ATM_KERNEL_REV 58
+#define ATM_KERNEL_REV 79
 #include <3dgptir/pipelineParameters.h>
 #include <3dgptir/kernels/cuda/sampler.cuh>
 // clang-format on
@@ -25,7 +25,7 @@ __constant__ PipelineParameters params;
 #include <3dgptir/kernels/cuda/environment.cuh>
 #include <3dgptir/kernels/cuda/pathTracer.cuh>
 #include <3dgptir/kernels/cuda/atmospherePathTracer.cuh>
-/* NVRTC: ATM_KERNEL_REV 58 same-path CIE XYZ mixture MIS; ATM_CIE_SPLIT=1 for legacy. */
+/* NVRTC: ATM_KERNEL_REV 79 LW cloud k uses Cbar(band)/C(dump) like htrdr. */
 
 // Ablation early-return stages (only with ENABLE_RAYGEN_SETUP_PROFILING).
 // Official release: do not define ENABLE_RAYGEN_SETUP_PROFILING.
@@ -323,7 +323,7 @@ extern "C" __global__ void __intersection__vol() {
         &params.atmosphere.voxels, org, dir, tmax, rng, omega_arg, walk_ks, &vox, 1.f, 1.f,
         params.atmosphere.voxel_z_iface);
     atm_gas_free_path_into(
-        &params.atmosphere.gas, org, dir, tmax, rng, walk_ks, &gas);
+        &params.atmosphere.gas, org, dir, tmax, rng, walk_ks, &gas, &params.atmosphere);
     AtmHit hit;
     atm_hit_clear(&hit);
     if (gas.event != ATM_EVENT_NONE && gas.t <= vox.t && gas.t >= tmin && gas.t <= tmax) {

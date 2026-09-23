@@ -1,0 +1,2 @@
+case,cloud_mode,htcp_path,omega_dump,g,tau_mean,z_bot_m,z_top_m,t_skin_K,water_T_K,water_rho,water_size_m,gas_1d,place_x,place_y
+clear_off,none,/home/szyj2025/scatterGS/cloudGS/htrdr-atmosphere-spk/htrdr-Atmosphere-Starter-Pack-0.8.0/clouds/L25.1.FIRE.012.htcp,,,0.0,,,,290.0,0.03999999910593033,2549.1,1,13275.0,19725.0

@@ -198,11 +198,16 @@ def load_htcp_bin(path: str):
         ka = np.fromfile(f, dtype=np.float32, count=n).reshape(nz, ny, nx)
         temp = np.fromfile(f, dtype=np.float32, count=n).reshape(nz, ny, nx)
         z_iface = None
+        x_h2o = None
         if int(hdr[3]) >= 2:
             z = np.fromfile(f, dtype=np.float32, count=nz + 1)
             if z.size == nz + 1:
                 z_iface = z
-    return ka, ks, temp, origin, spacing, z_iface
+        if int(hdr[3]) >= 3:
+            xh = np.fromfile(f, dtype=np.float32, count=n)
+            if xh.size == n:
+                x_h2o = xh.reshape(nz, ny, nx)
+    return ka, ks, temp, origin, spacing, z_iface, x_h2o
 
 
 def analog_kext_tr(ka, ks, origin, spacing, org, direction, tmax=2.0e4, z_iface=None):
@@ -401,7 +406,7 @@ def main():
     p.add_argument(
         "--no-clouds",
         action="store_true",
-        help="zero voxel ka/ks and 1D gas so only GS+mesh ground is lit",
+        help="zero voxel ka/ks (keep 1D HTGOP gas / Rayleigh)",
     )
     p.add_argument(
         "--camera",
@@ -515,7 +520,7 @@ def main():
 
     z_iface = None
     if os.path.isfile(args.htcp_bin):
-        ka, ks, temp, origin, spacing, z_iface = load_htcp_bin(args.htcp_bin)
+        ka, ks, temp, origin, spacing, z_iface, _xh = load_htcp_bin(args.htcp_bin)
         print(
             f"voxels from htcp dump {ks.shape} origin={origin} dx={spacing} "
             f"z_iface={'yes' if z_iface is not None else 'no'}"
@@ -542,9 +547,7 @@ def main():
     if args.no_clouds:
         ka = np.zeros_like(ka)
         ks = np.zeros_like(ks)
-        gas_ka = np.zeros_like(gas_ka)
-        gas_ks = np.zeros_like(gas_ks)
-        print("no-clouds: voxel ka/ks and gas ka/ks zeroed")
+        print("no-clouds: voxel ka/ks zeroed, 1D gas kept")
     diagnose_cloud_sun_tr(ka, ks, origin, spacing, sun, z_iface=z_iface)
     buffers = AtmosphereBuffers.from_numpy(
         device=device,
@@ -575,11 +578,7 @@ def main():
     buffers.cie_lambda0_nm = float(cie["lambda0_nm"])
     buffers.cie_dlambda_nm = float(cie["dlambda_nm"])
     sw = mgs.load_ecrad_sw_visible()
-    if args.no_clouds:
-        sw_ka = np.zeros_like(sw["ka_quad"])
-        sw_ks = np.zeros_like(sw["ks_quad"])
-    else:
-        sw_ka, sw_ks = sw["ka_quad"], sw["ks_quad"]
+    sw_ka, sw_ks = sw["ka_quad"], sw["ks_quad"]
     buffers.sw_lambda_lo = torch.as_tensor(sw["lambda_lo_nm"], dtype=torch.float32, device=device)
     buffers.sw_lambda_hi = torch.as_tensor(sw["lambda_hi_nm"], dtype=torch.float32, device=device)
     buffers.sw_gas_ka = torch.as_tensor(sw_ka, dtype=torch.float32, device=device).contiguous()
@@ -613,6 +612,10 @@ def main():
         buffers.mesh_idx = torch.from_numpy(mountain_mesh["idx"]).to(device)
         buffers.mesh_albedo = torch.from_numpy(mountain_mesh["albedo"]).to(device)
         buffers.mesh_temp = torch.from_numpy(mountain_mesh["temp"]).to(device)
+        mat_id = mountain_mesh.get("mat_id")
+        if mat_id is None:
+            mat_id = np.zeros((mountain_mesh["idx"].shape[0],), np.int32)
+        buffers.mesh_mat_id = torch.from_numpy(np.ascontiguousarray(mat_id)).to(device)
     else:
         buffers.particle_density = gs["density"]
         buffers.particle_material = gs["material"]
