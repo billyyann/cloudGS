@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
-"""SWIR 1600 nm gate: four stills before the 5 s stare video.
+"""SWIR 1600 nm gate: render cases from unified manifest CSV(s).
 
-Cases:
-  cloud_org  HTCP + An-124 at stare center
-  cloud_off  HTCP, no aircraft
-  clear_off  ka=ks=0 (no cloud) + An-124  — 无云有运输机
-  slab_off   retrieve column slab, no aircraft
+One row per file, e.g. ``manifest1.csv`` (clear + aircraft), ``manifest2.csv``
+(cloudy + aircraft). Switches:
 
-Writes 16-bit PNG + imaging/target/scene CSV. Does not change the kernel.
+  clouds=0/1         kernel no_clouds=(clouds==0)
+  has_aircraft=0/1   water-only vs water+An-124
+  cloud_mode         none | htcp | slab
+
+Usage::
+
+  python tools/render_fire_swir_gate_four.py --manifest scenes/fire_gs/swir_video5s/manifest1.csv
+  python tools/render_fire_swir_gate_four.py --manifest .../manifest1.csv .../manifest2.csv
+
+Does not change the OptiX kernel.
 """
 from __future__ import annotations
 
@@ -39,6 +45,7 @@ import mountain_gs_scene as mgs  # noqa: E402
 import render_fire_shahed_bands as rf  # noqa: E402
 import retrieve_fire_sc_rte as rte  # noqa: E402
 import swir_camera_psf as cam_psf  # noqa: E402
+import swir_manifest as swir_mf  # noqa: E402
 from render_mountain_gs_gpu import make_conf  # noqa: E402
 from threedgptir_tracer.tracer import load_threedgptir_plugin  # noqa: E402
 import threedgptir_tracer.tracer as tracer_mod  # noqa: E402
@@ -66,6 +73,7 @@ SWIR_NETD_K = 0.05
 OUTDIR_DEFAULT = os.path.join(ROOT, "scenes", "fire_gs", "swir_video5s", "gate")
 DOWNSAMPLE_CSV_DEFAULT = cam_psf.DEFAULT_DOWNSAMPLE_CSV
 MTF_CSV_DEFAULT = cam_psf.DEFAULT_MTF_CSV
+MANIFEST_DEFAULT = [swir_mf.MANIFEST1]
 
 
 def stare_geometry(nx: int = SWIR_NX, ny: int = SWIR_NY) -> dict:
@@ -175,59 +183,109 @@ def write_csv(path: str, rows: list[dict]) -> None:
     print("wrote", path)
 
 
+
 def main() -> int:
-    p = argparse.ArgumentParser(description="SWIR gate four stills + CSV + 16-bit PNG")
+    p = argparse.ArgumentParser(description="SWIR gate from unified manifest CSV(s)")
+    p.add_argument(
+        "--manifest",
+        nargs="+",
+        default=None,
+        help="one or more manifest CSV paths (default: manifest1.csv)",
+    )
     p.add_argument("--outdir", default=OUTDIR_DEFAULT)
-    p.add_argument("--spp", type=int, default=1024)
-    p.add_argument("--film", nargs=2, type=int, default=[SWIR_NX, SWIR_NY], help="detector nx ny")
-    p.add_argument("--ss", type=int, default=SWIR_SS, help="supersample factor (render ss*N then downsample)")
-    p.add_argument("--downsample-csv", default=DOWNSAMPLE_CSV_DEFAULT, help="ss×ss area kernel CSV")
-    p.add_argument("--mtf-csv", default=MTF_CSV_DEFAULT, help="detector/optical MTF CSV (not atmosphere)")
+    p.add_argument("--spp", type=int, default=None, help="override manifest spp")
     p.add_argument("--no-ss", action="store_true", help="render at detector res, no supersample")
     p.add_argument("--no-mtf", action="store_true", help="skip detector MTF (RTE-only beauty)")
     p.add_argument("--max-bounces", type=int, default=256)
     p.add_argument("--brick", type=int, default=8)
     p.add_argument("--chunk", type=int, default=32)
-    p.add_argument("--seed", type=int, default=0)
     p.add_argument(
         "--only",
         nargs="+",
         default=None,
-        help="subset of cloud_org cloud_off clear_off slab_off",
+        help="legacy: clear_off→manifest1, cloud_org→manifest2 (ignored if --manifest set)",
     )
     args = p.parse_args()
     os.makedirs(args.outdir, exist_ok=True)
-    geo = stare_geometry(int(args.film[0]), int(args.film[1]))
-    w, h = geo["nx"], geo["ny"]
-    ss = 1 if args.no_ss else max(int(args.ss), 1)
+
+    man_paths: list[str] = []
+    if args.manifest:
+        man_paths = [os.path.abspath(x) for x in args.manifest]
+    elif args.only:
+        alias = {
+            "clear_off": swir_mf.MANIFEST1,
+            "cloud_org": swir_mf.MANIFEST2,
+        }
+        for key in args.only:
+            if key not in alias:
+                raise SystemExit(
+                    f"--only {key!r} needs --manifest; known aliases: {sorted(alias)}"
+                )
+            man_paths.append(alias[key])
+    else:
+        man_paths = list(MANIFEST_DEFAULT)
+
+    manifests = [swir_mf.load_manifest(p) for p in man_paths]
+    for m in manifests:
+        print(
+            f"manifest {m['_path']}  case={m['case']}  "
+            f"clouds={m['clouds']}  has_aircraft={m['has_aircraft']}  "
+            f"cloud_mode={m['cloud_mode']}"
+        )
+
+    m0 = manifests[0]
+    nx = int(m0.get("nx") or SWIR_NX)
+    ny = int(m0.get("ny") or SWIR_NY)
+    geo = stare_geometry(nx, ny)
+    if m0.get("H_m"):
+        geo["H_m"] = float(m0["H_m"])
+    if m0.get("film_w_m"):
+        geo["film_w_m"] = float(m0["film_w_m"])
+        geo["film_h_m"] = float(m0.get("film_h_m") or m0["film_w_m"] * ny / float(nx))
+        geo["gsd_m"] = geo["film_w_m"] / float(nx)
+        geo["water_m"] = float(m0.get("water_size_m") or (geo["film_w_m"] + 200.0))
+    w, h = int(geo["nx"]), int(geo["ny"])
+    ss_cfg = int(m0.get("ss") or SWIR_SS)
+    ss = 1 if args.no_ss else max(ss_cfg, 1)
     w_ss, h_ss = w * ss, h * ss
     film_h = geo["film_h_m"]
-    cx, cy = PLACE_X, PLACE_Y
+    cx = float(m0.get("place_x") if m0.get("place_x") is not None else PLACE_X)
+    cy = float(m0.get("place_y") if m0.get("place_y") is not None else PLACE_Y)
+    heading = float(m0.get("heading_rad") if m0.get("heading_rad") is not None else HEADING_RAD)
+    ac_z = float(m0.get("ac_z_m") if m0.get("ac_z_m") is not None else rf.AC_Z_M)
+    spp = int(args.spp if args.spp is not None else (m0.get("spp") or 1024))
+    seed = int(m0.get("seed") if m0.get("seed") is not None else 0)
+    sun_az = float(m0.get("sun_az_deg") if m0.get("sun_az_deg") is not None else fire.SUN_AZ_DEG)
+    sun_el = float(m0.get("sun_el_deg") if m0.get("sun_el_deg") is not None else fire.SUN_EL_DEG)
+    ds_path = swir_mf.resolve_path(m0.get("downsample_csv"), DOWNSAMPLE_CSV_DEFAULT)
+    mtf_path = swir_mf.resolve_path(m0.get("mtf_csv"), MTF_CSV_DEFAULT)
+    htcp_path = m0.get("htcp_path") or fire.DEFAULT_HTCP
+    water_rho = float(
+        m0.get("water_rho") if m0.get("water_rho") is not None else rf.IR_WATER_ALBEDO[0]
+    )
+    water_T = float(m0.get("water_T_K") if m0.get("water_T_K") is not None else rf.WATER_T_K)
+    water_alb = np.array([water_rho, water_rho, water_rho], np.float32)
+
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     band = band_swir()
-    band["spp"] = int(args.spp)
-    lam = float(band["lambda_nm"])
+    band["spp"] = spp
+    lam = float(m0.get("lambda_nm") or band["lambda_nm"])
     ds_k = None
     mtf_meta = None
     if ss > 1:
-        ds_k = cam_psf.load_downsample(args.downsample_csv)
-        print(
-            f"SS {ss}x → detector {w}x{h}; downsample {args.downsample_csv}  "
-            f"k=\n{ds_k}"
-        )
+        ds_k = cam_psf.load_downsample(ds_path)
+        print(f"SS {ss}x → detector {w}x{h}; downsample {ds_path}\n{ds_k}")
     if not args.no_mtf and ss > 1:
-        mtf_meta = cam_psf.load_mtf(args.mtf_csv)
+        mtf_meta = cam_psf.load_mtf(mtf_path)
         print(
-            f"MTF {args.mtf_csv}  FWHM_det={mtf_meta['fwhm_detector_px']:.3g} px  "
-            f"sigma_ss={mtf_meta['sigma_ss_px']:.3g}  (pixel/optical, not atmosphere)"
+            f"MTF {mtf_path}  FWHM_det={mtf_meta['fwhm_detector_px']:.3g} px  "
+            f"(pixel/optical, not atmosphere)"
         )
 
     print("=== stare geometry ===")
     print(
         f"  H={geo['H_m']:.1f} m  film={geo['film_w_m']:.1f}x{geo['film_h_m']:.1f} m  "
-        f"detector={w}x{h}  render={w_ss}x{h_ss}  "
-        f"GSD_film={geo['gsd_m']:.3f} m  GSD_optics={geo['gsd_optics_m']:.3f} m  "
-        f"half_need={geo['half_need_m']:.1f} m"
+        f"detector={w}x{h}  render={w_ss}x{h_ss}  GSD={geo['gsd_m']:.3f} m"
     )
 
     print("=== Mie + HTCP ===")
@@ -236,7 +294,7 @@ def main() -> int:
         raise RuntimeError("SWIR Mie unusable")
     Cs, Ca, g = float(mie["Cs"]), float(mie["Ca"]), float(mie["g"])
     om_dump = Cs / max(Cs + Ca, 1e-30)
-    vox = mgs.load_htcp_voxels(fire.DEFAULT_HTCP, wavelength_nm=lam)
+    vox = mgs.load_htcp_voxels(htcp_path, wavelength_nm=lam)
     maps = rte.analog_column_maps(vox)
     slab = rte.make_slab_voxels(vox, maps, om_dump)
     gas = mgs.load_ecrad_gas_1d(wavelength_m=lam * 1.0e-9)
@@ -245,206 +303,136 @@ def main() -> int:
         "mono": mgs.load_ecrad_sw_visible(lambda0_nm=lam, lambda1_nm=lam),
     }
     lw = mgs.load_ecrad_lw()
-    water = rf.water_quad(cx, cy, geo["water_m"], rf.IR_WATER_ALBEDO, rf.WATER_T_K)
+    water = rf.water_quad(cx, cy, geo["water_m"], water_alb, water_T)
+
+    rho_body = float(m0.get("rho_body") if m0.get("rho_body") is not None else rf.SWIR_BODY_R)
+    rho_wing = float(m0.get("rho_wing") if m0.get("rho_wing") is not None else rf.SWIR_WING_R)
+    rho_eng = float(m0.get("rho_engine") if m0.get("rho_engine") is not None else rf.SWIR_ENGINE_R)
+    old = (rf.SWIR_BODY_R, rf.SWIR_WING_R, rf.SWIR_ENGINE_R)
+    rf.SWIR_BODY_R, rf.SWIR_WING_R, rf.SWIR_ENGINE_R = rho_body, rho_wing, rho_eng
     ac = rf.apply_swir_airframe(
         rf.set_airframe_temps(
-            acmesh.make_an124_coarse_mesh((cx, cy, rf.AC_Z_M), heading_rad=HEADING_RAD)
+            acmesh.make_an124_coarse_mesh((cx, cy, ac_z), heading_rad=heading)
         )
     )
+    rf.SWIR_BODY_R, rf.SWIR_WING_R, rf.SWIR_ENGINE_R = old
     mesh_org = mgs.concat_meshes(water, ac)
     cam = np.array([cx, cy, geo["H_m"]], np.float32)
-    az = math.radians(fire.SUN_AZ_DEG)
-    el = math.radians(fire.SUN_EL_DEG)
+    az = math.radians(sun_az)
+    el = math.radians(sun_el)
     sun = (math.cos(el) * math.cos(az), math.cos(el) * math.sin(az), math.sin(el))
 
-    want = args.only or ["cloud_org", "cloud_off", "clear_off", "slab_off"]
-    jobs = []
-    if "cloud_org" in want:
-        jobs.append(("cloud_org", vox, mesh_org, False, "htcp", 1))
-    if "cloud_off" in want:
-        jobs.append(("cloud_off", vox, water, False, "htcp", 0))
-    if "clear_off" in want:
-        # 无云有机：体素消光清零，运输机仍在（海面+An-124）
-        jobs.append(("clear_off", vox, mesh_org, True, "none", 1))
-    if "slab_off" in want:
-        jobs.append(("slab_off", slab, water, False, "slab", 0))
+    def voxels_for(cloud_mode: str):
+        if cloud_mode == "slab":
+            return slab
+        return vox
 
     tracer, device = load_plugin()
     imgs = {}
     meta = {}
-    for key, voxels, mesh, no_clouds, cloud_mode, has_ac in jobs:
+    result_rows = []
+    for man in manifests:
+        key = str(man["case"])
+        clouds = int(man["clouds"])
+        has_ac = int(man["has_aircraft"])
+        cloud_mode = str(man["cloud_mode"])
+        mesh = mesh_org if has_ac else water
+        voxels = voxels_for(cloud_mode)
         buf = rf.make_buffers(
             device, voxels, gas, mesh, band, sun, sw_tab, lw, None,
-            args.brick, args.max_bounces, mie["g"], mie, no_clouds=no_clouds,
+            args.brick, args.max_bounces, mie["g"], mie, no_clouds=(clouds == 0),
         )
         print(
-            f"-- {key} spp={args.spp} tris={mesh['idx'].shape[0]} "
-            f"no_clouds={int(no_clouds)} render={w_ss}x{h_ss}"
+            f"-- {key} spp={spp} tris={mesh['idx'].shape[0]} "
+            f"clouds={clouds} has_aircraft={has_ac} mode={cloud_mode} "
+            f"render={w_ss}x{h_ss}"
         )
         img = rf.render_ortho(
-            tracer, buf, cam, film_h, w_ss, h_ss, int(args.spp), device,
-            max(int(args.chunk), 1), args.seed,
+            tracer, buf, cam, film_h, w_ss, h_ss, spp, device,
+            max(int(args.chunk), 1), seed,
         )
-        npy_ss = os.path.join(args.outdir, f"gpu_swir_{key}_spp{args.spp}_ss{ss}.npy")
+        npy_ss = os.path.join(args.outdir, f"gpu_swir_{key}_spp{spp}_ss{ss}.npy")
         np.save(npy_ss, img.astype(np.float32))
         if ss > 1:
             if mtf_meta is not None:
                 img = cam_psf.apply_mtf_ss(img, mtf=mtf_meta)
             img = cam_psf.downsample_ss(img, kernel=ds_k, ss=ss)
-        npy = os.path.join(args.outdir, f"gpu_swir_{key}_spp{args.spp}.npy")
+        npy = os.path.join(args.outdir, f"gpu_swir_{key}_spp{spp}.npy")
         np.save(npy, img.astype(np.float32))
         print("wrote", npy_ss if ss > 1 else npy)
         print("wrote", npy)
         y = lum(img)
         imgs[key] = y
         meta[key] = {
+            "manifest": man["_path"],
             "npy": npy,
             "npy_ss": npy_ss if ss > 1 else None,
             "cloud_mode": cloud_mode,
+            "clouds": clouds,
             "has_aircraft": has_ac,
             "mean": float(y.mean()),
-            "downsample_csv": None if ss <= 1 else os.path.abspath(args.downsample_csv),
-            "mtf_csv": None if mtf_meta is None else os.path.abspath(args.mtf_csv),
             "ss": int(ss),
-            "swir_rho_body": float(rf.SWIR_BODY_R) if has_ac else None,
-            "swir_rho_engine": float(rf.SWIR_ENGINE_R) if has_ac else None,
-            "water_rho": float(rf.IR_WATER_ALBEDO[0]),
+            "swir_rho_body": rho_body if has_ac else None,
+            "swir_rho_engine": rho_eng if has_ac else None,
+            "water_rho": water_rho,
         }
+        row = {k: man.get(k, "") for k in swir_mf.FIELDS}
+        row["manifest_path"] = man["_path"]
+        row["npy"] = npy
+        row["L_mean"] = meta[key]["mean"]
+        result_rows.append(row)
         del buf, img
         torch.cuda.empty_cache()
 
-    # Pull sibling npys so --only still shares absolute calibration with the gate set.
-    case_order = ["cloud_org", "cloud_off", "clear_off", "slab_off"]
-    case_has = {"cloud_org": 1, "cloud_off": 0, "clear_off": 1, "slab_off": 0}
-    case_mode = {"cloud_org": "htcp", "cloud_off": "htcp", "clear_off": "none", "slab_off": "slab"}
-    for key in case_order:
-        if key in imgs:
-            continue
-        npy = os.path.join(args.outdir, f"gpu_swir_{key}_spp{args.spp}.npy")
-        if not os.path.isfile(npy):
-            continue
-        y = lum(np.load(npy))
-        if y.shape != (h, w):
-            print(f"cal skip {key}: shape {y.shape} != detector {(h, w)}")
-            continue
-        imgs[key] = y
-        meta[key] = {
-            "npy": npy,
-            "cloud_mode": case_mode[key],
-            "has_aircraft": case_has[key],
-            "mean": float(y.mean()),
-            "from_disk": True,
-        }
-        print(f"cal load {key} mean={meta[key]['mean']:.6g}")
-
-    # Scientific I;16: shared absolute [0, stack p99.5] for radiometric compare.
-    # Viewing: separate 8-bit L PNG (sea/shadow/aircraft tone map on clear_off).
+    case_order = [str(m["case"]) for m in manifests]
     stack = np.concatenate([imgs[k].ravel() for k in case_order if k in imgs])
     lo = 0.0
     hi = float(np.percentile(stack, 99.5))
     scale = max(hi - lo, 1e-30)
 
-    imaging_rows = []
-    target_rows = []
-    scene_rows = []
-    size = np.asarray(ac["verts"], np.float64)
-    sx = float(size[:, 0].max() - size[:, 0].min())
-    sy = float(size[:, 1].max() - size[:, 1].min())
-    sz = float(size[:, 2].max() - size[:, 2].min())
     z_bot = float(np.nanmean(maps["z_bot"]))
     z_top = float(np.nanmean(maps["z_top"]))
     t_skin = float(np.nanmean(maps["t_skin"]))
     tau_mean = float(maps["tau"].mean())
 
-    for key in case_order:
-        if key not in imgs:
-            continue
+    for i, key in enumerate(case_order):
         y = imgs[key]
-        png = os.path.join(args.outdir, f"swir_{key}_spp{args.spp}_{stamp}.png")
-        png8 = os.path.join(args.outdir, f"swir_{key}_spp{args.spp}_{stamp}_u8.png")
+        png = os.path.join(args.outdir, f"swir_{key}_spp{spp}_{stamp}.png")
+        png8 = os.path.join(args.outdir, f"swir_{key}_spp{spp}_{stamp}_u8.png")
         save_u16_png(png, y, lo, scale)
-        save_u8_display(png8, y, clear_with_ac=(key == "clear_off"))
+        save_u8_display(
+            png8, y,
+            clear_with_ac=(int(meta[key]["clouds"]) == 0 and int(meta[key]["has_aircraft"]) == 1),
+        )
         print(f"wrote {png}  L_offset={lo:.6g} L_scale={scale:.6g}")
         print(f"wrote {png8}")
         meta[key]["png"] = png
         meta[key]["png_u8"] = png8
-        imaging_rows.append(
-            {
-                "case": key,
-                "lambda_nm": lam,
-                "H_m": geo["H_m"],
-                "film_w_m": geo["film_w_m"],
-                "film_h_m": geo["film_h_m"],
-                "nx": w,
-                "ny": h,
-                "gsd_m": geo["gsd_m"],
-                "gsd_optics_m": geo["gsd_optics_m"],
-                "ss": int(ss),
-                "downsample_csv": "" if ss <= 1 else os.path.abspath(args.downsample_csv),
-                "mtf_csv": "" if mtf_meta is None else os.path.abspath(args.mtf_csv),
-                "spp": int(args.spp),
-                "seed": int(args.seed),
-                "fps": SWIR_FPS,
-                "f_m": SWIR_F_M,
-                "pitch_m": SWIR_PITCH_M,
-                "fnum": SWIR_FNUM,
-                "netd_k": SWIR_NETD_K,
-                "sun_az_deg": fire.SUN_AZ_DEG,
-                "sun_el_deg": fire.SUN_EL_DEG,
-                "L_scale": scale,
-                "L_offset": lo,
-                "png": png,
-                "png_u8": png8,
-                "npy": meta[key]["npy"],
-                "L_mean": meta[key]["mean"],
-            }
-        )
-        has_ac = int(meta[key]["has_aircraft"])
-        target_rows.append(
-            {
-                "case": key,
-                "has_aircraft": has_ac,
-                "x_m": cx if has_ac else "",
-                "y_m": cy if has_ac else "",
-                "z_m": rf.AC_Z_M if has_ac else "",
-                "heading_rad": HEADING_RAD if has_ac else "",
-                "v_mps": V_MPS if has_ac else "",
-                "ntri": int(ac["idx"].shape[0]) if has_ac else 0,
-                "T_body_K": rf.BODY_T_K if has_ac else "",
-                "T_engine_K": rf.ENGINE_T_K if has_ac else "",
-                "rho_body": rf.SWIR_BODY_R if has_ac else "",
-                "rho_engine": rf.SWIR_ENGINE_R if has_ac else "",
-                "size_x_m": sx if has_ac else "",
-                "size_y_m": sy if has_ac else "",
-                "size_z_m": sz if has_ac else "",
-            }
-        )
-        cm = meta[key]["cloud_mode"]
-        scene_rows.append(
-            {
-                "case": key,
-                "cloud_mode": cm,
-                "htcp_path": fire.DEFAULT_HTCP,
-                "omega_dump": om_dump if cm != "none" else "",
-                "g": g if cm != "none" else "",
-                "tau_mean": tau_mean if cm != "none" else 0.0,
-                "z_bot_m": z_bot if cm != "none" else "",
-                "z_top_m": z_top if cm != "none" else "",
-                "t_skin_K": t_skin if cm != "none" else "",
-                "water_T_K": rf.WATER_T_K,
-                "water_rho": float(rf.IR_WATER_ALBEDO[0]),
-                "water_size_m": geo["water_m"],
-                "gas_1d": 1,
-                "place_x": cx,
-                "place_y": cy,
-            }
-        )
+        result_rows[i]["png"] = png
+        result_rows[i]["png_u8"] = png8
+        result_rows[i]["L_scale"] = scale
+        result_rows[i]["L_offset"] = lo
+        if int(meta[key]["clouds"]) == 1:
+            result_rows[i]["tau_mean"] = tau_mean
+            result_rows[i]["z_bot_m"] = z_bot
+            result_rows[i]["z_top_m"] = z_top
+            result_rows[i]["t_skin_K"] = t_skin
+            result_rows[i]["omega_dump"] = om_dump
+            result_rows[i]["g"] = g
 
-    write_csv(os.path.join(args.outdir, "imaging.csv"), imaging_rows)
-    write_csv(os.path.join(args.outdir, "target.csv"), target_rows)
-    write_csv(os.path.join(args.outdir, "scene.csv"), scene_rows)
+    out_fields = swir_mf.FIELDS + [
+        "manifest_path", "npy", "png", "png_u8", "L_mean", "L_scale", "L_offset",
+        "tau_mean", "z_bot_m", "z_top_m", "t_skin_K", "omega_dump", "g",
+    ]
+    for row in result_rows:
+        base = os.path.splitext(os.path.basename(row["manifest_path"]))[0]
+        out_csv = os.path.join(args.outdir, f"{base}_result.csv")
+        with open(out_csv, "w", newline="") as f:
+            wri = csv.DictWriter(f, fieldnames=out_fields, extrasaction="ignore")
+            wri.writeheader()
+            wri.writerow({k: row.get(k, "") for k in out_fields})
+        print("wrote", out_csv)
 
-    # clear_off acceptance: body-core / sea contrast + edge gradient (detector beauty)
     accept = {}
     if "clear_off" in imgs:
         y = imgs["clear_off"]
@@ -452,7 +440,6 @@ def main() -> int:
         c = 32
         sea_patches = [y[:c, :c], y[:c, -c:], y[-c:, :c], y[-c:, -c:]]
         sea_m = float(np.mean([p.mean() for p in sea_patches]))
-        # body core: film bbox pixels clearly above sea (exclude mixed/MTF skirt)
         core = mask & (y > sea_m * 1.15)
         if not core.any() and mask.any():
             thr = float(np.percentile(y[mask], 60.0))
@@ -464,8 +451,8 @@ def main() -> int:
         gmag = np.hypot(gx, gy)
         from scipy.ndimage import binary_dilation
 
-        band = binary_dilation(mask, iterations=2) & ~mask
-        edge = gmag[band] if band.any() else gmag[mask]
+        edge_band = binary_dilation(mask, iterations=2) & ~mask
+        edge = gmag[edge_band] if edge_band.any() else gmag[mask]
         accept = {
             "body_core_mean": body_m,
             "body_bbox_mean": bbox_m,
@@ -483,42 +470,33 @@ def main() -> int:
         }
         print(
             f"accept clear_off  body_core/sea={contrast:.3g}  "
-            f"bbox/sea={accept['contrast_bbox_sea']:.3g}  peak/sea={accept['peak_sea']:.3g}  "
-            f"body={body_m:.4g} sea={sea_m:.4g}  "
-            f"shadow_p1={accept['shadow_p1']:.4g}  "
-            f"edge_grad_mean={accept['edge_grad_mean']:.4g}  "
             f"ok_contrast={accept['ok_contrast']}"
         )
         with open(os.path.join(args.outdir, "accept_clear_off.json"), "w") as f:
             json.dump(accept, f, indent=2)
             f.write("\n")
 
-    for k in meta:
-        meta[k]["png"] = os.path.join(args.outdir, f"swir_{k}_spp{args.spp}_{stamp}.png")
-        meta[k]["png_u8"] = os.path.join(args.outdir, f"swir_{k}_spp{args.spp}_{stamp}_u8.png")
     rec = {
         "stamp": stamp,
+        "manifests": man_paths,
         "geometry": geo,
         "lambda_nm": lam,
-        "spp": int(args.spp),
-        "seed": int(args.seed),
+        "spp": spp,
+        "seed": seed,
         "L_offset": lo,
         "L_scale": scale,
         "L_calibration": "u16_shared_0_stack_p99.5; beauty=SS_MTF_box2x; RTE_pre_MTF_in_ss_npy",
-        "downsample_csv": None if ss <= 1 else os.path.abspath(args.downsample_csv),
-        "mtf_csv": None if mtf_meta is None else os.path.abspath(args.mtf_csv),
+        "downsample_csv": None if ss <= 1 else ds_path,
+        "mtf_csv": None if mtf_meta is None else mtf_path,
         "ss": int(ss),
-        "swir_rho_body": float(rf.SWIR_BODY_R),
-        "swir_rho_engine": float(rf.SWIR_ENGINE_R),
-        "water_rho": float(rf.IR_WATER_ALBEDO[0]),
-        "note": "No sky pad. Sea rho=0.04 matches htrdr IR LUT. MTF is detector/optical only.",
+        "swir_rho_body": rho_body,
+        "swir_rho_engine": rho_eng,
+        "water_rho": water_rho,
+        "note": "Config from unified manifest CSV. Kernel no_clouds=(clouds==0).",
         "detector_nx": int(w),
         "detector_ny": int(h),
         "cases": meta,
         "mie": {"Cs": Cs, "Ca": Ca, "g": g, "omega_dump": om_dump},
-        "imaging_csv": os.path.join(args.outdir, "imaging.csv"),
-        "target_csv": os.path.join(args.outdir, "target.csv"),
-        "scene_csv": os.path.join(args.outdir, "scene.csv"),
         "accept_clear_off": accept,
     }
     with open(os.path.join(args.outdir, "record.json"), "w") as f:
@@ -526,7 +504,10 @@ def main() -> int:
         f.write("\n")
     print("wrote", os.path.join(args.outdir, "record.json"))
     for k, m in meta.items():
-        print(f"  {k:10s} mean={m['mean']:.6g}")
+        print(
+            f"  {k:10s} mean={m['mean']:.6g}  "
+            f"clouds={m['clouds']}  has_aircraft={m['has_aircraft']}"
+        )
     return 0
 
 
