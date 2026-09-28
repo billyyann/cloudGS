@@ -371,9 +371,11 @@ volume_gs_validate_majorants(cloud, n_probes) -> max_violation, tightness stats
 
 | Piece | Suggested location | Note |
 | -- | -- | -- |
-| Host classify + majorant build | e.g. `tools/` or `gpu/.../volume_gs_host.*` | Prefer tools/tests first |
-| Brute-force validator | unit test / small CLI | A1.2–A1.4 |
+| Host classify + majorant build | [`tools/volume_gs_p1.py`](../tools/volume_gs_p1.py) | `unit` / `fire` CLIs; no CUDA |
+| Brute-force validator | same | A1.2–A1.4 / A1.7 |
 | Device σ + Woodcock | P2 only in `atmosphere.cuh` family | Behind flag |
+
+P1 smoke notes: `fire --max-particles` subsamples for runtime; A1.7 bias vs full voxel \(k_e\) will look bad until full pin (millions of particles). Majorant uses **all** particles per brick (no reach cull) — culling underestimates \(\bar\sigma_b\).
 
 ## 8. Non-goals / 非目标
 
@@ -403,7 +405,7 @@ volume_gs_validate_majorants(cloud, n_probes) -> max_violation, tightness stats
 | O2 | Material slots | **Locked:** `albedo=(k_a,k_s,T)`; `metallic=-1`; **`roughness=g`** (HG). Poly abandoned. |
 | O2g | Runtime \(g\): particle `roughness` vs path `mie_g` | **Default:** path `mie_g` wins when set |
 | O3 | P1 first validation | **Locked: fire 体素 pin 提取** + unit probes 作门禁（先合成探针，再 fire 回归） |
-| O4 | P2 radiance tolerance | **TBD** |
+| O4 | P2 radiance tolerance | **TBD** — until set, P2 **only reports gap** (no fake pass) |
 | O5 | Brick resolution policy | **TBD** |
 | O6 | GAS / neighbor accel | **TBD** |
 
