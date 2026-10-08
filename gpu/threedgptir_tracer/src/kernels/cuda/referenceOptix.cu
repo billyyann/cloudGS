@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#define ATM_KERNEL_REV 79
+#define ATM_KERNEL_REV 82
 #include <3dgptir/pipelineParameters.h>
 #include <3dgptir/kernels/cuda/sampler.cuh>
 // clang-format on
@@ -25,7 +25,7 @@ __constant__ PipelineParameters params;
 #include <3dgptir/kernels/cuda/environment.cuh>
 #include <3dgptir/kernels/cuda/pathTracer.cuh>
 #include <3dgptir/kernels/cuda/atmospherePathTracer.cuh>
-/* NVRTC: ATM_KERNEL_REV 79 LW cloud k uses Cbar(band)/C(dump) like htrdr. */
+/* NVRTC: ATM_KERNEL_REV 82 VOLUME GS trunc = per-axis 6σ·s_axis. */
 
 // Ablation early-return stages (only with ENABLE_RAYGEN_SETUP_PROFILING).
 // Official release: do not define ENABLE_RAYGEN_SETUP_PROFILING.
@@ -321,7 +321,7 @@ extern "C" __global__ void __intersection__vol() {
     AtmHit gas;
     atm_woodcock_voxels_into(
         &params.atmosphere.voxels, org, dir, tmax, rng, omega_arg, walk_ks, &vox, 1.f, 1.f,
-        params.atmosphere.voxel_z_iface);
+        params.atmosphere.voxel_z_iface, &params.atmosphere.volume_gs);
     atm_gas_free_path_into(
         &params.atmosphere.gas, org, dir, tmax, rng, walk_ks, &gas, &params.atmosphere);
     AtmHit hit;

@@ -2191,7 +2191,18 @@ OptixTracer::traceAtmosphere(
     torch::Tensor swH2oX,
     torch::Tensor swH2oKa,
     torch::Tensor swH2oKs,
-    torch::Tensor swH2oKsMax) {
+    torch::Tensor swH2oKsMax,
+    torch::Tensor volumeGsPid,
+    torch::Tensor volumeGsCenter,
+    torch::Tensor volumeGsScale,
+    torch::Tensor volumeGsQuat,
+    torch::Tensor volumeGsKa,
+    torch::Tensor volumeGsKs,
+    torch::Tensor volumeGsKmax,
+    int volumeGsRx,
+    int volumeGsRy,
+    int volumeGsRz,
+    float volumeGsMajorantBoost) {
 
     const torch::TensorOptions opts = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
 
@@ -2534,6 +2545,36 @@ OptixTracer::traceAtmosphere(
         std::fprintf(stderr,
                      "[atm] SPECTRAL_SW x_H2O voxels + HTGOP humidity tabs ntab=%d (CIE/LW unused)\n",
                      atm.sw_h2o_ntab);
+    }
+
+    /* VOLUME GS pid-stencil (default off). Shares voxel lattice dims. */
+    std::memset(&atm.volume_gs, 0, sizeof(atm.volume_gs));
+    atm.volume_gs.majorant_boost = volumeGsMajorantBoost > 0.f ? volumeGsMajorantBoost : 4.f;
+    if (volumeGsPid.defined() && volumeGsPid.numel() > 0 && volumeGsCenter.defined() &&
+        volumeGsKa.defined() && volumeGsKs.defined() && volumeGsScale.defined() &&
+        volumeGsQuat.defined() && atm.voxels.nx > 0) {
+        const int64_t nCell = static_cast<int64_t>(atm.voxels.nx) * atm.voxels.ny * atm.voxels.nz;
+        if (volumeGsPid.numel() == nCell && volumeGsCenter.dim() == 2 && volumeGsCenter.size(1) == 3) {
+            atm.volume_gs.enabled = 1;
+            atm.volume_gs.n = static_cast<int>(volumeGsCenter.size(0));
+            atm.volume_gs.rx = volumeGsRx > 0 ? volumeGsRx : 5;
+            atm.volume_gs.ry = volumeGsRy > 0 ? volumeGsRy : 5;
+            atm.volume_gs.rz = volumeGsRz > 0 ? volumeGsRz : 5;
+            atm.volume_gs.pid = atmIntPtr(volumeGsPid);
+            atm.volume_gs.center = atmFloatPtr(volumeGsCenter);
+            atm.volume_gs.scale = atmFloatPtr(volumeGsScale);
+            atm.volume_gs.quat = atmFloatPtr(volumeGsQuat);
+            atm.volume_gs.ka = atmFloatPtr(volumeGsKa);
+            atm.volume_gs.ks = atmFloatPtr(volumeGsKs);
+            if (volumeGsKmax.defined() && volumeGsKmax.numel() > 0) {
+                atm.volume_gs.kext_max = atmFloatPtr(volumeGsKmax);
+            }
+            std::fprintf(stderr,
+                         "[atm] VOLUME_GS enabled N=%d stencil=%d,%d,%d boost=%g kmax=%s\n",
+                         atm.volume_gs.n, atm.volume_gs.rx, atm.volume_gs.ry, atm.volume_gs.rz,
+                         (double)atm.volume_gs.majorant_boost,
+                         atm.volume_gs.kext_max ? "yes" : "voxel*boost");
+        }
     }
 
     cudaStream_t cudaStream = at::cuda::getCurrentCUDAStream();

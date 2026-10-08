@@ -1,10 +1,11 @@
 # GS 替代全部图元计划 / Plan: Replace All Primitives with GS
 
-> Status: **design only (P0 + doc refine)**. No volume-GS backend / no CUDA changes yet.
-> 状态：**仅设计（P0 + 文档完善）**。尚无体积 GS 后端，**未改 CUDA**。
+> Status: **P0–P1 host done; P1b = differentiable voxel↔GS fit (host Torch)**. No volume-GS CUDA / Woodcock backend yet.
+> 状态：**P0–P1 主机探针完成；P1b = 体素场可微对齐 VOLUME GS（PyTorch，主机）**。尚无体积 GS 的 CUDA / Woodcock 后端。
 >
 > Branch: `feat/gs`
 >
+> Host tools: `tools/volume_gs_p1.py` (pin / majorant), `tools/volume_gs_fit_torch.py` (Adam fit + grid MSE).
 > Open decisions (do not invent in code): see §10.
 
 ## 1. Goal / 目标
@@ -149,23 +150,52 @@ One BVH from position/scale/quat. Type branch: `metallic < 0` only.
 
 | 层级 | 做法 | 用途 | 诚实边界 |
 | -- | -- | -- | -- |
-| **P1 钉扎提取** | 活跃体素 → 一粒：`density=k_a+k_s`；`albedo=(k_a,k_s,T)`；`metallic=-1`；`roughness=g_scene`（或提取时 Mie 参考 g）；`n=0`；scale≈dx | 测 σ / ka / ks | 重叠 bias；g 与路径 mie_g 对齐策略见上 |
-| **P3 拟合提取** | 对 LWC 或 \(k_e\) 场做高斯混合拟合/压缩 | 真压缩表示 | 拟合残差进 A3.* |
+| **P1 钉扎提取** | 活跃体素 → 一粒：`density=k_a+k_s`；`albedo=(k_a,k_s,T)`；`metallic=-1`；`roughness=g_scene`；scale≈dx | 测 σ / majorant | 重叠 bias；禁止当无偏重建 |
+| **P1b 可微对齐** | 中心锁死、N 固定；Adam 学 scale/quat/`k_{a,i},k_{s,i}`；盒内随机采样 MSE vs 三线性体素 | 消重叠、网格 MSE 门禁 (A1.8) | 场 MSE≠辐射无偏；不改 CUDA |
+| **P3 压缩拟合** | N≪N_active 的混合/压缩 + htrdr | 真压缩表示 | 残差进 A3.* |
 
 钉扎提取时 \(\sigma_i\) 与 \(G_i\) 宽度必须**联立**约定（例如要求单核在 \(c_i\) 贡献 \(\sigma_i=\sigma_e^{\mathrm{vox}}(c_i)\)，重叠区求和会 **偏高**——验收里要报告该 bias，禁止假装无偏重建体素场）。
+
+### P1b：体素 → GS 可微拟合（autodiff，非 CNN）
+
+实现：[`tools/volume_gs_fit_torch.py`](../tools/volume_gs_fit_torch.py)。七步：
+
+1. **输入** 体素场 \(k_a,k_s\)；\(g\) 无三维场时用标量 \(g_{\mathrm{ref}}\) 广播。
+2. **初始化** 每个活跃胞心（\(k_e>\varepsilon\)）一粒；**\(c_i\) 锁死**；**N 不增不减**。
+3. **采样** 云盒内均匀随机点 \(x\sim\mathcal{U}(\mathrm{box})\)（batch）。
+4. **前向（线性叠加，对求和交换无偏）** 各向异性核
+   \[
+   G_i(x)=\exp\bigl(-\tfrac12(x-c_i)^\top\Sigma_i^{-1}(x-c_i)\bigr),\quad
+   \Sigma_i=R(q_i)\,\mathrm{diag}(s_i)^2 R(q_i)^\top
+   \]
+   \[
+   k_a^{\mathrm{GS}}=\sum_i k_{a,i}G_i,\quad
+   k_s^{\mathrm{GS}}=\sum_i k_{s,i}G_i,\quad
+   \sigma=k_e^{\mathrm{GS}}=k_a^{\mathrm{GS}}+k_s^{\mathrm{GS}},\quad
+   g^{\mathrm{GS}}=\frac{\sum_i g_i k_{s,i}G_i}{k_s^{\mathrm{GS}}+\varepsilon}
+   \]
+   邻域 \(6\sigma\) 截断仅加速（截断误差在合成自洽里应可忽略）。
+5. **损失** 体素真值三线性到 \(x\)：
+   \[
+   \mathcal{L}=\mathbb{E}_x[\lambda_a(k_a^{\mathrm{GS}}-k_a^{\mathrm{v}})^2+\lambda_s(k_s^{\mathrm{GS}}-k_s^{\mathrm{v}})^2+\lambda_g(g^{\mathrm{GS}}-g^{\mathrm{v}})^2]
+   \]
+   首版 \(\lambda_a=\lambda_s=1\)，\(\lambda_g=0\)（无三维 g）。
+6. **优化** Adam；可学：`scale`（正）、`quat`（单位化）、`k_{a,i},k_{s,i}\ge 0`；可选 `g_i`。只学形状不学振幅则重叠 bias 有硬地板。
+7. **收敛后** 全胞心/全格子 **网格 MSE**（A1.8），对照同一初始化的 pin。
 
 ```text
 Host (offline):
   AtmVoxelGrid ka,ks
-    → filter active cells
-    → emit VOLUME ParticleDensity/Material
+    → pin (P1 probes) OR Adam fit (P1b)
+    → VOLUME particles (metallic=-1)
     → volume_gs_build_majorants(...)
-P1 tests: σ_query vs brute; majorant ≥ σ
-P2: same assets under cloud_medium=volume_gs vs voxels (expect gap from pin extraction)
-P3: replace pin with fit; shrink gap; htrdr metrics
+P1: σ_query vs brute; majorant ≥ σ
+P1b: fit_rel_L2(ke) vs pin on grid
+P2: cloud_medium=volume_gs vs voxels (report gap)
+P3: compress N; htrdr metrics
 ```
 
-**EN:** Yes — pre-extract VOLUME GS from the voxel grid offline. P1 uses a **pin** (one Gaussian per active cell) for testable σ; P3 uses a real **fit**. Pin overlap bias must be reported; not a free lossless replace.
+**EN:** Offline voxel→VOLUME GS. Pin tests operators; **P1b autodiff** aligns amplitudes/scales/rotations with grid MSE. Compression remains P3. Grid MSE ≠ radiance unbiasedness.
 
 ## 4. Volume GS transport / 体积 GS 传输
 
@@ -263,6 +293,7 @@ No phase is “done” by screenshots alone.
 | A1.5 | Voxel path remains default | Flag off ⇒ bit-identical / CUDA untouched (P1) |
 | A1.6 | §10 decisions resolved or TBD with no code using them | Checklist |
 | A1.7 | Fire pin extract runs end-to-end (O3) | From `scenes/fire_gs` voxel assets → VOLUME particles → A1.2–A1.4 on that set; report overlap bias vs voxel \(k_e\) |
+| A1.8 | **P1b** differentiable fit grid MSE | After Adam fit: `rel_L2(ke)` on cell centers (or full grid / `--bbox`); **must** beat pin on same domain (`fit_rel_L2 < 0.5 * pin_rel_L2` and preferably `< 0.05`); report ka/ks MSE; empty-region leak; tool `volume_gs_fit_torch.py` |
 
 ### 6.2 P2 exit (device Woodcock on \(\sigma_{\mathrm{GS}}\) + gas race; feature flag)
 
@@ -392,9 +423,10 @@ P1 smoke notes: `fire --max-particles` subsamples for runtime; A1.7 bias vs full
 | -- | -- | -- |
 | **P0** | This doc + branch `feat/gs` | Done (`73a8dd5`+) |
 | **P0.1** | Acceptance + P1 sketch + defect priority (this revise) | §§5–7–10 present; still no CUDA |
-| **P1** | VOLUME convention; \(\sigma(x)\); brick majorants; voxel default; **fire pin + unit probes (O3)** | §6.1 A1.* |
+| **P1** | VOLUME convention; \(\sigma(x)\); brick majorants; voxel default; **fire pin + unit probes (O3)** | §6.1 A1.1–A1.7 |
+| **P1b** | Autodiff voxel↔GS align (centers locked; scale/quat/amp); grid MSE | §6.1 **A1.8**; `tools/volume_gs_fit_torch.py` |
 | **P2** | Woodcock on \(\sigma_{\mathrm{GS}}\) + gas race; flag | §6.2 A2.* |
-| **P3** | HTCP→GS fit + htrdr | §6.3 A3.* |
+| **P3** | HTCP→GS **compress** fit + htrdr | §6.3 A3.* |
 | **P4** | Evaluate mesh→SURFACE GS | §6.4 A4.* |
 
 ## 10. Open decisions（必须问清，禁止瞎改）
@@ -415,7 +447,10 @@ P1 smoke notes: `fire --max-particles` subsamples for runtime; A1.7 bias vs full
 - [`atmosphere.cuh`](../gpu/threedgptir_tracer/include/3dgptir/kernels/cuda/atmosphere.cuh) — Woodcock GS backend (**P2+**)
 - [`atmosphere.h`](../gpu/threedgptir_tracer/include/3dgptir/atmosphere.h) — params; avoid mid-struct inserts
 - [`particleDensity.h`](../gpu/threedgptir_tracer/include/3dgptir/particleDensity.h) — layout unchanged for type
-- [`gaussianParticles.cuh`](../gpu/threedgptir_tracer/include/3dgptir/kernels/cuda/gaussianParticles.cuh) — \(G_i\) / kernel response
+- [`tools/volume_gs_p1.py`](../tools/volume_gs_p1.py) — pin extract, σ probes, majorants (P1)
+- [`tools/volume_gs_fit_torch.py`](../tools/volume_gs_fit_torch.py) — Adam voxel align + grid MSE (P1b)
+- [`tools/volume_gs_pin_buffers.py`](../tools/volume_gs_pin_buffers.py) — host pin → `AtmVolumeGs` upload buffers
+- Device: `AtmVolumeGs` + `atm_volume_gs_eval_ka_ks` in [`atmosphere.h`](../gpu/threedgptir_tracer/include/3dgptir/atmosphere.h) / [`atmosphere.cuh`](../gpu/threedgptir_tracer/include/3dgptir/kernels/cuda/atmosphere.cuh); Woodcock uses GS point query when `volume_gs.enabled` (default off). Training CUDA extension **not** wired yet.
 
 ## 12. Related docs
 

@@ -1,2 +1,2 @@
-case,has_aircraft,x_m,y_m,z_m,heading_rad,v_mps,ntri,T_body_K,T_engine_K,rho_body,rho_engine,size_x_m,size_y_m,size_z_m
-clear_off,1,13275.0,19725.0,100.0,0.0,220.0,304,300.0,400.0,0.16,0.06,69.099609375,73.30078125,22.579994201660156
+case,has_aircraft,type,x_m,y_m,z_m,heading_rad,v_mps,T_s,ntri,T_body_K,T_engine_K,rho_body,rho_wing,rho_engine,size_x_m,size_y_m,size_z_m,note
+clear_off,1,An-124,13275.0,19725.0,100.0,0.0,220.0,5.0,304,300.0,400.0,0.16,0.14,0.06,69.099609375,73.30078125,22.579994201660156,Aircraft switch = has_aircraft (1 on / 0 off)

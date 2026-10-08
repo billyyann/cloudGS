@@ -236,6 +236,119 @@ ATM_FN float atm_fetch_ks(const struct AtmVoxelGrid* g, int ix, int iy, int iz) 
     return g->ks[atm_voxel_index(g, ix, iy, iz)];
 }
 
+/* --- VOLUME GS point query (pid stencil; one thread owns one sample point) --- */
+#ifndef ATM_VOLUME_GS_REACH_SIGMA
+#define ATM_VOLUME_GS_REACH_SIGMA 6.f
+#endif
+
+ATM_FN void atm_quat_to_rot(const float q[4], float R[9]) {
+    /* q = (w,x,y,z); R row-major 3x3 */
+    const float w = q[0], x = q[1], y = q[2], z = q[3];
+    const float ww = w * w, xx = x * x, yy = y * y, zz = z * z;
+    const float wx = w * x, wy = w * y, wz = w * z;
+    const float xy = x * y, xz = x * z, yz = y * z;
+    R[0] = ww + xx - yy - zz;
+    R[1] = 2.f * (xy - wz);
+    R[2] = 2.f * (xz + wy);
+    R[3] = 2.f * (xy + wz);
+    R[4] = ww - xx + yy - zz;
+    R[5] = 2.f * (yz - wx);
+    R[6] = 2.f * (xz - wy);
+    R[7] = 2.f * (yz + wx);
+    R[8] = ww - xx - yy + zz;
+}
+
+ATM_FN float atm_volume_gs_G(
+    const float p[3],
+    const float c[3],
+    const float s[3],
+    const float q[4]) {
+    float R[9];
+    atm_quat_to_rot(q, R);
+    const float dx = p[0] - c[0];
+    const float dy = p[1] - c[1];
+    const float dz = p[2] - c[2];
+    /* d_local = R^T d */
+    const float lx = R[0] * dx + R[3] * dy + R[6] * dz;
+    const float ly = R[1] * dx + R[4] * dy + R[7] * dz;
+    const float lz = R[2] * dx + R[5] * dy + R[8] * dz;
+    const float sx = fmaxf(s[0], 1e-6f);
+    const float sy = fmaxf(s[1], 1e-6f);
+    const float sz = fmaxf(s[2], 1e-6f);
+    const float quad = (lx / sx) * (lx / sx) + (ly / sy) * (ly / sy) + (lz / sz) * (lz / sz);
+    return expf(-0.5f * quad);
+}
+
+/* Unbiased w.r.t. truncated-kernel model: sum over pid stencil only. */
+ATM_FN void atm_volume_gs_eval_ka_ks(
+    const struct AtmVolumeGs* vgs,
+    const struct AtmVoxelGrid* g,
+    const float p[3],
+    float* out_ka,
+    float* out_ks) {
+    float ka = 0.f;
+    float ks = 0.f;
+    if (out_ka) {
+        *out_ka = 0.f;
+    }
+    if (out_ks) {
+        *out_ks = 0.f;
+    }
+    if (!vgs || !vgs->enabled || !g || !vgs->pid || !vgs->center || !vgs->scale || !vgs->quat ||
+        !vgs->ka || !vgs->ks || vgs->n <= 0 || g->nx <= 0) {
+        return;
+    }
+    const float gx = (p[0] - g->origin[0]) / fmaxf(g->dx, 1e-20f) - 0.5f;
+    const float gy = (p[1] - g->origin[1]) / fmaxf(g->dy, 1e-20f) - 0.5f;
+    const float gz = (p[2] - g->origin[2]) / fmaxf(g->dz, 1e-20f) - 0.5f;
+    const int ix0 = (int)floorf(gx);
+    const int iy0 = (int)floorf(gy);
+    const int iz0 = (int)floorf(gz);
+    const int rx = vgs->rx > 0 ? vgs->rx : 1;
+    const int ry = vgs->ry > 0 ? vgs->ry : 1;
+    const int rz = vgs->rz > 0 ? vgs->rz : 1;
+    for (int dz = -rz; dz <= rz; ++dz) {
+        const int iz = iz0 + dz;
+        if (iz < 0 || iz >= g->nz) {
+            continue;
+        }
+        for (int dy = -ry; dy <= ry; ++dy) {
+            const int iy = iy0 + dy;
+            if (iy < 0 || iy >= g->ny) {
+                continue;
+            }
+            for (int dx = -rx; dx <= rx; ++dx) {
+                const int ix = ix0 + dx;
+                if (ix < 0 || ix >= g->nx) {
+                    continue;
+                }
+                const int pid = vgs->pid[atm_voxel_index(g, ix, iy, iz)];
+                if (pid < 0 || pid >= vgs->n) {
+                    continue;
+                }
+                const float* c = vgs->center + pid * 3;
+                const float* s = vgs->scale + pid * 3;
+                const float* q = vgs->quat + pid * 4;
+                /* Per-axis AABB gate: REACH_SIGMA×s_axis (default 6σ). */
+                if (fabsf(p[0] - c[0]) > ATM_VOLUME_GS_REACH_SIGMA * s[0] ||
+                    fabsf(p[1] - c[1]) > ATM_VOLUME_GS_REACH_SIGMA * s[1] ||
+                    fabsf(p[2] - c[2]) > ATM_VOLUME_GS_REACH_SIGMA * s[2]) {
+                    continue;
+                }
+                const float G = atm_volume_gs_G(p, c, s, q);
+                ka += vgs->ka[pid] * G;
+                ks += vgs->ks[pid] * G;
+            }
+        }
+    }
+    if (out_ka) {
+        *out_ka = ka;
+    }
+    if (out_ks) {
+        *out_ks = ks;
+    }
+}
+
 ATM_FN float atm_fetch_temp(const struct AtmVoxelGrid* g, int ix, int iy, int iz) {
     if (!g->temperature || iz < 0 || iz >= g->nz) {
         return 0.f;
@@ -279,6 +392,27 @@ ATM_FN float atm_brick_kmax(const struct AtmVoxelGrid* g, int bx, int by, int bz
     bx = atm_imod(bx, g->nbx);
     by = atm_imod(by, g->nby);
     return g->kext_max[(bz * g->nby + by) * g->nbx + bx];
+}
+
+ATM_FN float atm_volume_gs_brick_kmax(
+    const struct AtmVolumeGs* vgs,
+    const struct AtmVoxelGrid* g,
+    int bx,
+    int by,
+    int bz) {
+    if (vgs && vgs->enabled && vgs->kext_max && g && g->nbx > 0 && g->nby > 0) {
+        if (bz < 0 || bz >= g->nbz) {
+            return 0.f;
+        }
+        bx = atm_imod(bx, g->nbx);
+        by = atm_imod(by, g->nby);
+        return vgs->kext_max[(bz * g->nby + by) * g->nbx + bx];
+    }
+    float k = atm_brick_kmax(g, bx, by, bz);
+    if (vgs && vgs->enabled && vgs->majorant_boost > 1.f) {
+        k *= vgs->majorant_boost;
+    }
+    return k;
 }
 
 enum AtmKKind { ATM_K_KA = 0, ATM_K_KS = 1, ATM_K_EXT = 2 };
@@ -361,7 +495,8 @@ ATM_HEAVY_FN void atm_woodcock_voxels_into(
     struct AtmHit* hit,
     float ks_scale = 1.f,
     float ka_scale = 1.f,
-    const float* z_iface = nullptr) {
+    const float* z_iface = nullptr,
+    const struct AtmVolumeGs* vgs = nullptr) {
     atm_hit_clear(hit);
     if (!g || !hit || g->nx <= 0 || tmax <= 1e-8f) {
         return;
@@ -428,7 +563,7 @@ ATM_HEAVY_FN void atm_woodcock_voxels_into(
         if (bz < 0 || bz >= g->nbz) {
             break;
         }
-        const float kmax0 = atm_brick_kmax(g, bx, by, bz);
+        const float kmax0 = atm_volume_gs_brick_kmax(vgs, g, bx, by, bz);
         const float kmax = kmax0 * (walk_ks ? ks_scale : fmaxf(ka_scale, ks_scale));
 
         const float bx0 = gx0 + (float)bx * bdx;
@@ -476,8 +611,16 @@ ATM_HEAVY_FN void atm_woodcock_voxels_into(
         float pos[3] = {org[0] + dir[0] * t, org[1] + dir[1] * t, org[2] + dir[2] * t};
         int cij[3];
         atm_world_to_ijk(g, pos, cij, z_iface);
-        const float ka = atm_fetch_ka(g, cij[0], cij[1], cij[2]) * ka_scale;
-        const float ks = atm_fetch_ks(g, cij[0], cij[1], cij[2]) * ks_scale;
+        float ka = 0.f;
+        float ks = 0.f;
+        if (vgs && vgs->enabled) {
+            atm_volume_gs_eval_ka_ks(vgs, g, pos, &ka, &ks);
+            ka *= ka_scale;
+            ks *= ks_scale;
+        } else {
+            ka = atm_fetch_ka(g, cij[0], cij[1], cij[2]) * ka_scale;
+            ks = atm_fetch_ks(g, cij[0], cij[1], cij[2]) * ks_scale;
+        }
         const float kext = ka + ks;
         const float r = rng.next_1d();
         /* htrdr SW: accept ks/ks_max (scatter only). LW: accept kext then ω. */
@@ -1339,7 +1482,8 @@ ATM_FN void atm_next_volume_event_into(
         &vox,
         atm_path_ks_scale(atm),
         atm_path_ka_scale(atm),
-        atm->voxel_z_iface);
+        atm->voxel_z_iface,
+        &atm->volume_gs);
     if (gas.event != ATM_EVENT_NONE && gas.t <= vox.t && gas.t < tmax) {
         *out = gas;
         return;

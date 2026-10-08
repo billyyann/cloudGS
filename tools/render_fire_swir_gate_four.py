@@ -215,6 +215,7 @@ def main() -> int:
         alias = {
             "clear_off": swir_mf.MANIFEST1,
             "cloud_org": swir_mf.MANIFEST2,
+            "cloud_noac": swir_mf.MANIFEST3,
         }
         for key in args.only:
             if key not in alias:

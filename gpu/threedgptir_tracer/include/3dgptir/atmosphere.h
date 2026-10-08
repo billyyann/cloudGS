@@ -67,6 +67,21 @@ struct AtmSun {
     float cos_half_angle; /* cone; 1 = directional */
 };
 
+/* VOLUME GS on the same lattice as AtmVoxelGrid (append-only consumer). */
+struct AtmVolumeGs {
+    int enabled;
+    int n;
+    int rx, ry, rz;
+    const int* pid;
+    const float* center;
+    const float* scale;
+    const float* quat;
+    const float* ka;
+    const float* ks;
+    const float* kext_max;
+    float majorant_boost;
+};
+
 struct AtmMeshHit {
     float t;
     int tri;
@@ -159,6 +174,9 @@ struct AtmParams {
     const float* sw_h2o_ks_max; /* [sw_nbands * sw_nquad_max * nlayers] Woodcock hat ks */
     int path_sw_iband; /* this path's HTGOP SW interval; -1 = unset */
     int path_sw_iquad;
+    /* VOLUME GS cloud medium (pin / fit). Append only — shares voxel lattice.
+     * enabled=0 → voxel ka/ks (default). Point query: pid stencil + Σ k_i G_i. */
+    struct AtmVolumeGs volume_gs;
 };
 
 #ifdef __cplusplus

@@ -285,6 +285,18 @@ class AtmosphereBuffers:
     sw_h2o_ka: torch.Tensor = field(default=None)  # type: ignore
     sw_h2o_ks: torch.Tensor = field(default=None)  # type: ignore
     sw_h2o_ks_max: torch.Tensor = field(default=None)  # type: ignore
+    # VOLUME GS (optional; empty pid ⇒ voxel path)
+    volume_gs_pid: torch.Tensor = field(default=None)  # type: ignore
+    volume_gs_center: torch.Tensor = field(default=None)  # type: ignore
+    volume_gs_scale: torch.Tensor = field(default=None)  # type: ignore
+    volume_gs_quat: torch.Tensor = field(default=None)  # type: ignore
+    volume_gs_ka: torch.Tensor = field(default=None)  # type: ignore
+    volume_gs_ks: torch.Tensor = field(default=None)  # type: ignore
+    volume_gs_kmax: torch.Tensor = field(default=None)  # type: ignore
+    volume_gs_rx: int = 0
+    volume_gs_ry: int = 0
+    volume_gs_rz: int = 0
+    volume_gs_majorant_boost: float = 4.0
 
     @classmethod
     def from_numpy(
@@ -391,6 +403,44 @@ class AtmosphereBuffers:
             sw_h2o_ka=torch.empty(0, dtype=torch.float32, device=device),
             sw_h2o_ks=torch.empty(0, dtype=torch.float32, device=device),
             sw_h2o_ks_max=torch.empty(0, dtype=torch.float32, device=device),
+            volume_gs_pid=torch.empty(0, dtype=torch.int32, device=device),
+            volume_gs_center=torch.empty((0, 3), dtype=torch.float32, device=device),
+            volume_gs_scale=torch.empty((0, 3), dtype=torch.float32, device=device),
+            volume_gs_quat=torch.empty((0, 4), dtype=torch.float32, device=device),
+            volume_gs_ka=torch.empty(0, dtype=torch.float32, device=device),
+            volume_gs_ks=torch.empty(0, dtype=torch.float32, device=device),
+            volume_gs_kmax=torch.empty(0, dtype=torch.float32, device=device),
+            volume_gs_rx=0,
+            volume_gs_ry=0,
+            volume_gs_rz=0,
+            volume_gs_majorant_boost=4.0,
+        )
+
+    def attach_volume_gs_cloud(
+        self,
+        source,
+        device: Optional[torch.device] = None,
+        majorant_boost: float = 4.0,
+    ) -> "AtmosphereBuffers":
+        """Load fitted/pin VOLUME GS cloud into buffer fields.
+
+        ``source``: path to ``volume_gs_fit.npz`` or upload dict from
+        ``volume_gs_pin_buffers.build_*``.
+        """
+        import os
+        import sys
+
+        tools = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "tools"))
+        if tools not in sys.path:
+            sys.path.insert(0, tools)
+        from volume_gs_pin_buffers import (
+            attach_volume_gs_to_atmosphere_buffers,
+            load_volume_gs_npz,
+        )
+
+        upload = load_volume_gs_npz(source) if isinstance(source, str) else source
+        return attach_volume_gs_to_atmosphere_buffers(
+            self, upload, device=device, majorant_boost=majorant_boost
         )
 
 
@@ -468,4 +518,15 @@ def trace_atmosphere(tracer_wrapper, ray_ori: torch.Tensor, ray_dir: torch.Tenso
         buffers.sw_h2o_ka if buffers.sw_h2o_ka is not None else torch.empty(0, dtype=torch.float32, device=device),
         buffers.sw_h2o_ks if buffers.sw_h2o_ks is not None else torch.empty(0, dtype=torch.float32, device=device),
         buffers.sw_h2o_ks_max if buffers.sw_h2o_ks_max is not None else torch.empty(0, dtype=torch.float32, device=device),
+        buffers.volume_gs_pid if buffers.volume_gs_pid is not None else torch.empty(0, dtype=torch.int32, device=device),
+        buffers.volume_gs_center if buffers.volume_gs_center is not None else torch.empty((0, 3), dtype=torch.float32, device=device),
+        buffers.volume_gs_scale if buffers.volume_gs_scale is not None else torch.empty((0, 3), dtype=torch.float32, device=device),
+        buffers.volume_gs_quat if buffers.volume_gs_quat is not None else torch.empty((0, 4), dtype=torch.float32, device=device),
+        buffers.volume_gs_ka if buffers.volume_gs_ka is not None else torch.empty(0, dtype=torch.float32, device=device),
+        buffers.volume_gs_ks if buffers.volume_gs_ks is not None else torch.empty(0, dtype=torch.float32, device=device),
+        buffers.volume_gs_kmax if buffers.volume_gs_kmax is not None else torch.empty(0, dtype=torch.float32, device=device),
+        int(buffers.volume_gs_rx),
+        int(buffers.volume_gs_ry),
+        int(buffers.volume_gs_rz),
+        float(buffers.volume_gs_majorant_boost),
     )

@@ -1125,7 +1125,8 @@ static __device__ void atm_next_volume_event_into_timed(
         &vox,
         atm_path_ks_scale(atm),
         atm_path_ka_scale(atm),
-        atm->voxel_z_iface);
+        atm->voxel_z_iface,
+        &atm->volume_gs);
     *cWc += atm_cycles_since(t0);
     if (gas.event != ATM_EVENT_NONE && gas.t <= vox.t && gas.t < tmax) {
         *out = gas;

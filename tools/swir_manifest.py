@@ -18,6 +18,7 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 MANIFEST_DIR = os.path.join(ROOT, "scenes", "fire_gs", "swir_video5s")
 MANIFEST1 = os.path.join(MANIFEST_DIR, "manifest1.csv")
 MANIFEST2 = os.path.join(MANIFEST_DIR, "manifest2.csv")
+MANIFEST3 = os.path.join(MANIFEST_DIR, "manifest3.csv")
 
 # Column order for all manifests (stable schema).
 FIELDS = [
