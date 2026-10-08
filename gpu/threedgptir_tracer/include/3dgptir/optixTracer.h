@@ -338,7 +338,35 @@ public:
         torch::Tensor mieGnm = torch::Tensor(),
         float mieCsRef = 1.f,
         float mieCaRef = 1.f,
-        torch::Tensor voxelZIface = torch::Tensor());
+        torch::Tensor voxelZIface = torch::Tensor(),
+        torch::Tensor meshMatId = torch::Tensor(),
+        torch::Tensor spotParams = torch::Tensor(),
+        float mieGLambda0Nm = 380.f,
+        float mieGDlambdaNm = 0.f,
+        torch::Tensor lwLambdaLo = torch::Tensor(),
+        torch::Tensor lwLambdaHi = torch::Tensor(),
+        torch::Tensor lwGasKa = torch::Tensor(),
+        torch::Tensor lwNquad = torch::Tensor(),
+        torch::Tensor lwQuadCdf = torch::Tensor(),
+        torch::Tensor voxelXh2o = torch::Tensor(),
+        int swH2oNtab = 0,
+        torch::Tensor swH2oN = torch::Tensor(),
+        torch::Tensor swH2oX = torch::Tensor(),
+        torch::Tensor swH2oKa = torch::Tensor(),
+        torch::Tensor swH2oKs = torch::Tensor(),
+        torch::Tensor swH2oKsMax = torch::Tensor(),
+        /* VOLUME GS (optional; empty pid ⇒ disabled) */
+        torch::Tensor volumeGsPid = torch::Tensor(),
+        torch::Tensor volumeGsCenter = torch::Tensor(),
+        torch::Tensor volumeGsScale = torch::Tensor(),
+        torch::Tensor volumeGsQuat = torch::Tensor(),
+        torch::Tensor volumeGsKa = torch::Tensor(),
+        torch::Tensor volumeGsKs = torch::Tensor(),
+        torch::Tensor volumeGsKmax = torch::Tensor(),
+        int volumeGsRx = 0,
+        int volumeGsRy = 0,
+        int volumeGsRz = 0,
+        float volumeGsMajorantBoost = 4.f);
 
     /// Last forward optixLaunch wall time in ms (__raygen__rg + nested OptiX programs).
 

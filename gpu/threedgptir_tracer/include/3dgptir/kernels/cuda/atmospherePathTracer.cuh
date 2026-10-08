@@ -32,21 +32,31 @@ static constexpr int kAtmMeshSlabMaxSteps = 32;
 static constexpr int kAtmProfSlots = 26;
 
 static __device__ int atm_mesh_repeat_ok() {
+    /* Periodic XY is for the tiled sea heightfield (millions of tris, -R).
+     * A 200 m water plate + 484-tri UAV has AABB XY > 1 m, but wrapping it
+     * replicates the aircraft every tile and rescales the whole film. */
+    if (params.atmosphere.mesh.ntri <= 65536) {
+        return 0;
+    }
     return (params.meshRepeatUpp[0] - params.meshRepeatLow[0] > 1.f) &&
            (params.meshRepeatUpp[1] - params.meshRepeatLow[1] > 1.f);
 }
 
-/* Z-slab of the -R mesh tile. 0 = ray never hits terrain AABB. */
+/* Z-slab of the -R mesh tile. 0 = ray never hits terrain AABB.
+ * Tiny meshes (water plate + UAV) are not a terrain slab: test the whole ray. */
 static __device__ int atm_mesh_z_interval(
     const float org[3],
     const float dir[3],
     float tmax,
     float* t_enter,
     float* t_exit) {
-    const float z0 = params.meshRepeatLow[2];
-    const float z1 = params.meshRepeatUpp[2];
     *t_enter = 0.f;
     *t_exit = tmax;
+    if (params.atmosphere.mesh.ntri > 0 && params.atmosphere.mesh.ntri <= 65536) {
+        return 1;
+    }
+    const float z0 = params.meshRepeatLow[2];
+    const float z1 = params.meshRepeatUpp[2];
     if (z1 - z0 < 1.f) {
         return 1;
     }
@@ -450,7 +460,7 @@ static __device__ void atm_merge_gas(
     struct AtmHit* out) {
     const int walk_ks = atm->spectral_mode != ATM_SPECTRAL_LW;
     struct AtmHit gas;
-    atm_gas_free_path_into(&atm->gas, org, dir, tmax, sampler, walk_ks, &gas);
+    atm_gas_free_path_into(&atm->gas, org, dir, tmax, sampler, walk_ks, &gas, atm);
     if (gas.event != ATM_EVENT_NONE && gas.t <= vox.t && gas.t < tmax) {
         *out = gas;
         return;
@@ -638,7 +648,8 @@ static __device__ int atm_lambert_bounce(
     Sampler& sampler,
     float3& throughput,
     float org[3],
-    float dir[3]) {
+    float dir[3],
+    float nOff = 2.f) {
     const float R = fmaxf(ix.material.albedo.x, fmaxf(ix.material.albedo.y, ix.material.albedo.z));
     if (R <= 1e-8f) {
         return 0;
@@ -672,13 +683,142 @@ static __device__ int atm_lambert_bounce(
     wo[2] = r * cp * T[2] + r * sp * B[2] + z * n[2];
     atm_normalize3(wo);
     throughput = throughput * R;
-    org[0] = ix.position.x + n[0] * 2.f + wo[0] * 0.05f;
-    org[1] = ix.position.y + n[1] * 2.f + wo[1] * 0.05f;
-    org[2] = ix.position.z + n[2] * 2.f + wo[2] * 0.05f;
+    org[0] = ix.position.x + n[0] * nOff + wo[0] * 0.02f;
+    org[1] = ix.position.y + n[1] * nOff + wo[1] * 0.02f;
+    org[2] = ix.position.z + n[2] * nOff + wo[2] * 0.02f;
     dir[0] = wo[0];
     dir[1] = wo[1];
     dir[2] = wo[2];
     return 1;
+}
+
+static __device__ int atm_lambert_bounce_rgb(
+    const Interaction& ix,
+    Sampler& sampler,
+    float3& throughput,
+    float org[3],
+    float dir[3],
+    float nOff) {
+    const float3 a = ix.material.albedo;
+    if (a.x + a.y + a.z <= 1e-8f) {
+        return 0;
+    }
+    float n[3] = {ix.shadingnormal.x, ix.shadingnormal.y, ix.shadingnormal.z};
+    atm_normalize3(n);
+    float wo[3];
+    const float u1 = sampler.next_1d();
+    const float u2 = sampler.next_1d();
+    const float r = sqrtf(fmaxf(u1, 0.f));
+    const float phi = 6.28318530718f * u2;
+    const float z = sqrtf(fmaxf(1.f - u1, 0.f));
+    float T[3], B[3];
+    if (fabsf(n[2]) < 0.999f) {
+        T[0] = n[1];
+        T[1] = -n[0];
+        T[2] = 0.f;
+    } else {
+        T[0] = 1.f;
+        T[1] = 0.f;
+        T[2] = 0.f;
+    }
+    atm_normalize3(T);
+    B[0] = n[1] * T[2] - n[2] * T[1];
+    B[1] = n[2] * T[0] - n[0] * T[2];
+    B[2] = n[0] * T[1] - n[1] * T[0];
+    const float cp = cosf(phi);
+    const float sp = sinf(phi);
+    wo[0] = r * cp * T[0] + r * sp * B[0] + z * n[0];
+    wo[1] = r * cp * T[1] + r * sp * B[1] + z * n[1];
+    wo[2] = r * cp * T[2] + r * sp * B[2] + z * n[2];
+    atm_normalize3(wo);
+    throughput.x *= a.x;
+    throughput.y *= a.y;
+    throughput.z *= a.z;
+    org[0] = ix.position.x + n[0] * nOff + wo[0] * 0.02f;
+    org[1] = ix.position.y + n[1] * nOff + wo[1] * 0.02f;
+    org[2] = ix.position.z + n[2] * nOff + wo[2] * 0.02f;
+    dir[0] = wo[0];
+    dir[1] = wo[1];
+    dir[2] = wo[2];
+    return 1;
+}
+
+/* Air–water: F0~htrdr visible ρ, grazing cap ~0.45 so the horizon is not a full sky mirror. */
+static __device__ float atm_water_schlick_F(const Interaction& ix, const float3& rayDir) {
+    float n[3] = {ix.shadingnormal.x, ix.shadingnormal.y, ix.shadingnormal.z};
+    atm_normalize3(n);
+    float wi[3] = {rayDir.x, rayDir.y, rayDir.z};
+    const float c = fmaxf(0.f, -atm_dot3(n, wi));
+    const float om = 1.f - c;
+    const float om2 = om * om;
+    return 0.040f + 0.18f * om2 * om2 * om;
+}
+
+/* htrdr ssf_specular: ω_r = 2(n·ω_o)n − ω_o, ω_o = −dir. RR with P=ρ, no extra weight. */
+static __device__ int atm_specular_bounce(
+    const Interaction& ix,
+    Sampler& sampler,
+    float3& throughput,
+    float org[3],
+    float dir[3],
+    float rho) {
+    const float R = atm_clampf(rho, 0.f, 1.f);
+    if (R <= 1e-8f || sampler.next_1d() >= R) {
+        return 0;
+    }
+    float n[3] = {ix.shadingnormal.x, ix.shadingnormal.y, ix.shadingnormal.z};
+    atm_normalize3(n);
+    const float nd = atm_dot3(n, dir);
+    dir[0] = dir[0] - 2.f * nd * n[0];
+    dir[1] = dir[1] - 2.f * nd * n[1];
+    dir[2] = dir[2] - 2.f * nd * n[2];
+    atm_normalize3(dir);
+    org[0] = ix.position.x + n[0] * 0.02f + dir[0] * 0.02f;
+    org[1] = ix.position.y + n[1] * 0.02f + dir[1] * 0.02f;
+    org[2] = ix.position.z + n[2] * 0.02f + dir[2] * 0.02f;
+    (void)throughput;
+    return 1;
+}
+
+static __device__ void atm_add_sun_nee_specular(
+    const struct AtmParams* atm,
+    const float org[3],
+    const float3& rayDir,
+    const Interaction& ix,
+    const float3& throughput,
+    Sampler& sampler,
+    float3& radiance,
+    float3& direct,
+    float rho) {
+    if (atm->sun.radiance <= 0.f) {
+        return;
+    }
+    const float R = atm_clampf(rho, 0.f, 1.f);
+    if (R <= 1e-8f) {
+        return;
+    }
+    float n[3] = {ix.shadingnormal.x, ix.shadingnormal.y, ix.shadingnormal.z};
+    atm_normalize3(n);
+    float wo[3] = {rayDir.x, rayDir.y, rayDir.z};
+    const float nd = atm_dot3(n, wo);
+    wo[0] = wo[0] - 2.f * nd * n[0];
+    wo[1] = wo[1] - 2.f * nd * n[1];
+    wo[2] = wo[2] - 2.f * nd * n[2];
+    atm_normalize3(wo);
+    if (!atm_dir_in_sun_cone(&atm->sun, wo)) {
+        return;
+    }
+    float p[3] = {
+        org[0] + n[0] * 0.02f + wo[0] * 0.02f,
+        org[1] + n[1] * 0.02f + wo[1] * 0.02f,
+        org[2] + n[2] * 0.02f + wo[2] * 0.02f};
+    const float vis = atm_sun_visibility(atm, p, wo, atm->path_tmax, sampler);
+    if (vis <= 0.f) {
+        return;
+    }
+    const float3 contrib = throughput * (R * atm->sun.radiance * vis);
+    radiance += contrib;
+    direct += contrib;
 }
 
 static __device__ void atm_add_sun_nee_surface(
@@ -689,8 +829,9 @@ static __device__ void atm_add_sun_nee_surface(
     const float3& throughput,
     Sampler& sampler,
     float3& radiance,
-    float3& direct) {
-    if (atm->spectral_mode == ATM_SPECTRAL_LW || atm->sun.radiance <= 0.f) {
+    float3& direct,
+    float nOff = 2.f) {
+    if (atm->sun.radiance <= 0.f) {
         return;
     }
     float wo[3];
@@ -712,11 +853,11 @@ static __device__ void atm_add_sun_nee_surface(
         (void)scatterPdf;
         fcos = (brdfTimesCos.x + brdfTimesCos.y + brdfTimesCos.z) > 1e-8f ? brdfTimesCos : lambert;
     }
-    /* Offset along shading normal so 8M heightfield NEE does not self-hit. */
+    /* 2 m was for 5 m sea_3m tris; water chop uses centimetres (nOff). */
     float p[3] = {
-        org[0] + ix.shadingnormal.x * 2.f + wo[0] * 0.05f,
-        org[1] + ix.shadingnormal.y * 2.f + wo[1] * 0.05f,
-        org[2] + ix.shadingnormal.z * 2.f + wo[2] * 0.05f};
+        org[0] + ix.shadingnormal.x * nOff + wo[0] * 0.02f,
+        org[1] + ix.shadingnormal.y * nOff + wo[1] * 0.02f,
+        org[2] + ix.shadingnormal.z * nOff + wo[2] * 0.02f};
     const float vis = atm_sun_visibility(atm, p, wo, atm->path_tmax, sampler);
     if (vis <= 0.f) {
         return;
@@ -732,17 +873,14 @@ static __device__ void atm_add_sky_surface(
     const float3& throughput,
     float3& radiance,
     float3& direct) {
-    if (atm->spectral_mode == ATM_SPECTRAL_LW || atm->sun.radiance <= 0.f) {
-        return;
-    }
-    /* htrdr has no constant skylight on surfaces. 0.08*sun was for mono-550. */
-    if (atm->cie_enabled) {
-        return;
-    }
-    const float sky = atm->sun.radiance * 0.08f;
-    const float3 contrib = throughput * ix.material.albedo * (sky * (1.f / 3.14159265f));
-    radiance += contrib;
-    direct += contrib;
+    /* htrdr has no constant skylight. 0.08*sun was mono-550 mountain fill.
+     * CIE already skipped this; SPECTRAL_SW FIRE 1600 must too — otherwise
+     * water L is ~10^3× the Lambert sun NEE and cannot match htrdr. */
+    (void)atm;
+    (void)ix;
+    (void)throughput;
+    (void)radiance;
+    (void)direct;
 }
 
 static __device__ void atm_add_sun_nee_volume(
@@ -754,7 +892,7 @@ static __device__ void atm_add_sun_nee_volume(
     Sampler& sampler,
     float3& radiance,
     float3& direct) {
-    if (atm->spectral_mode == ATM_SPECTRAL_LW || atm->sun.radiance <= 0.f) {
+    if (atm->sun.radiance <= 0.f) {
         return;
     }
     float wo[3];
@@ -770,6 +908,142 @@ static __device__ void atm_add_sun_nee_volume(
         return;
     }
     const float3 contrib = throughput * (phase * atm->sun.radiance * vis / fmaxf(pdf, 1e-12f));
+    radiance += contrib;
+    direct += contrib;
+}
+
+static __device__ void atm_onb_from_n(const float n[3], float T[3], float B[3]) {
+    if (fabsf(n[2]) < 0.999f) {
+        T[0] = n[1];
+        T[1] = -n[0];
+        T[2] = 0.f;
+    } else {
+        T[0] = 1.f;
+        T[1] = 0.f;
+        T[2] = 0.f;
+    }
+    atm_normalize3(T);
+    B[0] = n[1] * T[2] - n[2] * T[1];
+    B[1] = n[2] * T[0] - n[0] * T[2];
+    B[2] = n[0] * T[1] - n[1] * T[0];
+}
+
+/* Ground searchlight NEE: sample the Lambert disk, analog Tr, mesh vis. */
+static __device__ int atm_sample_spot(
+    const struct AtmParams* atm,
+    const float org[3],
+    Sampler& sampler,
+    float wo[3],
+    float* distOut,
+    float* pdf) {
+    if (!atm->spot_enabled || atm->spot_sun_scale <= 0.f || atm->spot_radius <= 0.f) {
+        return 0;
+    }
+    float n[3] = {atm->spot_dir[0], atm->spot_dir[1], atm->spot_dir[2]};
+    atm_normalize3(n);
+    float T[3], B[3];
+    atm_onb_from_n(n, T, B);
+    const float u1 = sampler.next_1d();
+    const float u2 = sampler.next_1d();
+    const float rad = atm->spot_radius * sqrtf(fmaxf(u1, 0.f));
+    const float phi = 6.28318530718f * u2;
+    const float cp = cosf(phi);
+    const float sp = sinf(phi);
+    const float px = atm->spot_pos[0] + rad * (cp * T[0] + sp * B[0]);
+    const float py = atm->spot_pos[1] + rad * (cp * T[1] + sp * B[1]);
+    const float pz = atm->spot_pos[2] + rad * (cp * T[2] + sp * B[2]);
+    wo[0] = px - org[0];
+    wo[1] = py - org[1];
+    wo[2] = pz - org[2];
+    const float dist = sqrtf(fmaxf(atm_dot3(wo, wo), 1e-20f));
+    if (dist < 2.f) {
+        return 0;
+    }
+    wo[0] /= dist;
+    wo[1] /= dist;
+    wo[2] /= dist;
+    float to[3] = {org[0] - atm->spot_pos[0], org[1] - atm->spot_pos[1], org[2] - atm->spot_pos[2]};
+    atm_normalize3(to);
+    if (atm_dot3(to, n) < atm->spot_cos_half) {
+        return 0;
+    }
+    const float mu = fmaxf(0.f, -atm_dot3(wo, n));
+    if (mu <= 1e-6f) {
+        return 0;
+    }
+    const float A = 3.14159265f * atm->spot_radius * atm->spot_radius;
+    *pdf = (dist * dist) / fmaxf(A * mu, 1e-12f);
+    *distOut = dist;
+    return 1;
+}
+
+static __device__ void atm_add_spot_nee_volume(
+    const struct AtmParams* atm,
+    const float org[3],
+    const float wi[3],
+    int voxelScatter,
+    const float3& throughput,
+    Sampler& sampler,
+    float3& radiance,
+    float3& direct) {
+    if (atm->sun.radiance <= 0.f) {
+        return;
+    }
+    float wo[3];
+    float dist = 0.f;
+    float pdf = 1.f;
+    if (!atm_sample_spot(atm, org, sampler, wo, &dist, &pdf)) {
+        return;
+    }
+    const float mu = atm_dot3(wi, wo);
+    const float phase = voxelScatter ? atm_hg_phase(atm->mie_g, mu) : atm_rayleigh_phase(mu);
+    const float tmax = fmaxf(dist - 1.f, 1e-3f);
+    float p[3] = {org[0] + wo[0] * kAtmSurfEps, org[1] + wo[1] * kAtmSurfEps, org[2] + wo[2] * kAtmSurfEps};
+    const float vis = atm_sun_visibility_volume(atm, p, wo, tmax);
+    if (vis <= 0.f) {
+        return;
+    }
+    const float Le = atm->sun.radiance * atm->spot_sun_scale;
+    const float3 contrib = throughput * (phase * Le * vis / fmaxf(pdf, 1e-12f));
+    radiance += contrib;
+    direct += contrib;
+}
+
+static __device__ void atm_add_spot_nee_surface(
+    const struct AtmParams* atm,
+    const float org[3],
+    const Interaction& ix,
+    const float3& throughput,
+    Sampler& sampler,
+    float3& radiance,
+    float3& direct) {
+    if (atm->sun.radiance <= 0.f) {
+        return;
+    }
+    float wo[3];
+    float dist = 0.f;
+    float pdf = 1.f;
+    if (!atm_sample_spot(atm, org, sampler, wo, &dist, &pdf)) {
+        return;
+    }
+    const float3 L = atm_arr_to_f3(wo);
+    if (dot(ix.shadingnormal, L) <= 0.f) {
+        return;
+    }
+    const float ndl = fmaxf(0.f, ix.shadingnormal.x * L.x + ix.shadingnormal.y * L.y + ix.shadingnormal.z * L.z);
+    const float3 fcos = ix.material.albedo * (ndl * (1.f / 3.14159265f));
+    float p[3] = {
+        org[0] + ix.shadingnormal.x * 2.f + wo[0] * 0.05f,
+        org[1] + ix.shadingnormal.y * 2.f + wo[1] * 0.05f,
+        org[2] + ix.shadingnormal.z * 2.f + wo[2] * 0.05f};
+    const float tmax = fmaxf(dist - 1.f, 1e-3f);
+    /* Mesh only: GS mountain would eat a ground-lamp ray. 747 is mesh, still occludes. */
+    const float vis = atm_sun_visibility_volume(atm, p, wo, tmax);
+    if (vis <= 0.f) {
+        return;
+    }
+    const float Le = atm->sun.radiance * atm->spot_sun_scale;
+    const float3 contrib = throughput * fcos * (Le * vis / fmaxf(pdf, 1e-12f));
     radiance += contrib;
     direct += contrib;
 }
@@ -837,7 +1111,7 @@ static __device__ void atm_next_volume_event_into_timed(
     struct AtmHit gas;
     struct AtmHit vox;
     long long t0 = clock64();
-    atm_gas_free_path_into(&atm->gas, org, dir, tmax, sampler, walk_ks, &gas);
+    atm_gas_free_path_into(&atm->gas, org, dir, tmax, sampler, walk_ks, &gas, atm);
     *cGas += atm_cycles_since(t0);
     t0 = clock64();
     atm_woodcock_voxels_into(
@@ -851,7 +1125,8 @@ static __device__ void atm_next_volume_event_into_timed(
         &vox,
         atm_path_ks_scale(atm),
         atm_path_ka_scale(atm),
-        atm->voxel_z_iface);
+        atm->voxel_z_iface,
+        &atm->volume_gs);
     *cWc += atm_cycles_since(t0);
     if (gas.event != ATM_EVENT_NONE && gas.t <= vox.t && gas.t < tmax) {
         *out = gas;
@@ -861,6 +1136,20 @@ static __device__ void atm_next_volume_event_into_timed(
         *out = vox;
         return;
     }
+}
+
+/* SW: analog Tr(Ka) on a Ks walk (htrdr decomposition). LW: kext Woodcock
+ * already includes ka — extra Tr(Ka) double-counts absorption. */
+static __device__ float atm_segment_abs_weight(
+    const AtmParams* atm,
+    int isLW,
+    const float org[3],
+    const float dir[3],
+    float t) {
+    if (isLW) {
+        return 1.f;
+    }
+    return atm_absorption_transmittance(atm, org, dir, t);
 }
 
 static __device__ void atm_run_volume_event(
@@ -874,7 +1163,12 @@ static __device__ void atm_run_volume_event(
     struct AtmHit* vol,
     unsigned long long* cGas,
     unsigned long long* cWc) {
-    if (params.volHandle && !cieOn) {
+    /* IS reads host params.atmosphere, not per-path iquad. CIE, monochromatic
+     * SW, and LW all bind gas on atm_ch — walk that, do not use vol IS. */
+    const int skipIS = cieOn
+        || (atm->spectral_mode == ATM_SPECTRAL_LW)
+        || (atm->spectral_mode == ATM_SPECTRAL_SW);
+    if (params.volHandle && !skipIS) {
         const AtmAccelHit a = atm_trace_vol(
             params.volHandle, org, dir, 1e-4f, tClip, sampler);
         atm_vol_from_accel(atm, org, dir, a, vol);
@@ -973,8 +1267,14 @@ static __device__ void traceAtmospherePath(const uint3& idx, Sampler& sampler) {
         atm_cie_bind_path(&atm_ch, bind_ch, r0, r1, r_quad, &wlen_pdf);
         const float wlen_nm = atm_ch.wavelength_m * 1.0e9f;
         atm_ch.path_albedo = atm_mrumtl_fetch_R(&atm_ch, wlen_nm, sampler.next_1d());
+    } else if (isLW) {
+        atm_lw_bind_path(&atm_ch, sampler.next_1d(), sampler.next_1d());
+        const float wlen_nm = atm_ch.wavelength_m * 1.0e9f;
+        atm_ch.path_albedo = atm_mrumtl_fetch_R(&atm_ch, wlen_nm, sampler.next_1d());
     } else {
-        atm_ch.path_albedo = -1.f;
+        atm_sw_bind_wavelength(&atm_ch, sampler.next_1d());
+        const float wlen_nm = atm_ch.wavelength_m * 1.0e9f;
+        atm_ch.path_albedo = atm_mrumtl_fetch_R(&atm_ch, wlen_nm, sampler.next_1d());
     }
     const AtmParams* atm = &atm_ch;
 
@@ -993,7 +1293,7 @@ static __device__ void traceAtmospherePath(const uint3& idx, Sampler& sampler) {
     /* htrdr SW: if the *camera* dir is in the solar cone, add L_sun * Tr(Kext)
      * before the walk. After a scatter/bounce, htrdr only uses NEE — a miss
      * does not add the disk (except specular, which CIE sand is not). */
-    if (!isLW && atm_dir_in_sun_cone(&atm->sun, dir) && atm->sun.radiance > 0.f) {
+    if (atm->sun.radiance > 0.f && atm_dir_in_sun_cone(&atm->sun, dir)) {
         const float vis = atm_sun_visibility(atm, org, dir, tmax0, sampler);
         if (vis > 0.f) {
             const float3 contrib = throughput * (atm->sun.radiance * vis);
@@ -1028,9 +1328,10 @@ static __device__ void traceAtmospherePath(const uint3& idx, Sampler& sampler) {
         float meshExit = tmax;
         const int meshMaybe = atm_mesh_z_interval(org, dir, tmax, &meshEnter, &meshExit);
         const int probeVol = meshMaybe && meshEnter > 1e-3f;
-        /* First ground hit keeps the 8.3M closest-hit. Later bounces skip mesh:
-         * sand R≈0.16 so 2nd ground hit is ~R², and 68% of those queries miss. */
-        const int allowMesh = (!above_terrain || !atm->gs_enabled) && !hadSurfBounce;
+        /* Mountain (millions of tris): skip mesh after first ground hit.
+         * Small water+aircraft meshes stay in the walk (IR bounce / nadir). */
+        const int allowMesh = (!above_terrain || !atm->gs_enabled) &&
+            (!hadSurfBounce || atm->mesh.ntri <= 65536);
         const float meshT0 = fmaxf(1e-4f, meshEnter);
         const float meshT1 = fminf(tmax, meshExit);
         int didMesh = 0;
@@ -1175,7 +1476,7 @@ static __device__ void traceAtmospherePath(const uint3& idx, Sampler& sampler) {
 
         if (vol_first) {
             escaped = 0;
-            const float Tr_abs = atm_absorption_transmittance(atm, org, dir, vol.t);
+            const float Tr_abs = atm_segment_abs_weight(atm, isLW, org, dir, vol.t);
             if (Tr_abs <= 0.f) {
                 break;
             }
@@ -1206,6 +1507,7 @@ static __device__ void traceAtmospherePath(const uint3& idx, Sampler& sampler) {
                 tSec = clock64();
             }
             atm_add_sun_nee_volume(atm, vol.pos, dir, voxelScatter, throughput, sampler, radiance, volNee);
+            atm_add_spot_nee_volume(atm, vol.pos, dir, voxelScatter, throughput, sampler, radiance, volNee);
             if (prof) {
                 cNee += atm_cycles_since(tSec);
             }
@@ -1234,7 +1536,7 @@ static __device__ void traceAtmospherePath(const uint3& idx, Sampler& sampler) {
         } else if (gs_first) {
             escaped = 0;
             hadSurfBounce = 1;
-            const float Tr_abs = atm_absorption_transmittance(atm, org, dir, t_gs);
+            const float Tr_abs = atm_segment_abs_weight(atm, isLW, org, dir, t_gs);
             if (Tr_abs <= 0.f) {
                 break;
             }
@@ -1250,6 +1552,7 @@ static __device__ void traceAtmospherePath(const uint3& idx, Sampler& sampler) {
             float gsPos[3];
             atm_f3_to_arr(gsIx.position, gsPos);
             atm_add_sun_nee_surface(atm, gsPos, gsRay.direction, gsIx, throughput, sampler, radiance, bounce == 0 ? direct : indirect);
+            atm_add_spot_nee_surface(atm, gsPos, gsIx, throughput, sampler, radiance, bounce == 0 ? direct : indirect);
             atm_add_sky_surface(atm, gsIx, throughput, radiance, bounce == 0 ? direct : indirect);
 
             if (atm->path_albedo >= 0.f) {
@@ -1273,7 +1576,7 @@ static __device__ void traceAtmospherePath(const uint3& idx, Sampler& sampler) {
         } else if (mesh_first) {
             escaped = 0;
             hadSurfBounce = 1;
-            const float Tr_abs = atm_absorption_transmittance(atm, org, dir, meshHit.t);
+            const float Tr_abs = atm_segment_abs_weight(atm, isLW, org, dir, meshHit.t);
             if (Tr_abs <= 0.f) {
                 break;
             }
@@ -1285,7 +1588,7 @@ static __device__ void traceAtmospherePath(const uint3& idx, Sampler& sampler) {
             float ar = meshHit.albedo[0];
             float ag = meshHit.albedo[1];
             float ab = meshHit.albedo[2];
-            if (atm->cie_enabled && atm->path_albedo >= 0.f) {
+            if (atm->path_albedo >= 0.f && atm_mesh_use_spectral_lambert(atm, meshHit.tri)) {
                 ar = ag = ab = atm->path_albedo;
             }
             if (isLW) {
@@ -1300,9 +1603,31 @@ static __device__ void traceAtmospherePath(const uint3& idx, Sampler& sampler) {
                 mat,
                 true);
             const float3 rayDir = make_float3(dir[0], dir[1], dir[2]);
-            atm_add_sun_nee_surface(atm, p, rayDir, ix, throughput, sampler, radiance, bounce == 0 ? direct : indirect);
-            atm_add_sky_surface(atm, ix, throughput, radiance, bounce == 0 ? direct : indirect);
-
+            const int specM = atm_mesh_use_spectral_specular(atm, meshHit.tri);
+            if (specM) {
+                const float F = atm_water_schlick_F(ix, rayDir);
+                const float omF = 1.f - F;
+                atm_add_sun_nee_specular(atm, p, rayDir, ix, throughput, sampler, radiance, bounce == 0 ? direct : indirect, F);
+                const Material matB(make_float3(ar * omF, ag * omF, ab * omF), 1.f, 0.f);
+                const Interaction ixB(
+                    make_float3(p[0], p[1], p[2]),
+                    make_float3(meshHit.n[0], meshHit.n[1], meshHit.n[2]),
+                    matB,
+                    true);
+                atm_add_sun_nee_surface(atm, p, rayDir, ixB, throughput, sampler, radiance, bounce == 0 ? direct : indirect, 0.02f);
+                atm_add_spot_nee_surface(atm, p, ixB, throughput, sampler, radiance, bounce == 0 ? direct : indirect);
+                atm_add_sky_surface(atm, ixB, throughput, radiance, bounce == 0 ? direct : indirect);
+                if (sampler.next_1d() < F) {
+                    if (!atm_specular_bounce(ix, sampler, throughput, org, dir, 1.f)) {
+                        break;
+                    }
+                } else if (!atm_lambert_bounce_rgb(ix, sampler, throughput, org, dir, 0.02f)) {
+                    break;
+                }
+            } else {
+                atm_add_sun_nee_surface(atm, p, rayDir, ix, throughput, sampler, radiance, bounce == 0 ? direct : indirect);
+                atm_add_spot_nee_surface(atm, p, ix, throughput, sampler, radiance, bounce == 0 ? direct : indirect);
+                atm_add_sky_surface(atm, ix, throughput, radiance, bounce == 0 ? direct : indirect);
             if (atm->path_albedo >= 0.f) {
                 if (!atm_lambert_bounce(ix, sampler, throughput, org, dir)) {
                     break;
@@ -1321,13 +1646,14 @@ static __device__ void traceAtmospherePath(const uint3& idx, Sampler& sampler) {
             atm_f3_to_arr(path.currentRayPayload.ray.direction, dir);
             atm_normalize3(dir);
             }
+            }
         } else {
             /* Above the mountain: no volume hit this segment — step into the
              * terrain band and keep walking (do not treat as space escape). */
             if (atm->gs_enabled && above_terrain && dir[2] < -1e-5f) {
                 const float t_band = (850.f - org[2]) / dir[2];
                 if (t_band > 1e-3f && t_band < tmax) {
-                    const float Tr_abs = atm_absorption_transmittance(atm, org, dir, t_band);
+                    const float Tr_abs = atm_segment_abs_weight(atm, isLW, org, dir, t_band);
                     if (Tr_abs <= 0.f) {
                         break;
                     }

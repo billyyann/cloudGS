@@ -40,6 +40,7 @@ DEFAULT_ECRAD = os.path.join(SPK, "ecrad_opt_prop.txt")
 DEFAULT_OUT = os.path.join(ROOT, "scenes", "mountain_gs")
 RES_OK = 0
 DRY_AIR_MOLAR_MASS = 0.0289644
+H2O_MOLAR_MASS = 0.01801528  # kg/mol; x_H2O = rvt / (rvt + M_H2O/M_air)
 GAS_CONSTANT = 8.3144598
 DEFAULT_MIE = os.path.join(SPK, "Mie_LUT_Cloud-2-10-0.010.nc")
 
@@ -169,11 +170,18 @@ def load_htcp_voxels(
     rct = _np_from_c_double(d.RCT, ncell).reshape(nt, nz, ny, nx)
     temp_src = _np_from_c_double(d.T, ncell).reshape(nt, nz, ny, nx) if d.T else None
     pabst = _np_from_c_double(d.PABST, ncell).reshape(nt, nz, ny, nx) if d.PABST else None
-    vxsz_z = _np_from_c_double(d.vxsz_z, nz) if d.vxsz_z else np.full(nz, (d.upper[2] - d.lower[2]) / max(nz, 1))
-    if d.irregular_z and d.coord_z:
+    dz_uniform = (float(d.upper[2]) - float(d.lower[2])) / max(nz, 1)
+    # Regular-Z HTCP (FIRE, BOMEX) stores one cell size; the vxsz_z pointer is not
+    # a reliable nz-length array. Only irregular_z grids expose coord_z + per-layer dz.
+    use_irregular = bool(d.irregular_z) and bool(d.coord_z)
+    if use_irregular:
         zlo = _np_from_c_double(d.coord_z, nz)
-    else:
-        zlo = d.lower[2] + np.arange(nz, dtype=np.float64) * ((d.upper[2] - d.lower[2]) / max(nz, 1))
+        vxsz_z = _np_from_c_double(d.vxsz_z, nz) if d.vxsz_z else np.full(nz, dz_uniform)
+        if (not np.isfinite(zlo).all()) or (not np.isfinite(vxsz_z).all()) or float(np.min(vxsz_z)) <= 0.0:
+            use_irregular = False
+    if not use_irregular:
+        zlo = float(d.lower[2]) + np.arange(nz, dtype=np.float64) * dz_uniform
+        vxsz_z = np.full(nz, dz_uniform, dtype=np.float64)
     zhi = zlo + vxsz_z
     z_iface = np.concatenate([zlo.astype(np.float32), np.float32([zhi[-1]])])
 
@@ -193,17 +201,34 @@ def load_htcp_voxels(
         ka[iz] = (ql * Ca).astype(np.float32)
         temp[iz] = tk.astype(np.float32)
 
+    x_h2o = None
+    rvt = _np_from_c_double(d.RVT, ncell)
+    if rvt.size == ncell:
+        rvt0 = rvt.reshape(nt, nz, ny, nx)[0]
+        ratio = H2O_MOLAR_MASS / DRY_AIR_MOLAR_MASS
+        x_h2o = (rvt0 / np.maximum(rvt0 + ratio, 1e-30)).astype(np.float32)
+        x_h2o = np.where(np.isfinite(x_h2o) & (x_h2o >= 0.0), x_h2o, np.float32(-1.0))
+
     z0_out = float(zlo[0])
     z1_out = float(zhi[-1])
     origin = np.array([float(d.lower[0]), float(d.lower[1]), z0_out], np.float32)
     mean_dz = (z1_out - z0_out) / float(max(nz, 1))
     spacing = np.array([float(d.vxsz_x), float(d.vxsz_y), mean_dz], np.float32)
     lib.htcp_ref_put(cloud)
+    xh_msg = "no RVT"
+    if x_h2o is not None:
+        valid = x_h2o >= 0.0
+        xh_msg = (
+            f"x_H2O valid={float(valid.mean()):.3f} "
+            f"mean={float(x_h2o[valid].mean()) if valid.any() else 0.0:.4g} "
+            f"max={float(x_h2o[valid].max()) if valid.any() else 0.0:.4g}"
+        )
     print(
         f"htcp {nx}x{ny}x{nz} native irregular Z origin={origin} dx={spacing} "
-        f"z=[{z0_out:.1f},{z1_out:.1f}] ks>0={(ks > 1e-6).mean():.3f} max_ks={ks.max():.4g} Cs={Cs:.4g}"
+        f"z=[{z0_out:.1f},{z1_out:.1f}] ks>0={(ks > 1e-6).mean():.3f} max_ks={ks.max():.4g} "
+        f"Cs={Cs:.4g} {xh_msg}"
     )
-    return {
+    out = {
         "ka": ka,
         "ks": ks,
         "temp": temp,
@@ -211,7 +236,12 @@ def load_htcp_voxels(
         "spacing": spacing,
         "z_iface": z_iface,
         "mie_g": mie["g"],
+        "mie_cs": np.float32(Cs),
+        "mie_ca": np.float32(Ca),
     }
+    if x_h2o is not None:
+        out["x_h2o"] = x_h2o
+    return out
 
 
 def save_voxel_bin(path: str, voxels: dict) -> None:
@@ -222,14 +252,16 @@ def save_voxel_bin(path: str, voxels: dict) -> None:
     if z_iface.size != nz + 1:
         raise ValueError(f"z_iface length {z_iface.size} != nz+1={nz + 1}")
     with open(path, "wb") as f:
-        np.array([nx, ny, nz, 2], dtype=np.int32).tofile(f)
+        np.array([nx, ny, nz, 3 if "x_h2o" in voxels else 2], dtype=np.int32).tofile(f)
         np.asarray(voxels["origin"], dtype=np.float32).tofile(f)
         np.asarray(voxels["spacing"], dtype=np.float32).tofile(f)
         ks.astype(np.float32).ravel().tofile(f)
         ka.astype(np.float32).ravel().tofile(f)
         temp.astype(np.float32).ravel().tofile(f)
         z_iface.tofile(f)
-    print(f"wrote {path} (native z_iface {nz + 1})")
+        if "x_h2o" in voxels:
+            np.asarray(voxels["x_h2o"], dtype=np.float32).ravel().tofile(f)
+    print(f"wrote {path} (native z_iface {nz + 1}" + (" + x_H2O)" if "x_h2o" in voxels else ")"))
 
 
 def load_voxel_bin(path: str) -> dict:
@@ -247,6 +279,10 @@ def load_voxel_bin(path: str) -> dict:
             z_iface = np.fromfile(f, dtype=np.float32, count=nz + 1)
             if z_iface.size == nz + 1:
                 out["z_iface"] = z_iface
+        if int(hdr[3]) >= 3:
+            xh = np.fromfile(f, dtype=np.float32, count=n)
+            if xh.size == n:
+                out["x_h2o"] = xh.reshape(nz, ny, nx)
     return out
 
 
@@ -273,6 +309,16 @@ class HtgopLayer(Structure):
     ]
 
 
+class HtgopLwSpec(Structure):
+    _fields_ = [
+        ("ka_nominal", POINTER(c_double)),
+        ("quadrature_length", c_size_t),
+        ("htgop", c_void_p),
+        ("data__", c_void_p),
+        ("layer__", c_void_p),
+    ]
+
+
 class HtgopSwSpec(Structure):
     _fields_ = [
         ("ka_nominal", POINTER(c_double)),
@@ -290,6 +336,16 @@ class HtgopSpectralInterval(Structure):
         ("quadrature_pdf", POINTER(c_double)),
         ("quadrature_cdf", POINTER(c_double)),
         ("quadrature_length", c_size_t),
+        ("htgop", c_void_p),
+    ]
+
+
+class HtgopSwTab(Structure):
+    _fields_ = [
+        ("x_h2o_tab", POINTER(c_double)),
+        ("ka_tab", POINTER(c_double)),
+        ("ks_tab", POINTER(c_double)),
+        ("tab_length", c_size_t),
         ("htgop", c_void_p),
     ]
 
@@ -381,17 +437,126 @@ def load_ecrad_gas_1d(
     return {"z": z, "ka": ka, "ks": ks, "temp": temp}
 
 
+def load_ecrad_gas_1d_lw(
+    ecrad_path: str = DEFAULT_ECRAD,
+    wavelength_m: float = 1.05e-5,
+) -> dict:
+    """Piecewise-constant LW ka vs z (ks=0) from HTGOP RRTMG longwave.
+
+    Do not use load_ecrad_gas_1d at MWIR/LWIR λ: that SW-interval lookup
+    snaps 4 μm and 10.5 μm onto SW band 0 (τ_a ~ 10³). This loader picks
+    the LW band that contains λ and pdf-weights ka_nominal. Device paths
+    still sample iquad via atm_lw_bind_path; host 1D is the fallback mean
+    and supplies z/T.
+    """
+    lib = _so("libhtgop.so")
+    lib.htgop_create.argtypes = [c_void_p, c_void_p, c_int, POINTER(c_void_p)]
+    lib.htgop_create.restype = c_int
+    lib.htgop_load.argtypes = [c_void_p, c_char_p]
+    lib.htgop_load.restype = c_int
+    lib.htgop_ref_put.argtypes = [c_void_p]
+    lib.htgop_ref_put.restype = c_int
+    lib.htgop_get_layers_count.argtypes = [c_void_p, POINTER(c_size_t)]
+    lib.htgop_get_layers_count.restype = c_int
+    lib.htgop_get_levels_count.argtypes = [c_void_p, POINTER(c_size_t)]
+    lib.htgop_get_levels_count.restype = c_int
+    lib.htgop_get_level.argtypes = [c_void_p, c_size_t, POINTER(HtgopLevel)]
+    lib.htgop_get_level.restype = c_int
+    lib.htgop_get_layer.argtypes = [c_void_p, c_size_t, POINTER(HtgopLayer)]
+    lib.htgop_get_layer.restype = c_int
+    lib.htgop_get_lw_spectral_intervals_count.argtypes = [c_void_p, POINTER(c_size_t)]
+    lib.htgop_get_lw_spectral_intervals_count.restype = c_int
+    lib.htgop_get_lw_spectral_interval.argtypes = [c_void_p, c_size_t, POINTER(HtgopSpectralInterval)]
+    lib.htgop_get_lw_spectral_interval.restype = c_int
+    lib.htgop_layer_get_lw_spectral_interval.argtypes = [
+        POINTER(HtgopLayer),
+        c_size_t,
+        POINTER(HtgopLwSpec),
+    ]
+    lib.htgop_layer_get_lw_spectral_interval.restype = c_int
+
+    gop = c_void_p()
+    if lib.htgop_create(None, None, 0, byref(gop)) != RES_OK:
+        raise RuntimeError("htgop_create failed")
+    if lib.htgop_load(gop, ecrad_path.encode()) != RES_OK:
+        lib.htgop_ref_put(gop)
+        raise RuntimeError(f"htgop_load failed: {ecrad_path}")
+
+    nlayers = c_size_t()
+    nlevels = c_size_t()
+    nint = c_size_t()
+    lib.htgop_get_layers_count(gop, byref(nlayers))
+    lib.htgop_get_levels_count(gop, byref(nlevels))
+    lib.htgop_get_lw_spectral_intervals_count(gop, byref(nint))
+    nl, nv, ni = int(nlayers.value), int(nlevels.value), int(nint.value)
+    lam_nm = float(wavelength_m) * 1.0e9
+
+    iband = -1
+    spec = HtgopSpectralInterval()
+    for ib in range(ni):
+        lib.htgop_get_lw_spectral_interval(gop, ib, byref(spec))
+        wn0, wn1 = float(spec.wave_numbers[0]), float(spec.wave_numbers[1])
+        if wn0 <= 0.0 or wn1 <= 0.0:
+            continue
+        lam_hi = 1.0e7 / min(wn0, wn1)
+        lam_lo = 1.0e7 / max(wn0, wn1)
+        if lam_lo <= lam_nm < lam_hi or (ib == ni - 1 and lam_lo <= lam_nm <= lam_hi):
+            iband = ib
+            break
+    if iband < 0:
+        lib.htgop_ref_put(gop)
+        raise RuntimeError(f"no LW interval for {lam_nm:.0f} nm")
+
+    lib.htgop_get_lw_spectral_interval(gop, iband, byref(spec))
+    nq = int(spec.quadrature_length)
+    pdf = np.array([spec.quadrature_pdf[q] for q in range(nq)], dtype=np.float64)
+    pdf = pdf / max(pdf.sum(), 1e-30)
+    wn0, wn1 = float(spec.wave_numbers[0]), float(spec.wave_numbers[1])
+    lam_hi = 1.0e7 / min(wn0, wn1)
+    lam_lo = 1.0e7 / max(wn0, wn1)
+
+    z = np.zeros(nv, np.float32)
+    tlev = np.zeros(nv, np.float32)
+    for i in range(nv):
+        lev = HtgopLevel()
+        lib.htgop_get_level(gop, i, byref(lev))
+        z[i] = float(lev.height)
+        tlev[i] = float(lev.temperature)
+
+    ka = np.zeros(nl, np.float32)
+    ks = np.zeros(nl, np.float32)
+    temp = np.zeros(nl, np.float32)
+    for i in range(nl):
+        layer = HtgopLayer()
+        lib.htgop_get_layer(gop, i, byref(layer))
+        lw = HtgopLwSpec()
+        lib.htgop_layer_get_lw_spectral_interval(byref(layer), iband, byref(lw))
+        nq_l = int(lw.quadrature_length)
+        w = pdf if nq_l == nq else np.full(nq_l, 1.0 / max(nq_l, 1))
+        ka[i] = sum(float(lw.ka_nominal[q]) * float(w[q]) for q in range(nq_l))
+        temp[i] = 0.5 * (tlev[i] + tlev[min(i + 1, nv - 1)])
+
+    lib.htgop_ref_put(gop)
+    tau_a = float(np.sum(ka * np.diff(z.astype(np.float64))))
+    print(
+        f"ecrad gas {nl} layers  LW band {iband} {lam_lo:.0f}-{lam_hi:.0f} nm  "
+        f"@ {lam_nm:.0f} nm  z=[{z[0]:.1f},{z[-1]:.1f}]  τ_a={tau_a:.4f}  "
+        f"ks=0 ka0={ka[0]:.4g}"
+    )
+    return {"z": z, "ka": ka, "ks": ks, "temp": temp}
+
+
 def load_ecrad_sw_visible(
     ecrad_path: str = DEFAULT_ECRAD,
     lambda0_nm: float = 380.0,
     lambda1_nm: float = 780.0,
     mie_path: str = DEFAULT_MIE,
 ) -> dict:
-    """HTGOP SW bands overlapping CIE 380-780 nm, plus htsky Mie band averages.
+    """HTGOP SW bands overlapping [lambda0, lambda1] nm, plus htsky Mie band averages.
 
-    Gas k is per quadrature point (htrdr `htsky_spectral_band_sample_quadrature`),
-    not the pdf-weighted mean. Averaging ka in 625–778 nm made Tr_mean/Tr_true≈0.75
-    and killed the red CIE-X wing (cyan + dark).
+    Default 380–780 is CIE. Pass lambda0=0, lambda1=1e9 for all 14 RRTMG SW bands
+    (solar NIR included). Gas k is per quadrature point (htrdr iquad), not the
+    pdf-weighted mean.
     """
     lib = _so("libhtgop.so")
     lib.htgop_create.argtypes = [c_void_p, c_void_p, c_int, POINTER(c_void_p)]
@@ -414,6 +579,12 @@ def load_ecrad_sw_visible(
     lib.htgop_get_sw_spectral_interval.restype = c_int
     lib.htgop_layer_get_sw_spectral_interval.argtypes = [POINTER(HtgopLayer), c_size_t, POINTER(HtgopSwSpec)]
     lib.htgop_layer_get_sw_spectral_interval.restype = c_int
+    lib.htgop_layer_sw_spectral_interval_get_tab.argtypes = [
+        POINTER(HtgopSwSpec),
+        c_size_t,
+        POINTER(HtgopSwTab),
+    ]
+    lib.htgop_layer_sw_spectral_interval_get_tab.restype = c_int
 
     mie = _so("libhtmie.so")
     mie.htmie_create.argtypes = [c_void_p, c_void_p, c_int, POINTER(c_void_p)]
@@ -497,17 +668,83 @@ def load_ecrad_sw_visible(
         ca_avg = float(mie.htmie_compute_xsection_absorption_average(hmie, band, 0))
         raw.append((lam_lo, lam_hi, ka_q, ks_q, cdf, cs_avg, ca_avg, ib))
 
+    h2o_n = np.zeros(nl, np.int32)
+    ntab_max = 0
+    h2o_x_rows = []
+    for i in range(nl):
+        layer = HtgopLayer()
+        lib.htgop_get_layer(gop, i, byref(layer))
+        ntab = int(layer.tab_length)
+        h2o_n[i] = ntab
+        ntab_max = max(ntab_max, ntab)
+        if ntab > 0 and layer.x_h2o_tab:
+            h2o_x_rows.append(_np_from_c_double(layer.x_h2o_tab, ntab))
+        else:
+            h2o_x_rows.append(np.zeros(0, np.float64))
+    ntab_store = max(int(ntab_max), 1)
+    h2o_x = np.zeros((nl, ntab_store), np.float32)
+    for i, xs in enumerate(h2o_x_rows):
+        if xs.size:
+            h2o_x[i, : xs.size] = xs.astype(np.float32)
+    nqmax_h = max((b[2].shape[0] for b in raw), default=1)
+    nb_h = len(raw)
+    h2o_ka = np.zeros((nb_h, nqmax_h, nl, ntab_store), np.float32)
+    h2o_ks = np.zeros_like(h2o_ka)
+    h2o_ks_max = np.zeros((nb_h, nqmax_h, nl), np.float32)
+    ntab_ok = 0
+    for bi, (_lo, _hi, ka_q, ks_q, _cdf, _cs, _ca, ib) in enumerate(raw):
+        nq = ka_q.shape[0]
+        for i in range(nl):
+            layer = HtgopLayer()
+            lib.htgop_get_layer(gop, i, byref(layer))
+            sw = HtgopSwSpec()
+            if lib.htgop_layer_get_sw_spectral_interval(byref(layer), ib, byref(sw)) != RES_OK:
+                continue
+            nq_l = int(sw.quadrature_length)
+            for q in range(min(nq, nq_l)):
+                tab = HtgopSwTab()
+                if lib.htgop_layer_sw_spectral_interval_get_tab(byref(sw), q, byref(tab)) != RES_OK:
+                    continue
+                nt = int(tab.tab_length)
+                if nt <= 0 or not tab.ka_tab or not tab.ks_tab:
+                    continue
+                ka_t = _np_from_c_double(tab.ka_tab, nt)
+                ks_t = _np_from_c_double(tab.ks_tab, nt)
+                h2o_ka[bi, q, i, :nt] = ka_t.astype(np.float32)
+                h2o_ks[bi, q, i, :nt] = ks_t.astype(np.float32)
+                hat = float(np.max(ks_t)) if ks_t.size else 0.0
+                hat = max(hat, float(ks_q[q, i]))
+                h2o_ks_max[bi, q, i] = hat
+                ntab_ok += 1
+
     cs_ref = float(mie.htmie_fetch_xsection_scattering(hmie, c_double(550.0), 0))
     ca_ref = float(mie.htmie_fetch_xsection_absorption(hmie, c_double(550.0), 0))
-    g0, g1, gn = 380.0, 780.0, 401
+    if raw:
+        g0 = float(min(b[0] for b in raw))
+        g1 = float(max(b[1] for b in raw))
+    else:
+        g0, g1 = 380.0, 780.0
+    g0 = max(g0, 200.0)
+    gn = int(max(g1 - g0, 1.0)) + 1
+    gn = min(max(gn, 2), 20001)
     g_lut = np.zeros(gn, np.float32)
+    g_ok = 0
+    last_g = 0.85
     for i in range(gn):
         lam = g0 + (g1 - g0) * i / float(gn - 1)
-        g_lut[i] = float(mie.htmie_fetch_asymmetry_parameter(hmie, c_double(lam), 0))
+        g = float(mie.htmie_fetch_asymmetry_parameter(hmie, c_double(lam), 0))
+        if np.isfinite(g) and 0.0 <= g < 1.0:
+            last_g = g
+            g_ok += 1
+        else:
+            g = last_g
+        g_lut[i] = g
+    if g_ok < gn:
+        print(f"  mie g(λ): {g_ok}/{gn} in LUT range; others clamped (do not use as thermal-IR Mie)")
     mie.htmie_ref_put(hmie)
     lib.htgop_ref_put(gop)
     if not raw:
-        raise RuntimeError("no HTGOP SW bands in 380-780 nm")
+        raise RuntimeError(f"no HTGOP SW bands in [{lambda0_nm:.0f},{lambda1_nm:.0f}] nm")
 
     nquad = np.array([b[2].shape[0] for b in raw], np.int32)
     nqmax = int(nquad.max())
@@ -537,10 +774,15 @@ def load_ecrad_sw_visible(
             f"ks0_mean={ks_mean[i, 0]:.4g}  Cs/Cs550={cs_avg / max(cs_ref, 1e-30):.4f}"
         )
     print(
-        f"ecrad SW visible {nb} bands  λ=[{lo.min():.0f},{hi.max():.0f}] nm  "
-        f"layers={nl}  nquad_max={nqmax}  (per-quad k, not band mean)"
+        f"ecrad SW {nb} bands  λ=[{lo.min():.0f},{hi.max():.0f}] nm  "
+        f"layers={nl}  nquad_max={nqmax}  gLUT [{g0:.0f},{g1:.0f}] n={gn}  (per-quad k, not band mean)"
     )
-    return {
+    if ntab_max > 0 and ntab_ok > 0:
+        print(
+            f"  HTGOP x_H2O tabs  ntab_max={ntab_max}  layers_with_knots={(h2o_n > 0).sum()}/{nl}  "
+            f"fetched={ntab_ok}"
+        )
+    out = {
         "z": z,
         "lambda_lo_nm": lo,
         "lambda_hi_nm": hi,
@@ -557,6 +799,215 @@ def load_ecrad_sw_visible(
         "mie_g_nm": g_lut,
         "mie_g_lambda0_nm": np.float32(g0),
         "mie_g_dlambda_nm": np.float32((g1 - g0) / float(gn - 1)),
+    }
+    if ntab_max > 0 and ntab_ok > 0:
+        out["h2o_n"] = h2o_n
+        out["h2o_x"] = h2o_x
+        out["h2o_ka"] = h2o_ka
+        out["h2o_ks"] = h2o_ks
+        out["h2o_ks_max"] = h2o_ks_max
+    return out
+
+
+def sw_find_band_index(sw: dict, wavelength_nm: float) -> int:
+    """Same interval test as device atm_sw_find_band. -1 if none."""
+    lo = np.asarray(sw["lambda_lo_nm"], np.float64).reshape(-1)
+    hi = np.asarray(sw["lambda_hi_nm"], np.float64).reshape(-1)
+    w = float(wavelength_nm)
+    if lo.size == 0 or lo.size != hi.size:
+        return -1
+    for i in range(int(lo.size)):
+        if w >= lo[i] and w < hi[i]:
+            return i
+    last = int(lo.size) - 1
+    if w >= lo[last] and w <= hi[last]:
+        return last
+    return -1
+
+
+def require_sw_band(sw: dict, wavelength_nm: float) -> int:
+    """Abort if the bound SW table has no interval containing λ.
+
+    Host 1D pdf-mean gas must not silently stand in for a missing band.
+    """
+    ib = sw_find_band_index(sw, wavelength_nm)
+    if ib < 0:
+        lo = np.asarray(sw.get("lambda_lo_nm", []), np.float64).reshape(-1)
+        hi = np.asarray(sw.get("lambda_hi_nm", []), np.float64).reshape(-1)
+        span = (
+            f"[{float(lo.min()):.0f},{float(hi.max()):.0f}] nm" if lo.size and hi.size else "empty"
+        )
+        raise RuntimeError(
+            f"HTGOP SW table {span} does not contain {float(wavelength_nm):.0f} nm; "
+            "refusing host 1D mean as monochromatic k"
+        )
+    return ib
+
+
+def require_sw_h2o(sw: dict, voxels: dict) -> tuple[np.ndarray, dict]:
+    """SPECTRAL_SW must have LES x_H2O and HTGOP humidity tabs. CIE must not call this."""
+    x = voxels.get("x_h2o")
+    if x is None:
+        raise RuntimeError(
+            "SPECTRAL_SW needs HTCP RVT → x_H2O; refusing 1D ka_nominal inside the cloud box"
+        )
+    x = np.asarray(x, dtype=np.float32)
+    if x.ndim != 3 or x.shape != np.asarray(voxels["ks"]).shape:
+        raise RuntimeError(
+            f"x_H2O shape {x.shape} != voxel ks {np.asarray(voxels['ks']).shape}"
+        )
+    for key in ("h2o_n", "h2o_x", "h2o_ka", "h2o_ks", "h2o_ks_max"):
+        if key not in sw:
+            raise RuntimeError(
+                f"SPECTRAL_SW HTGOP table missing {key}; refusing nominal-only gas k"
+            )
+    return x, sw
+
+
+def planck_B_lambda(wavelength_m: float, temperature_K: float = 5778.0) -> float:
+    """SI B_λ (W sr^-1 m^-2 m^-1). Matches device atm_planck_monochromatic."""
+    h = 6.62607015e-34
+    c = 299792458.0
+    k = 1.380649e-23
+    lam = float(wavelength_m)
+    T = float(temperature_K)
+    if T <= 0.0 or lam <= 0.0:
+        return 0.0
+    hc_lkT = (h * c) / (lam * k * T)
+    return (2.0 * h * c * c / (lam ** 5)) / (math.exp(hc_lkT) - 1.0)
+
+
+def load_ecrad_lw(
+    ecrad_path: str = DEFAULT_ECRAD,
+    mie_path: str = DEFAULT_MIE,
+) -> dict:
+    """RRTMG 16 LW bands: ka only (ks=0). For ATM_SPECTRAL_LW host bind.
+
+    Gas: per-quad ka_nominal (device samples iquad). Cloud: htsky band-average
+    C̄(Δν); voxels dumped at dump λ are scaled by C̄/C(λ_dump) like htrdr.
+    Planck stays at dump λ. Not a 3.7–4.8 / 8–12 μm camera window.
+    """
+    lib = _so("libhtgop.so")
+    lib.htgop_create.argtypes = [c_void_p, c_void_p, c_int, POINTER(c_void_p)]
+    lib.htgop_create.restype = c_int
+    lib.htgop_load.argtypes = [c_void_p, c_char_p]
+    lib.htgop_load.restype = c_int
+    lib.htgop_ref_put.argtypes = [c_void_p]
+    lib.htgop_ref_put.restype = c_int
+    lib.htgop_get_layers_count.argtypes = [c_void_p, POINTER(c_size_t)]
+    lib.htgop_get_layers_count.restype = c_int
+    lib.htgop_get_lw_spectral_intervals_count.argtypes = [c_void_p, POINTER(c_size_t)]
+    lib.htgop_get_lw_spectral_intervals_count.restype = c_int
+    lib.htgop_get_lw_spectral_interval.argtypes = [c_void_p, c_size_t, POINTER(HtgopSpectralInterval)]
+    lib.htgop_get_lw_spectral_interval.restype = c_int
+    lib.htgop_get_layer.argtypes = [c_void_p, c_size_t, POINTER(HtgopLayer)]
+    lib.htgop_get_layer.restype = c_int
+    lib.htgop_layer_get_lw_spectral_interval.argtypes = [POINTER(HtgopLayer), c_size_t, POINTER(HtgopLwSpec)]
+    lib.htgop_layer_get_lw_spectral_interval.restype = c_int
+
+    mie = _so("libhtmie.so")
+    mie.htmie_create.argtypes = [c_void_p, c_void_p, c_int, POINTER(c_void_p)]
+    mie.htmie_create.restype = c_int
+    mie.htmie_load.argtypes = [c_void_p, c_char_p]
+    mie.htmie_load.restype = c_int
+    mie.htmie_ref_put.argtypes = [c_void_p]
+    mie.htmie_ref_put.restype = c_int
+    mie.htmie_fetch_xsection_scattering.argtypes = [c_void_p, c_double, c_int]
+    mie.htmie_fetch_xsection_scattering.restype = c_double
+    mie.htmie_fetch_xsection_absorption.argtypes = [c_void_p, c_double, c_int]
+    mie.htmie_fetch_xsection_absorption.restype = c_double
+    mie.htmie_compute_xsection_scattering_average.argtypes = [c_void_p, POINTER(c_double), c_int]
+    mie.htmie_compute_xsection_scattering_average.restype = c_double
+    mie.htmie_compute_xsection_absorption_average.argtypes = [c_void_p, POINTER(c_double), c_int]
+    mie.htmie_compute_xsection_absorption_average.restype = c_double
+
+    gop = c_void_p()
+    if lib.htgop_create(None, None, 0, byref(gop)) != RES_OK:
+        raise RuntimeError("htgop_create failed")
+    if lib.htgop_load(gop, ecrad_path.encode()) != RES_OK:
+        lib.htgop_ref_put(gop)
+        raise RuntimeError(f"htgop_load failed: {ecrad_path}")
+
+    hmie = c_void_p()
+    if mie.htmie_create(None, None, 0, byref(hmie)) != RES_OK:
+        lib.htgop_ref_put(gop)
+        raise RuntimeError("htmie_create failed")
+    if mie.htmie_load(hmie, mie_path.encode()) != RES_OK:
+        mie.htmie_ref_put(hmie)
+        lib.htgop_ref_put(gop)
+        raise RuntimeError(f"htmie_load failed: {mie_path}")
+
+    nlayers = c_size_t()
+    nint = c_size_t()
+    lib.htgop_get_layers_count(gop, byref(nlayers))
+    lib.htgop_get_lw_spectral_intervals_count(gop, byref(nint))
+    nl, ni = int(nlayers.value), int(nint.value)
+
+    raw = []
+    for ib in range(ni):
+        spec = HtgopSpectralInterval()
+        lib.htgop_get_lw_spectral_interval(gop, ib, byref(spec))
+        wn0, wn1 = float(spec.wave_numbers[0]), float(spec.wave_numbers[1])
+        if wn0 <= 0.0 or wn1 <= 0.0:
+            continue
+        lam_hi = 1.0e7 / min(wn0, wn1)
+        lam_lo = 1.0e7 / max(wn0, wn1)
+        nq = int(spec.quadrature_length)
+        pdf = np.array([spec.quadrature_pdf[q] for q in range(nq)], dtype=np.float64)
+        pdf = pdf / max(pdf.sum(), 1e-30)
+        cdf = np.cumsum(pdf).astype(np.float32)
+        cdf[-1] = 1.0
+        ka_q = np.zeros((nq, nl), np.float32)
+        for i in range(nl):
+            layer = HtgopLayer()
+            lib.htgop_get_layer(gop, i, byref(layer))
+            lw = HtgopLwSpec()
+            lib.htgop_layer_get_lw_spectral_interval(byref(layer), ib, byref(lw))
+            nq_l = int(lw.quadrature_length)
+            for q in range(min(nq, nq_l)):
+                ka_q[q, i] = float(lw.ka_nominal[q])
+        band = (c_double * 2)(lam_lo, lam_hi)
+        cs_avg = float(mie.htmie_compute_xsection_scattering_average(hmie, band, 0))
+        ca_avg = float(mie.htmie_compute_xsection_absorption_average(hmie, band, 0))
+        raw.append((lam_lo, lam_hi, ka_q, cdf, cs_avg, ca_avg, ib))
+    cs_ref = float(mie.htmie_fetch_xsection_scattering(hmie, c_double(550.0), 0))
+    ca_ref = float(mie.htmie_fetch_xsection_absorption(hmie, c_double(550.0), 0))
+    mie.htmie_ref_put(hmie)
+    lib.htgop_ref_put(gop)
+    if not raw:
+        raise RuntimeError("no HTGOP LW bands")
+
+    nquad = np.array([b[2].shape[0] for b in raw], np.int32)
+    nqmax = int(nquad.max())
+    nb = len(raw)
+    lo = np.array([b[0] for b in raw], np.float32)
+    hi = np.array([b[1] for b in raw], np.float32)
+    ka_quad = np.zeros((nb, nqmax, nl), np.float32)
+    cdf = np.ones((nb, nqmax), np.float32)
+    mie_cs = np.zeros(nb, np.float32)
+    mie_ca = np.zeros(nb, np.float32)
+    for i, (lam_lo, lam_hi, ka_q, cdf_i, cs_avg, ca_avg, _ib) in enumerate(raw):
+        nq = ka_q.shape[0]
+        ka_quad[i, :nq] = ka_q
+        cdf[i, :nq] = cdf_i
+        cdf[i, nq:] = 1.0
+        mie_cs[i] = cs_avg
+        mie_ca[i] = ca_avg
+        print(
+            f"  HTGOP LW band {lam_lo:.0f}-{lam_hi:.0f} nm  nq={nq}  ka0={ka_q[0, 0]:.4g}  "
+            f"Cs_bar={cs_avg:.4g} Ca_bar={ca_avg:.4g}"
+        )
+    print(f"ecrad LW {nb} bands  λ=[{lo.min():.0f},{hi.max():.0f}] nm  layers={nl}  nquad_max={nqmax}")
+    return {
+        "lambda_lo_nm": lo,
+        "lambda_hi_nm": hi,
+        "ka_quad": ka_quad,
+        "nquad": nquad,
+        "quad_cdf": cdf,
+        "mie_cs_band": mie_cs,
+        "mie_ca_band": mie_ca,
+        "mie_cs_ref": np.float32(cs_ref),
+        "mie_ca_ref": np.float32(ca_ref),
     }
 
 
@@ -696,7 +1147,228 @@ def heightfield_to_mesh(grid: np.ndarray) -> dict:
     ).astype(np.float32)
     temp = np.full((idx.shape[0],), 300.0, np.float32)
     print(f"mountain mesh {n}x{n} verts={verts.shape[0]} tris={idx.shape[0]} z=[{verts[:,2].min():.1f},{verts[:,2].max():.1f}]")
-    return {"verts": verts, "idx": idx, "albedo": alb, "temp": temp}
+    mat_id = np.zeros((idx.shape[0],), np.int32)  # ATM_MTL_SPECTRAL_LAMBERT; host binds sand.mrumtl
+    return {"verts": verts, "idx": idx, "albedo": alb, "temp": temp, "mat_id": mat_id}
+
+
+def _box_mesh(center, half, R):
+    """Axis-aligned box. half = (hx, hy, hz). 8 verts, 12 tris."""
+    cx, cy, cz = (float(center[0]), float(center[1]), float(center[2]))
+    hx, hy, hz = (float(half[0]), float(half[1]), float(half[2]))
+    verts = np.array(
+        [
+            [cx - hx, cy - hy, cz - hz],
+            [cx + hx, cy - hy, cz - hz],
+            [cx + hx, cy + hy, cz - hz],
+            [cx - hx, cy + hy, cz - hz],
+            [cx - hx, cy - hy, cz + hz],
+            [cx + hx, cy - hy, cz + hz],
+            [cx + hx, cy + hy, cz + hz],
+            [cx - hx, cy + hy, cz + hz],
+        ],
+        dtype=np.float32,
+    )
+    idx = np.array(
+        [
+            [0, 1, 2],
+            [0, 2, 3],
+            [4, 6, 5],
+            [4, 7, 6],
+            [0, 4, 5],
+            [0, 5, 1],
+            [1, 5, 6],
+            [1, 6, 2],
+            [2, 6, 7],
+            [2, 7, 3],
+            [3, 7, 4],
+            [3, 4, 0],
+        ],
+        dtype=np.int32,
+    )
+    alb = np.full((idx.shape[0], 3), float(R), np.float32)
+    return verts, idx, alb
+
+
+def _cyl_x_mesh(x0, x1, r, R, nseg=16):
+    """Closed cylinder along +X, circle in YZ."""
+    nseg = max(int(nseg), 6)
+    t = np.linspace(0.0, 2.0 * np.pi, nseg, endpoint=False)
+    ring = np.stack([np.zeros(nseg), r * np.cos(t), r * np.sin(t)], axis=1).astype(np.float32)
+    v0 = ring + np.array([x0, 0.0, 0.0], np.float32)
+    v1 = ring + np.array([x1, 0.0, 0.0], np.float32)
+    c0 = np.array([[x0, 0.0, 0.0]], np.float32)
+    c1 = np.array([[x1, 0.0, 0.0]], np.float32)
+    verts = np.concatenate([v0, v1, c0, c1], axis=0)
+    tris = []
+    for i in range(nseg):
+        j = (i + 1) % nseg
+        tris.append([i, j, nseg + j])
+        tris.append([i, nseg + j, nseg + i])
+        tris.append([2 * nseg, j, i])
+        tris.append([2 * nseg + 1, nseg + i, nseg + j])
+    idx = np.asarray(tris, np.int32)
+    alb = np.full((idx.shape[0], 3), float(R), np.float32)
+    return verts, idx, alb
+
+
+def _cone_x_mesh(x0, x1, r0, r1, R, nseg=16):
+    nseg = max(int(nseg), 6)
+    t = np.linspace(0.0, 2.0 * np.pi, nseg, endpoint=False)
+    ring0 = np.stack([np.full(nseg, x0), r0 * np.cos(t), r0 * np.sin(t)], axis=1).astype(np.float32)
+    ring1 = np.stack([np.full(nseg, x1), r1 * np.cos(t), r1 * np.sin(t)], axis=1).astype(np.float32)
+    verts = np.concatenate([ring0, ring1], axis=0)
+    tris = []
+    for i in range(nseg):
+        j = (i + 1) % nseg
+        tris.append([i, j, nseg + j])
+        tris.append([i, nseg + j, nseg + i])
+    idx = np.asarray(tris, np.int32)
+    alb = np.full((idx.shape[0], 3), float(R), np.float32)
+    return verts, idx, alb
+
+
+def _join_parts(parts):
+    verts = []
+    idx = []
+    alb = []
+    base = 0
+    for v, t, a in parts:
+        verts.append(v)
+        idx.append(t + base)
+        alb.append(a)
+        base += int(v.shape[0])
+    return (
+        np.concatenate(verts, axis=0).astype(np.float32),
+        np.concatenate(idx, axis=0).astype(np.int32),
+        np.concatenate(alb, axis=0).astype(np.float32),
+    )
+
+
+def make_b747_mesh(center, heading_rad: float = 0.0) -> dict:
+    """747-400 scale low-poly, local +X nose +Z up. 1:1 meters.
+
+    Fuselage white, wings grey, tail/engines dark. Not airline livery.
+    """
+    # 747-400: L=70.66 m, span=64.44 m, height=19.41 m, fuse Ø≈6.5 m
+    r_fuse = 0.72
+    r_wing = 0.28
+    r_dark = 0.12
+    fuse_r = 3.25
+    x_tail = -32.5
+    x_nose = 32.5
+    parts = []
+    parts.append(_cyl_x_mesh(-24.0, 22.0, fuse_r, r_fuse, 20))
+    parts.append(_cone_x_mesh(22.0, x_nose, fuse_r, 0.35, r_fuse, 16))
+    parts.append(_cone_x_mesh(x_tail, -24.0, 2.2, fuse_r, r_fuse, 16))
+    # Wing box (slight sweep via two panels)
+    parts.append(_box_mesh((2.0, 0.0, -0.4), (11.0, 32.2, 0.55), r_wing))
+    parts.append(_box_mesh((-6.0, 0.0, -0.35), (6.0, 18.0, 0.45), r_wing))
+    # Horizontal stabilizer
+    parts.append(_box_mesh((x_tail + 4.0, 0.0, 1.2), (3.5, 10.5, 0.28), r_fuse))
+    # Vertical tail
+    parts.append(_box_mesh((x_tail + 5.0, 0.0, 8.5), (4.5, 0.35, 7.0), r_dark))
+    # Four engines under wings (approx 747 stations)
+    for y in (-22.0, -13.5, 13.5, 22.0):
+        parts.append(_cyl_x_mesh(-4.0, 8.0, 1.35, r_dark, 12))
+        v, t, a = parts[-1]
+        v[:, 1] += y
+        v[:, 2] -= 3.6
+        parts[-1] = (v, t, a)
+    verts, idx, alb = _join_parts(parts)
+    c, s = math.cos(heading_rad), math.sin(heading_rad)
+    rot = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]], np.float32)
+    verts = verts @ rot.T
+    verts += np.asarray(center, np.float32).reshape(1, 3)
+    temp = np.full((idx.shape[0],), 288.15, np.float32)
+    mat_id = np.full((idx.shape[0],), 1, np.int32)  # ATM_MTL_RGB_LAMBERT
+    bb0 = verts.min(axis=0)
+    bb1 = verts.max(axis=0)
+    print(
+        f"B747 mesh verts={verts.shape[0]} tris={idx.shape[0]}  "
+        f"AABB=[{bb0[0]:.1f},{bb0[1]:.1f},{bb0[2]:.1f}]-[{bb1[0]:.1f},{bb1[1]:.1f},{bb1[2]:.1f}]  "
+        f"size={(bb1-bb0).tolist()} m  center={np.asarray(center, float).tolist()}"
+    )
+    return {"verts": verts, "idx": idx, "albedo": alb, "temp": temp, "mat_id": mat_id}
+
+
+def concat_meshes(ground: dict, extra: dict) -> dict:
+    nv = int(ground["verts"].shape[0])
+    g_id = ground.get("mat_id")
+    if g_id is None:
+        g_id = np.zeros((ground["idx"].shape[0],), np.int32)
+    e_id = extra.get("mat_id")
+    if e_id is None:
+        e_id = np.ones((extra["idx"].shape[0],), np.int32)
+    return {
+        "verts": np.concatenate([ground["verts"], extra["verts"]], axis=0),
+        "idx": np.concatenate([ground["idx"], extra["idx"] + nv], axis=0),
+        "albedo": np.concatenate([ground["albedo"], extra["albedo"]], axis=0),
+        "temp": np.concatenate([ground["temp"], extra["temp"]], axis=0),
+        "mat_id": np.concatenate([g_id, e_id], axis=0).astype(np.int32),
+    }
+
+
+def pick_b747_placement(
+    ks, ka, origin, spacing, z_iface, tau_min: float = 8.0, place: str = "peak"
+) -> dict:
+    """Densest cloudy column (max τ). place=peak: k_ext max; place=mid: geometric cloud mid."""
+    if place not in ("peak", "mid"):
+        raise ValueError(f"place must be peak or mid, got {place!r}")
+    ks = np.asarray(ks)
+    ka = np.asarray(ka)
+    zf = np.asarray(z_iface, np.float64)
+    dz = np.diff(zf)
+    kext = ks.astype(np.float64) + ka.astype(np.float64)
+    tau = (kext * dz[:, None, None]).sum(axis=0)
+    nz, ny, nx = ks.shape
+    ox, oy = float(origin[0]), float(origin[1])
+    dx, dy = float(spacing[0]), float(spacing[1])
+    iy, ix = np.unravel_index(int(np.argmax(tau)), tau.shape)
+    iy, ix = int(iy), int(ix)
+    col = kext[:, iy, ix]
+    cloudy = col > 1e-4
+    if not np.any(cloudy):
+        iz0, iz1 = 0, nz - 1
+    else:
+        izs = np.where(cloudy)[0]
+        iz0, iz1 = int(izs[0]), int(izs[-1])
+    z_base = 0.5 * (zf[iz0] + zf[iz0 + 1])
+    z_top = 0.5 * (zf[iz1] + zf[iz1 + 1])
+    if place == "mid":
+        zc = 0.5 * (z_base + z_top)
+        izc = int(np.searchsorted(zf, zc, side="right") - 1)
+        izc = int(np.clip(izc, 0, nz - 1))
+    else:
+        izc = int(iz0 + np.argmax(col[iz0 : iz1 + 1]))
+        zc = 0.5 * (zf[izc] + zf[izc + 1])
+    mid = 0.5 * (zf[:-1] + zf[1:])
+    tau_above = float((col[mid > zc] * dz[mid > zc]).sum())
+    tau_below = float((col[mid < zc] * dz[mid < zc]).sum())
+    cx = ox + (ix + 0.5) * dx
+    cy = oy + (iy + 0.5) * dy
+    out = {
+        "ix": ix,
+        "iy": iy,
+        "center": np.array([cx, cy, zc], np.float32),
+        "tau": float(tau[iy, ix]),
+        "kext_here": float(col[izc]),
+        "kext_peak": float(col[iz0 : iz1 + 1].max()),
+        "z_base": float(z_base),
+        "z_top": float(z_top),
+        "cloud_h": float(z_top - z_base),
+        "tau_above": tau_above,
+        "tau_below": tau_below,
+        "place": place,
+        "heading": 0.0,
+    }
+    print(
+        f"B747 densest column ix,iy=({ix},{iy}) tau={out['tau']:.2f}  place={place}  "
+        f"kext={out['kext_here']:.4g} at z={zc:.1f}  "
+        f"tau_above={tau_above:.2f} tau_below={tau_below:.2f}  "
+        f"z_cloud=[{out['z_base']:.1f},{out['z_top']:.1f}] H={out['cloud_h']:.1f} m  "
+        f"ac={out['center'].tolist()}"
+    )
+    return out
 
 
 def ensure_mountain_mesh(outdir: str = DEFAULT_OUT, obj_path: str = DEFAULT_OBJ, rebuild: bool = False) -> dict:
@@ -704,6 +1376,10 @@ def ensure_mountain_mesh(outdir: str = DEFAULT_OUT, obj_path: str = DEFAULT_OBJ,
     if (not rebuild) and os.path.isfile(cache):
         data = np.load(cache)
         mesh = {k: data[k] for k in ("verts", "idx", "albedo", "temp")}
+        if "mat_id" in data.files:
+            mesh["mat_id"] = data["mat_id"]
+        else:
+            mesh["mat_id"] = np.zeros((mesh["idx"].shape[0],), np.int32)
         print(f"mountain mesh from cache {cache}  verts={mesh['verts'].shape[0]} tris={mesh['idx'].shape[0]}")
         return mesh
     grid = load_mountain_grid(obj_path)

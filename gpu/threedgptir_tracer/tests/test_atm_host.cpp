@@ -284,6 +284,67 @@ int main() {
         expect_near("analog_xy_wrap_tau", tau_w, k * tmax_w, 0.05);
     }
 
+    /* htgop three-case fetch: below first knot, linear through zero, log-log. */
+    {
+        const float xt[3] = {0.01f, 0.02f, 0.04f};
+        const float kt[3] = {1.f, 4.f, 16.f};
+        expect_near("htgop_k_below", atm_htgop_tab_k(xt, kt, 3, 0.005f), 0.5, 1e-5);
+        expect_near("htgop_k_zero_k", atm_htgop_tab_k(xt, kt, 3, 0.0f), 0.0, 1e-12);
+        const float kmid = atm_htgop_tab_k(xt, kt, 3, 0.02f);
+        expect_near("htgop_k_knot", kmid, 4.0, 1e-5);
+        const float kll = atm_htgop_tab_k(xt, kt, 3, 0.028284271f); /* sqrt(0.02*0.04) → sqrt(4*16)=8 */
+        expect_near("htgop_k_loglog", kll, 8.0, 0.05);
+        const float kz[2] = {0.f, 2.f};
+        const float xz[2] = {0.01f, 0.02f};
+        expect_near("htgop_k_linear_zero", atm_htgop_tab_k(xz, kz, 2, 0.015f), 1.0, 1e-5);
+    }
+
+    /* VOLUME GS pid-stencil: one particle at cell (1,1,1), eval at center → ka/ks. */
+    {
+        const int n = 4;
+        std::vector<float> vka(n * n * n, 0.f), vks(n * n * n, 0.f), vtemp(n * n * n, 280.f);
+        AtmVoxelGrid vg{};
+        vg.nx = vg.ny = vg.nz = n;
+        vg.origin[0] = vg.origin[1] = vg.origin[2] = 0.f;
+        vg.dx = vg.dy = vg.dz = 1.f;
+        vg.ka = vka.data();
+        vg.ks = vks.data();
+        vg.temperature = vtemp.data();
+        vg.brick = 8;
+        std::vector<float> vkmax;
+        vkmax.resize(1);
+        atm_build_brick_majorants(&vg, vkmax.data());
+
+        std::vector<int> pid(n * n * n, -1);
+        const int pix = 1, piy = 1, piz = 1;
+        pid[(piz * n + piy) * n + pix] = 0;
+        float center[3] = {1.5f, 1.5f, 1.5f};
+        float scale[3] = {0.7071f, 0.7071f, 0.7071f};
+        float quat[4] = {1.f, 0.f, 0.f, 0.f};
+        float gka[1] = {0.1f};
+        float gks[1] = {1.0f};
+        AtmVolumeGs vgs{};
+        vgs.enabled = 1;
+        vgs.n = 1;
+        vgs.rx = vgs.ry = vgs.rz = 2;
+        vgs.pid = pid.data();
+        vgs.center = center;
+        vgs.scale = scale;
+        vgs.quat = quat;
+        vgs.ka = gka;
+        vgs.ks = gks;
+        vgs.kext_max = nullptr;
+        vgs.majorant_boost = 4.f;
+        float oka = 0.f, oks = 0.f;
+        atm_volume_gs_eval_ka_ks(&vgs, &vg, center, &oka, &oks);
+        expect_near("volume_gs_at_center_ka", oka, 0.1, 1e-5);
+        expect_near("volume_gs_at_center_ks", oks, 1.0, 1e-5);
+        float far[3] = {10.f, 10.f, 10.f};
+        atm_volume_gs_eval_ka_ks(&vgs, &vg, far, &oka, &oks);
+        expect_near("volume_gs_far_ka", oka, 0.0, 1e-6);
+        expect_near("volume_gs_far_ks", oks, 0.0, 1e-6);
+    }
+
     if (g_fail) {
         std::fprintf(stderr, "%d checks failed\n", g_fail);
         return 1;

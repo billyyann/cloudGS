@@ -13,7 +13,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .atmosphere import AtmosphereBuffers, SPECTRAL_LW, SPECTRAL_SW, SPECTRAL_SW_CIE_XYZ, build_brick_majorants, htpp_xyz_to_srgb, trace_atmosphere
+from .atmosphere import (
+    AtmosphereBuffers,
+    MTL_RGB_LAMBERT,
+    MTL_SPECTRAL_LAMBERT,
+    MTL_SPECTRAL_SPECULAR,
+    SPECTRAL_LW,
+    SPECTRAL_SW,
+    SPECTRAL_SW_CIE_XYZ,
+    build_brick_majorants,
+    htpp_xyz_to_srgb,
+    trace_atmosphere,
+)
 from .tracer import Tracer
 
 __all__ = [
@@ -22,6 +33,9 @@ __all__ = [
     "SPECTRAL_SW",
     "SPECTRAL_LW",
     "SPECTRAL_SW_CIE_XYZ",
+    "MTL_SPECTRAL_LAMBERT",
+    "MTL_RGB_LAMBERT",
+    "MTL_SPECTRAL_SPECULAR",
     "build_brick_majorants",
     "htpp_xyz_to_srgb",
     "trace_atmosphere",

@@ -2175,7 +2175,34 @@ OptixTracer::traceAtmosphere(
     torch::Tensor mieGnm,
     float mieCsRef,
     float mieCaRef,
-    torch::Tensor voxelZIface) {
+    torch::Tensor voxelZIface,
+    torch::Tensor meshMatId,
+    torch::Tensor spotParams,
+    float mieGLambda0Nm,
+    float mieGDlambdaNm,
+    torch::Tensor lwLambdaLo,
+    torch::Tensor lwLambdaHi,
+    torch::Tensor lwGasKa,
+    torch::Tensor lwNquad,
+    torch::Tensor lwQuadCdf,
+    torch::Tensor voxelXh2o,
+    int swH2oNtab,
+    torch::Tensor swH2oN,
+    torch::Tensor swH2oX,
+    torch::Tensor swH2oKa,
+    torch::Tensor swH2oKs,
+    torch::Tensor swH2oKsMax,
+    torch::Tensor volumeGsPid,
+    torch::Tensor volumeGsCenter,
+    torch::Tensor volumeGsScale,
+    torch::Tensor volumeGsQuat,
+    torch::Tensor volumeGsKa,
+    torch::Tensor volumeGsKs,
+    torch::Tensor volumeGsKmax,
+    int volumeGsRx,
+    int volumeGsRy,
+    int volumeGsRz,
+    float volumeGsMajorantBoost) {
 
     const torch::TensorOptions opts = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
 
@@ -2317,6 +2344,12 @@ OptixTracer::traceAtmosphere(
         atm.gas.temperature = atmFloatPtr(gasTemp);
     }
 
+    atm.mesh.nvert = 0;
+    atm.mesh.ntri = 0;
+    atm.mesh.vertices = nullptr;
+    atm.mesh.indices = nullptr;
+    atm.mesh.albedo = nullptr;
+    atm.mesh.temperature = nullptr;
     if (meshVerts.defined() && meshIdx.defined() && meshIdx.numel() >= 3) {
         atm.mesh.nvert = static_cast<int>(meshVerts.size(0));
         atm.mesh.ntri = static_cast<int>(meshIdx.size(0));
@@ -2324,6 +2357,46 @@ OptixTracer::traceAtmosphere(
         atm.mesh.indices = atmIntPtr(meshIdx);
         atm.mesh.albedo = atmFloatPtr(meshAlbedo);
         atm.mesh.temperature = atmFloatPtr(meshTemp);
+    }
+    atm.mesh_mat_id = nullptr;
+    if (meshMatId.defined() && meshMatId.numel() > 0) {
+        atm.mesh_mat_id = atmIntPtr(meshMatId);
+    }
+
+    atm.spot_enabled = 0;
+    atm.spot_pos[0] = atm.spot_pos[1] = atm.spot_pos[2] = 0.f;
+    atm.spot_dir[0] = 0.f;
+    atm.spot_dir[1] = 0.f;
+    atm.spot_dir[2] = 1.f;
+    atm.spot_sun_scale = 0.f;
+    atm.spot_cos_half = 1.f;
+    atm.spot_radius = 1.f;
+    if (spotParams.defined() && spotParams.numel() >= 9) {
+        const torch::Tensor hsp = spotParams.detach().cpu().contiguous();
+        const float* sp = hsp.data_ptr<float>();
+        atm.spot_pos[0] = sp[0];
+        atm.spot_pos[1] = sp[1];
+        atm.spot_pos[2] = sp[2];
+        atm.spot_dir[0] = sp[3];
+        atm.spot_dir[1] = sp[4];
+        atm.spot_dir[2] = sp[5];
+        float dn = std::sqrt(
+            atm.spot_dir[0] * atm.spot_dir[0] + atm.spot_dir[1] * atm.spot_dir[1] + atm.spot_dir[2] * atm.spot_dir[2]);
+        if (dn > 1e-12f) {
+            atm.spot_dir[0] /= dn;
+            atm.spot_dir[1] /= dn;
+            atm.spot_dir[2] /= dn;
+        }
+        atm.spot_sun_scale = sp[6];
+        atm.spot_cos_half = sp[7];
+        atm.spot_radius = sp[8];
+        atm.spot_enabled = (atm.spot_sun_scale > 0.f && atm.spot_radius > 0.f) ? 1 : 0;
+        std::fprintf(stderr,
+                     "[atm] spot on pos=(%.1f,%.1f,%.1f) dir=(%.3f,%.3f,%.3f) "
+                     "L/Lsun=%.4g cosHalf=%.4f r=%.3f m\n",
+                     (double)atm.spot_pos[0], (double)atm.spot_pos[1], (double)atm.spot_pos[2],
+                     (double)atm.spot_dir[0], (double)atm.spot_dir[1], (double)atm.spot_dir[2],
+                     (double)atm.spot_sun_scale, (double)atm.spot_cos_half, (double)atm.spot_radius);
     }
 
     atmCopy3(sunDir, atm.sun.dir, 0.f, 0.f, 1.f);
@@ -2405,8 +2478,13 @@ OptixTracer::traceAtmosphere(
     if (mieGnm.defined() && mieGnm.numel() > 1) {
         atm.mie_g_nm = atmFloatPtr(mieGnm);
         atm.mie_g_n = static_cast<int>(mieGnm.numel());
-        atm.mie_g_lambda0_nm = 380.f;
-        atm.mie_g_dlambda_nm = 400.f / float(atm.mie_g_n - 1);
+        if (mieGDlambdaNm > 0.f) {
+            atm.mie_g_lambda0_nm = mieGLambda0Nm;
+            atm.mie_g_dlambda_nm = mieGDlambdaNm;
+        } else {
+            atm.mie_g_lambda0_nm = 380.f;
+            atm.mie_g_dlambda_nm = 400.f / float(atm.mie_g_n - 1);
+        }
     }
     atm.brdf_n = 0;
     atm.brdf_lambda_nm = nullptr;
@@ -2416,6 +2494,87 @@ OptixTracer::traceAtmosphere(
         atm.brdf_n = static_cast<int>(brdfLambdaNm.numel());
         atm.brdf_lambda_nm = atmFloatPtr(brdfLambdaNm);
         atm.brdf_R = atmFloatPtr(brdfR);
+    }
+
+    atm.lw_nbands = 0;
+    atm.lw_nquad_max = 0;
+    atm.lw_lambda_lo_nm = nullptr;
+    atm.lw_lambda_hi_nm = nullptr;
+    atm.lw_gas_ka = nullptr;
+    atm.lw_nquad = nullptr;
+    atm.lw_quad_cdf = nullptr;
+    if (lwGasKa.defined() && lwGasKa.numel() > 0) {
+        if (lwGasKa.dim() == 3) {
+            atm.lw_nbands = static_cast<int>(lwGasKa.size(0));
+            atm.lw_nquad_max = static_cast<int>(lwGasKa.size(1));
+        } else {
+            atm.lw_nbands = static_cast<int>(lwGasKa.size(0));
+            atm.lw_nquad_max = 1;
+        }
+        atm.lw_lambda_lo_nm = atmFloatPtr(lwLambdaLo);
+        atm.lw_lambda_hi_nm = atmFloatPtr(lwLambdaHi);
+        atm.lw_gas_ka = atmFloatPtr(lwGasKa);
+        if (lwNquad.defined() && lwNquad.numel() > 0) {
+            atm.lw_nquad = atmIntPtr(lwNquad);
+        }
+        if (lwQuadCdf.defined() && lwQuadCdf.numel() > 0) {
+            atm.lw_quad_cdf = atmFloatPtr(lwQuadCdf);
+        }
+        std::fprintf(stderr, "[atm] LW bands=%d nquad_max=%d (ka only; no sun)\n",
+                     atm.lw_nbands, atm.lw_nquad_max);
+    }
+
+    atm.voxel_x_h2o = nullptr;
+    atm.sw_h2o_ntab = 0;
+    atm.sw_h2o_n = nullptr;
+    atm.sw_h2o_x = nullptr;
+    atm.sw_h2o_ka = nullptr;
+    atm.sw_h2o_ks = nullptr;
+    atm.sw_h2o_ks_max = nullptr;
+    atm.path_sw_iband = -1;
+    atm.path_sw_iquad = -1;
+    if (spectralMode == ATM_SPECTRAL_SW && voxelXh2o.defined() && voxelXh2o.numel() > 0 &&
+        swH2oKa.defined() && swH2oKa.numel() > 0 && swH2oNtab > 0) {
+        atm.voxel_x_h2o = atmFloatPtr(voxelXh2o);
+        atm.sw_h2o_ntab = swH2oNtab;
+        atm.sw_h2o_n = atmIntPtr(swH2oN);
+        atm.sw_h2o_x = atmFloatPtr(swH2oX);
+        atm.sw_h2o_ka = atmFloatPtr(swH2oKa);
+        atm.sw_h2o_ks = atmFloatPtr(swH2oKs);
+        atm.sw_h2o_ks_max = atmFloatPtr(swH2oKsMax);
+        std::fprintf(stderr,
+                     "[atm] SPECTRAL_SW x_H2O voxels + HTGOP humidity tabs ntab=%d (CIE/LW unused)\n",
+                     atm.sw_h2o_ntab);
+    }
+
+    /* VOLUME GS pid-stencil (default off). Shares voxel lattice dims. */
+    std::memset(&atm.volume_gs, 0, sizeof(atm.volume_gs));
+    atm.volume_gs.majorant_boost = volumeGsMajorantBoost > 0.f ? volumeGsMajorantBoost : 4.f;
+    if (volumeGsPid.defined() && volumeGsPid.numel() > 0 && volumeGsCenter.defined() &&
+        volumeGsKa.defined() && volumeGsKs.defined() && volumeGsScale.defined() &&
+        volumeGsQuat.defined() && atm.voxels.nx > 0) {
+        const int64_t nCell = static_cast<int64_t>(atm.voxels.nx) * atm.voxels.ny * atm.voxels.nz;
+        if (volumeGsPid.numel() == nCell && volumeGsCenter.dim() == 2 && volumeGsCenter.size(1) == 3) {
+            atm.volume_gs.enabled = 1;
+            atm.volume_gs.n = static_cast<int>(volumeGsCenter.size(0));
+            atm.volume_gs.rx = volumeGsRx > 0 ? volumeGsRx : 5;
+            atm.volume_gs.ry = volumeGsRy > 0 ? volumeGsRy : 5;
+            atm.volume_gs.rz = volumeGsRz > 0 ? volumeGsRz : 5;
+            atm.volume_gs.pid = atmIntPtr(volumeGsPid);
+            atm.volume_gs.center = atmFloatPtr(volumeGsCenter);
+            atm.volume_gs.scale = atmFloatPtr(volumeGsScale);
+            atm.volume_gs.quat = atmFloatPtr(volumeGsQuat);
+            atm.volume_gs.ka = atmFloatPtr(volumeGsKa);
+            atm.volume_gs.ks = atmFloatPtr(volumeGsKs);
+            if (volumeGsKmax.defined() && volumeGsKmax.numel() > 0) {
+                atm.volume_gs.kext_max = atmFloatPtr(volumeGsKmax);
+            }
+            std::fprintf(stderr,
+                         "[atm] VOLUME_GS enabled N=%d stencil=%d,%d,%d boost=%g kmax=%s\n",
+                         atm.volume_gs.n, atm.volume_gs.rx, atm.volume_gs.ry, atm.volume_gs.rz,
+                         (double)atm.volume_gs.majorant_boost,
+                         atm.volume_gs.kext_max ? "yes" : "voxel*boost");
+        }
     }
 
     cudaStream_t cudaStream = at::cuda::getCurrentCUDAStream();

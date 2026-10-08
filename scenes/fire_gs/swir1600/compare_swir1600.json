@@ -1,0 +1,50 @@
+{
+  "gpu_npy": "/home/szyj2025/scatterGS/cloudGS/scenes/fire_gs/swir1600/gpu_swir_nouav_spp32.npy",
+  "htrdr_txt": "/home/szyj2025/scatterGS/cloudGS/scenes/fire_gs/swir1600/htrdr_fire_swir1600_512x512x32.txt",
+  "dlambda_m": 1e-09,
+  "unit": "GPU and htrdr/\u0394\u03bb are L_\u03bb W m^-2 sr^-1 m^-1",
+  "gpu": {
+    "name": "gpu_L_lambda",
+    "mean": 4539714.513837367,
+    "median": 2375020.375,
+    "p05": 476937.228125,
+    "p95": 16342621.649999969,
+    "p995": 34814640.84000003,
+    "min": 51812.171875,
+    "max": 124387856.0,
+    "frac_zero": 0.0
+  },
+  "htrdr_integrated": {
+    "name": "htrdr_E",
+    "mean": 0.004496144756317139,
+    "median": 0.002184,
+    "p05": 0.000416,
+    "p95": 0.016971,
+    "p995": 0.03657028000000003,
+    "min": 2.2e-05,
+    "max": 0.100118,
+    "frac_zero": 0.0
+  },
+  "htrdr_L_lambda": {
+    "name": "htrdr_E/dlambda",
+    "mean": 4496144.756317139,
+    "median": 2184000.0,
+    "p05": 415999.99999999994,
+    "p95": 16971000.0,
+    "p995": 36570280.00000002,
+    "min": 21999.999999999996,
+    "max": 100117999.99999999,
+    "frac_zero": 0.0
+  },
+  "mean_GPU_over_htrdr": 1.009690470365531,
+  "median_GPU_over_htrdr": 1.0874635416666667,
+  "rel_mean": 2.384308048812627,
+  "rel_p50": 0.0801472184973272,
+  "rel_p95_abs": 12.769345720720706,
+  "corr": 0.004105561002186068,
+  "noise_std_over_mean_gpu": 1.2950565783449781,
+  "noise_std_over_mean_htrdr": 1.379038997342645,
+  "corr_20m": 0.8907216725405452,
+  "median_smooth_GPU_over_htrdr": 1.0065683479627954,
+  "smooth_rel_p95_abs": 0.099238086013491
+}

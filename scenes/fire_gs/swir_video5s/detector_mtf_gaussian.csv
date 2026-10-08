@@ -1,0 +1,14 @@
+# SWIR detector / optical MTF (host post-process on SS radiance)
+# role=pixel_optical_mtf
+# NOT atmospheric path radiance or Rayleigh/aerosol scatter
+# model=isotropic_gaussian
+# fwhm_detector_px=1.75
+# sigma_detector_px=0.743157
+# ss_factor=2
+# sigma_ss_px=1.48631  (applied on supersample grid before box downsample)
+# apply: gaussian_filter(L_ss, sigma=sigma_ss_px, mode=reflect) then box 2x2
+param,value
+fwhm_detector_px,1.75
+sigma_detector_px,0.743156575252
+ss_factor,2
+sigma_ss_px,1.4863131505

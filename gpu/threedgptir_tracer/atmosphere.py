@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -13,6 +14,72 @@ import torch
 SPECTRAL_SW = 0
 SPECTRAL_LW = 1
 SPECTRAL_SW_CIE_XYZ = 2
+MTL_SPECTRAL_LAMBERT = 0
+MTL_RGB_LAMBERT = 1
+MTL_SPECTRAL_SPECULAR = 2  # htrdr ssf_specular; same ρ(λ) LUT as Lambert
+
+# Through-atmosphere mean solar-disk luminance (cd/m²).
+SUN_LUMINANCE_ATM_CD_M2 = 1.44e9
+
+
+def xenon_searchlight_params(
+    pos,
+    target,
+    lumens: float = 8.0e4,
+    diameter_m: float = 1.0,
+    half_angle_deg: float | None = None,
+    sun_luminance: float = SUN_LUMINANCE_ATM_CD_M2,
+) -> tuple[np.ndarray, dict]:
+    """One 2 kW-class xenon searchlight as a Lambert disk in a cone.
+
+    Φ ≈ 8×10⁴ lm, D = 1 m. Half-angle covers the target if omitted.
+    L = Φ / (π A sin²α) ≪ L_sun because the aperture and beam are both large.
+    Returns (9-vector for C++, info dict).
+    """
+    pos = np.asarray(pos, np.float64).reshape(3)
+    target = np.asarray(target, np.float64).reshape(3)
+    delta = target - pos
+    dist = float(np.linalg.norm(delta))
+    if dist < 1.0:
+        raise ValueError("searchlight pos too close to target")
+    direction = delta / dist
+    if half_angle_deg is None:
+        # Cover a 747 (~70 m) with a little spill onto the cloud.
+        half_angle_deg = float(np.degrees(np.arctan2(40.0, dist)))
+        half_angle_deg = float(np.clip(half_angle_deg, 4.0, 10.0))
+    radius = 0.5 * float(diameter_m)
+    area = math.pi * radius * radius
+    alpha = math.radians(float(half_angle_deg))
+    sin2 = max(math.sin(alpha) ** 2, 1e-12)
+    luminance = float(lumens) / (math.pi * area * sin2)
+    scale = luminance / max(float(sun_luminance), 1.0)
+    vec = np.array(
+        [
+            pos[0],
+            pos[1],
+            pos[2],
+            direction[0],
+            direction[1],
+            direction[2],
+            scale,
+            math.cos(alpha),
+            radius,
+        ],
+        dtype=np.float32,
+    )
+    info = {
+        "lumens": float(lumens),
+        "diameter_m": float(diameter_m),
+        "radius_m": radius,
+        "half_angle_deg": float(half_angle_deg),
+        "dist_m": dist,
+        "luminance_cd_m2": luminance,
+        "sun_luminance_cd_m2": float(sun_luminance),
+        "spot_sun_scale": scale,
+        "I0_cd": luminance * area,
+        "E_axis_lux": (luminance * area) / (dist * dist),
+    }
+    return vec, info
 
 
 def identity_ray_to_world(device: torch.device | str) -> torch.Tensor:
@@ -27,8 +94,9 @@ def build_brick_majorants(
     ka: np.ndarray,
     ks: np.ndarray,
     brick: int = 8,
+    use_extinction: bool = False,
 ) -> np.ndarray:
-    """Per-brick k̂ = max(ks). Same majorant as GPU Woodcock (htrdr SW)."""
+    """Per-brick k̂. SW Woodcock (htrdr): max(ks). LW: max(ka+ks)."""
     nz, ny, nx = ka.shape
     b = max(int(brick), 1)
     nbz = (nz + b - 1) // b
@@ -36,10 +104,13 @@ def build_brick_majorants(
     nbx = (nx + b - 1) // b
     kmax = np.zeros((nbz, nby, nbx), dtype=np.float32)
     ks_a = np.asarray(ks, dtype=np.float32)
+    src = ks_a
+    if use_extinction:
+        src = np.asarray(ka, dtype=np.float32) + ks_a
     for bz in range(nbz):
         for by in range(nby):
             for bx in range(nbx):
-                sl = ks_a[bz * b : min((bz + 1) * b, nz), by * b : min((by + 1) * b, ny), bx * b : min((bx + 1) * b, nx)]
+                sl = src[bz * b : min((bz + 1) * b, nz), by * b : min((by + 1) * b, ny), bx * b : min((bx + 1) * b, nx)]
                 kmax[bz, by, bx] = float(sl.max()) if sl.size else 0.0
     return kmax
 
@@ -198,6 +269,34 @@ class AtmosphereBuffers:
     mie_cs_ref: float = 1.0
     mie_ca_ref: float = 1.0
     voxel_z_iface: torch.Tensor = field(default=None)  # type: ignore
+    mesh_mat_id: torch.Tensor = field(default=None)  # type: ignore
+    spot_params: torch.Tensor = field(default=None)  # type: ignore
+    mie_g_lambda0_nm: float = 380.0
+    mie_g_dlambda_nm: float = 0.0  # 0 = host derives 380–780 from LUT length
+    lw_lambda_lo: torch.Tensor = field(default=None)  # type: ignore
+    lw_lambda_hi: torch.Tensor = field(default=None)  # type: ignore
+    lw_gas_ka: torch.Tensor = field(default=None)  # type: ignore
+    lw_nquad: torch.Tensor = field(default=None)  # type: ignore
+    lw_quad_cdf: torch.Tensor = field(default=None)  # type: ignore
+    voxel_x_h2o: torch.Tensor = field(default=None)  # type: ignore
+    sw_h2o_ntab: int = 0
+    sw_h2o_n: torch.Tensor = field(default=None)  # type: ignore
+    sw_h2o_x: torch.Tensor = field(default=None)  # type: ignore
+    sw_h2o_ka: torch.Tensor = field(default=None)  # type: ignore
+    sw_h2o_ks: torch.Tensor = field(default=None)  # type: ignore
+    sw_h2o_ks_max: torch.Tensor = field(default=None)  # type: ignore
+    # VOLUME GS (optional; empty pid ⇒ voxel path)
+    volume_gs_pid: torch.Tensor = field(default=None)  # type: ignore
+    volume_gs_center: torch.Tensor = field(default=None)  # type: ignore
+    volume_gs_scale: torch.Tensor = field(default=None)  # type: ignore
+    volume_gs_quat: torch.Tensor = field(default=None)  # type: ignore
+    volume_gs_ka: torch.Tensor = field(default=None)  # type: ignore
+    volume_gs_ks: torch.Tensor = field(default=None)  # type: ignore
+    volume_gs_kmax: torch.Tensor = field(default=None)  # type: ignore
+    volume_gs_rx: int = 0
+    volume_gs_ry: int = 0
+    volume_gs_rz: int = 0
+    volume_gs_majorant_boost: float = 4.0
 
     @classmethod
     def from_numpy(
@@ -235,7 +334,9 @@ class AtmosphereBuffers:
                 voxel_temp if voxel_temp is not None else np.full(ka.shape, 288.15, dtype=np.float32),
                 dtype=np.float32,
             )
-            kmax = build_brick_majorants(ka, ks, brick)
+            kmax = build_brick_majorants(
+                ka, ks, brick, use_extinction=(int(spectral_mode) == SPECTRAL_LW)
+            )
         else:
             ka = np.zeros((0, 0, 0), dtype=np.float32)
             ks = ka
@@ -290,6 +391,56 @@ class AtmosphereBuffers:
             mie_cs_ref=1.0,
             mie_ca_ref=1.0,
             voxel_z_iface=_to_cuda_f32(voxel_z_iface, (0,), device),
+            lw_lambda_lo=torch.empty(0, dtype=torch.float32, device=device),
+            lw_lambda_hi=torch.empty(0, dtype=torch.float32, device=device),
+            lw_gas_ka=torch.empty((0, 0, 0), dtype=torch.float32, device=device),
+            lw_nquad=torch.empty(0, dtype=torch.int32, device=device),
+            lw_quad_cdf=torch.empty(0, dtype=torch.float32, device=device),
+            voxel_x_h2o=torch.empty(0, dtype=torch.float32, device=device),
+            sw_h2o_ntab=0,
+            sw_h2o_n=torch.empty(0, dtype=torch.int32, device=device),
+            sw_h2o_x=torch.empty(0, dtype=torch.float32, device=device),
+            sw_h2o_ka=torch.empty(0, dtype=torch.float32, device=device),
+            sw_h2o_ks=torch.empty(0, dtype=torch.float32, device=device),
+            sw_h2o_ks_max=torch.empty(0, dtype=torch.float32, device=device),
+            volume_gs_pid=torch.empty(0, dtype=torch.int32, device=device),
+            volume_gs_center=torch.empty((0, 3), dtype=torch.float32, device=device),
+            volume_gs_scale=torch.empty((0, 3), dtype=torch.float32, device=device),
+            volume_gs_quat=torch.empty((0, 4), dtype=torch.float32, device=device),
+            volume_gs_ka=torch.empty(0, dtype=torch.float32, device=device),
+            volume_gs_ks=torch.empty(0, dtype=torch.float32, device=device),
+            volume_gs_kmax=torch.empty(0, dtype=torch.float32, device=device),
+            volume_gs_rx=0,
+            volume_gs_ry=0,
+            volume_gs_rz=0,
+            volume_gs_majorant_boost=4.0,
+        )
+
+    def attach_volume_gs_cloud(
+        self,
+        source,
+        device: Optional[torch.device] = None,
+        majorant_boost: float = 4.0,
+    ) -> "AtmosphereBuffers":
+        """Load fitted/pin VOLUME GS cloud into buffer fields.
+
+        ``source``: path to ``volume_gs_fit.npz`` or upload dict from
+        ``volume_gs_pin_buffers.build_*``.
+        """
+        import os
+        import sys
+
+        tools = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "tools"))
+        if tools not in sys.path:
+            sys.path.insert(0, tools)
+        from volume_gs_pin_buffers import (
+            attach_volume_gs_to_atmosphere_buffers,
+            load_volume_gs_npz,
+        )
+
+        upload = load_volume_gs_npz(source) if isinstance(source, str) else source
+        return attach_volume_gs_to_atmosphere_buffers(
+            self, upload, device=device, majorant_boost=majorant_boost
         )
 
 
@@ -351,4 +502,31 @@ def trace_atmosphere(tracer_wrapper, ray_ori: torch.Tensor, ray_dir: torch.Tenso
         float(buffers.mie_cs_ref),
         float(buffers.mie_ca_ref),
         buffers.voxel_z_iface if buffers.voxel_z_iface is not None else torch.empty(0, dtype=torch.float32, device=device),
+        buffers.mesh_mat_id if buffers.mesh_mat_id is not None else torch.empty(0, dtype=torch.int32, device=device),
+        buffers.spot_params if buffers.spot_params is not None else torch.empty(0, dtype=torch.float32, device=device),
+        float(buffers.mie_g_lambda0_nm),
+        float(buffers.mie_g_dlambda_nm),
+        buffers.lw_lambda_lo if buffers.lw_lambda_lo is not None else torch.empty(0, dtype=torch.float32, device=device),
+        buffers.lw_lambda_hi if buffers.lw_lambda_hi is not None else torch.empty(0, dtype=torch.float32, device=device),
+        buffers.lw_gas_ka if buffers.lw_gas_ka is not None else torch.empty((0, 0, 0), dtype=torch.float32, device=device),
+        buffers.lw_nquad if buffers.lw_nquad is not None else torch.empty(0, dtype=torch.int32, device=device),
+        buffers.lw_quad_cdf if buffers.lw_quad_cdf is not None else torch.empty(0, dtype=torch.float32, device=device),
+        buffers.voxel_x_h2o if buffers.voxel_x_h2o is not None else torch.empty(0, dtype=torch.float32, device=device),
+        int(buffers.sw_h2o_ntab),
+        buffers.sw_h2o_n if buffers.sw_h2o_n is not None else torch.empty(0, dtype=torch.int32, device=device),
+        buffers.sw_h2o_x if buffers.sw_h2o_x is not None else torch.empty(0, dtype=torch.float32, device=device),
+        buffers.sw_h2o_ka if buffers.sw_h2o_ka is not None else torch.empty(0, dtype=torch.float32, device=device),
+        buffers.sw_h2o_ks if buffers.sw_h2o_ks is not None else torch.empty(0, dtype=torch.float32, device=device),
+        buffers.sw_h2o_ks_max if buffers.sw_h2o_ks_max is not None else torch.empty(0, dtype=torch.float32, device=device),
+        buffers.volume_gs_pid if buffers.volume_gs_pid is not None else torch.empty(0, dtype=torch.int32, device=device),
+        buffers.volume_gs_center if buffers.volume_gs_center is not None else torch.empty((0, 3), dtype=torch.float32, device=device),
+        buffers.volume_gs_scale if buffers.volume_gs_scale is not None else torch.empty((0, 3), dtype=torch.float32, device=device),
+        buffers.volume_gs_quat if buffers.volume_gs_quat is not None else torch.empty((0, 4), dtype=torch.float32, device=device),
+        buffers.volume_gs_ka if buffers.volume_gs_ka is not None else torch.empty(0, dtype=torch.float32, device=device),
+        buffers.volume_gs_ks if buffers.volume_gs_ks is not None else torch.empty(0, dtype=torch.float32, device=device),
+        buffers.volume_gs_kmax if buffers.volume_gs_kmax is not None else torch.empty(0, dtype=torch.float32, device=device),
+        int(buffers.volume_gs_rx),
+        int(buffers.volume_gs_ry),
+        int(buffers.volume_gs_rz),
+        float(buffers.volume_gs_majorant_boost),
     )

@@ -1,0 +1,56 @@
+{
+  "stamp": "20260928_154347",
+  "manifests": [
+    "/home/szyj2025/scatterGS/cloudGS/scenes/fire_gs/swir_video5s/manifest2.csv"
+  ],
+  "geometry": {
+    "H_m": 3022.738970588235,
+    "film_w_m": 2349.1,
+    "film_h_m": 2349.1,
+    "nx": 512,
+    "ny": 512,
+    "gsd_m": 4.5880859375,
+    "gsd_optics_m": 4.723029641544118,
+    "half_need_m": 1174.55,
+    "water_m": 2549.1
+  },
+  "lambda_nm": 1600.0,
+  "spp": 1024,
+  "seed": 0,
+  "L_offset": 0.0,
+  "L_scale": 5960554.1850000005,
+  "L_calibration": "u16_shared_0_stack_p99.5; beauty=SS_MTF_box2x; RTE_pre_MTF_in_ss_npy",
+  "downsample_csv": "/home/szyj2025/scatterGS/cloudGS/scenes/fire_gs/swir_video5s/downsample_2x_box.csv",
+  "mtf_csv": "/home/szyj2025/scatterGS/cloudGS/scenes/fire_gs/swir_video5s/detector_mtf_gaussian.csv",
+  "ss": 2,
+  "swir_rho_body": 0.16,
+  "swir_rho_engine": 0.06,
+  "water_rho": 0.03999999910593033,
+  "note": "Config from unified manifest CSV. Kernel no_clouds=(clouds==0).",
+  "detector_nx": 512,
+  "detector_ny": 512,
+  "cases": {
+    "cloud_org": {
+      "manifest": "/home/szyj2025/scatterGS/cloudGS/scenes/fire_gs/swir_video5s/manifest2.csv",
+      "npy": "/home/szyj2025/scatterGS/cloudGS/scenes/fire_gs/swir_video5s/gate/gpu_swir_cloud_org_spp1024.npy",
+      "npy_ss": "/home/szyj2025/scatterGS/cloudGS/scenes/fire_gs/swir_video5s/gate/gpu_swir_cloud_org_spp1024_ss2.npy",
+      "cloud_mode": "htcp",
+      "clouds": 1,
+      "has_aircraft": 1,
+      "mean": 4284698.688575745,
+      "ss": 2,
+      "swir_rho_body": 0.16,
+      "swir_rho_engine": 0.06,
+      "water_rho": 0.03999999910593033,
+      "png": "/home/szyj2025/scatterGS/cloudGS/scenes/fire_gs/swir_video5s/gate/swir_cloud_org_spp1024_20260928_154347.png",
+      "png_u8": "/home/szyj2025/scatterGS/cloudGS/scenes/fire_gs/swir_video5s/gate/swir_cloud_org_spp1024_20260928_154347_u8.png"
+    }
+  },
+  "mie": {
+    "Cs": 163.127673573627,
+    "Ca": 1.0705201417787,
+    "g": 0.8468360632674,
+    "omega_dump": 0.9934803171852538
+  },
+  "accept_clear_off": {}
+}
